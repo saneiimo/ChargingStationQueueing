@@ -14,6 +14,7 @@ rng = np.random.default_rng(1)
 policy = FIFOQueuePolicy()
 
 while not done:
+    # obs is stored as [piles_loads + pile_nozzles + [queue_len]]
     # Get queue_len
     q_len = obs[-1]
     # Get pile states

@@ -1,3 +1,4 @@
+from __future__ import annotations
 from models.station import ChargingStation
 from models.pile import ChargingPile
 from models.ev import EV
@@ -76,10 +77,8 @@ class SimulationEngine:
 
         return True
 
-    def _redistribute_power(
-        self, pile: ChargingPile, ev: EV | None = None, kind: str | None = None
-    ):
-        assignments = self.station.power_policy.update_power(pile, ev, kind)
+    def _redistribute_power(self, pile: ChargingPile, ev: EV | None = None):
+        assignments = self.station.power_policy.update_power(pile, ev)
         for each_ev, power in assignments:
             each_ev.update_charging_power(power, self.current_time, self.event_heap)
 

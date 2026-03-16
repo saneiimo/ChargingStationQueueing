@@ -41,6 +41,7 @@ class EV:
             self.c_b / self.p_req_max * (self.s_th - self.s_i)
         )  # Time corresponding to s_thresh
         self.energy_needed = (self.s_f - self.s_i) * self.c_b  # Energy required (kWh)
+        self.s_next = self.s_current
 
     # ------
 
@@ -57,9 +58,9 @@ class EV:
         else:
             self.departure_event_id += 1
             event_id = self.departure_event_id
-
+        t_next = self.dt_next_candidate + current_time
         event = Event(
-            self.t_next_candidate,
+            t_next,
             self.event_type_next_candidate,
             event_id,
             self,
@@ -69,20 +70,20 @@ class EV:
 
     # ------
 
-    @property
-    def current_time(self) -> float:
-        if self.pile is None:
-            return float("inf")
-        return self.pile.station.current_time
+    # @property
+    # def current_time(self) -> float:
+    #     if self.pile is None:
+    #         return float("inf")
+    #     return self.pile.station.current_time
 
-    @property
-    def next_time(self) -> float:
-        """
-        This is the next global event (based on other EVs, Arrivals, ...)
-        """
-        if self.pile is None:
-            return float("inf")
-        return self.pile.station.next_time
+    # @property
+    # def next_time(self) -> float:
+    #     """
+    #     This is the next global event (based on other EVs, Arrivals, ...)
+    #     """
+    #     if self.pile is None:
+    #         return float("inf")
+    #     return self.pile.station.next_time
 
     @property
     def n_bricks(self) -> int:
@@ -110,13 +111,11 @@ class EV:
         return 1 - self.p_act / self.tan_B
 
     @property
-    def t_taper(self) -> float:
-        return (
-            self.c_b / self.p_act * (self.s_taper - self.s_current) + self.current_time
-        )
+    def dt_taper(self) -> float:
+        return self.c_b / self.p_act * (self.s_taper - self.s_current)
 
     @property
-    def next_state(self) -> tuple:
+    def next_state(self) -> tuple[float, EventType]:
         """
         Next SoC of interest: if pile is overloaded, next event is when
         the power request of EV is less than the threshold (EV is underutilizing
@@ -132,8 +131,15 @@ class EV:
             p_thresh_2 = (self.n_bricks - 1) * self.pile.p_brick
             # If self.p_act < p_thresh, next state is freeing up that power brick
             # else it is underutilizing that brick
-            p_next = max(min(p_thresh, self.p_act), min(p_thresh_2, self.p_act))
-            return (1 - p_next / self.tan_B, EventType.CHARGE_CHANGE)
+            p_next = p_thresh if self.p_act > p_thresh else p_thresh_2
+            # SoC corresponding to when underutilization happens
+            local_next_s = 1 - p_next / self.tan_B
+            if local_next_s < self.s_f:
+                return (local_next_s, EventType.CHARGE_CHANGE)
+            else:
+                # This is for the highly unlikely case that the EV target SoC
+                # is before tapering.
+                return (self.s_f, EventType.DEPARTURE)
         else:
             return (self.s_f, EventType.DEPARTURE)
 
@@ -146,7 +152,7 @@ class EV:
         return self.next_state[1]
 
     @property
-    def t_next_candidate(self) -> float:
+    def dt_next_candidate(self) -> float:
         """
         Computes the time of next charging event for this EV;
         """
@@ -157,40 +163,48 @@ class EV:
             (1 - max(self.s_taper, self.s_next_candidate))
             / (1 - max(self.s_taper, self.s_current))
         )
-        return self.c_b / self.p_act * (linear_term + log_term) + self.current_time
+        return self.c_b / self.p_act * (linear_term + log_term)
 
-    @property
-    def s_next(self) -> float:
-        delta_t = self.next_time - self.current_time
+    def compute_s_next(self, delta_t: float) -> float:
+        """
+        Computes the next SoC, after Δt, based on current SoC and received power
+        """
         k_tmp = delta_t * self.p_act / self.c_b
-        # Constant part of P-S curve
-        if self.current_time < self.next_time <= self.t_taper:
-            return k_tmp + self.s_current
-        # Starting at the constant part - going in the linear decay
-        elif self.current_time < self.t_taper < self.next_time:
-            exp_term = exp((self.s_taper - self.s_current - k_tmp) / (1 - self.s_taper))
-            return 1 - (1 - self.s_taper) * exp_term
+
         # Linear decay part
-        elif self.t_taper <= self.current_time < self.next_time:
-            return 1 - (1 - self.s_current) * exp(-k_tmp / (1 - self.s_taper))
+        if np.isclose(self.dt_taper, 0, rtol=1e-6, atol=1e-9):
+            self.s_next = 1 - (1 - self.s_current) * exp(-k_tmp / (1 - self.s_taper))
+
+        # Starting at the constant part
         else:
-            raise ValueError("Something is wrong with s_next calculation!")
+            # Not going in the linear decay part of P-S curve (s_next < s_taper)
+            if delta_t < self.dt_taper:
+                self.s_next = k_tmp + self.s_current
+            # going in the linear decay
+            else:
+                exp_term = exp(
+                    (self.s_taper - self.s_current - k_tmp) / (1 - self.s_taper)
+                )
+                self.s_next = 1 - (1 - self.s_taper) * exp_term
 
     @property
-    def deltaE_power(self) -> float:
-        linear_term = min(self.t_taper, self.next_time) - min(
-            self.t_taper, self.current_time
-        )
-        expo_next_time = exp(
-            -self.tan_B / self.c_b * (max(self.next_time, self.t_taper) - self.t_taper)
-        )
-        expo_current_time = exp(
-            -self.tan_B
-            / self.c_b
-            * (max(self.current_time, self.t_taper) - self.t_taper)
-        )
-        expo_term = -self.c_b / self.tan_B * (expo_next_time - expo_current_time)
-        return self.p_act * (linear_term + expo_term)
+    def compute_deltaE_power(self, delta_t) -> float:
+        # Linear decay (P-S curve)
+        if np.isclose(self.dt_taper, 0, rtole=1e-6, atol=1e-9):
+            expo_t_i = exp(-self.tan_B / self.c_b * (-self.dt_taper))
+            expo_t_f = exp(-self.tan_B / self.c_b * (delta_t - self.dt_taper))
+            self.deltaE_power = -self.c_b * (1 - self.s_taper) * (expo_t_f - expo_t_i)
+        # Starting from the constant part
+        else:
+            # Not going in the linear decay part of P-S curve
+            if delta_t < self.dt_taper:
+                self.deltaE_power = self.p_act * delta_t
+            # Going in the linear decay part
+            else:
+                lin_part = self.p_act * self.dt_taper
+                expo_t_f = exp(-self.tan_B / self.c_b * (delta_t - self.dt_taper))
+                expo_part = -self.c_b * (1 - self.s_taper) * (expo_t_f - 1)
+                self.deltaE_power = lin_part + expo_part
 
     @property
     def deltaE_SoC(self):

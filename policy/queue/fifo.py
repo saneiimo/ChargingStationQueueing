@@ -11,7 +11,7 @@ class FIFOQueuePolicy(QueuePolicy):
     def select_pile(
         self, q_len: int, pile_state: List[int], rng: np.random.Generator
     ) -> int:
-
+        # pile_state is [piles_loads + pile_nozzles]
         num_piles = len(pile_state) // 2
         pile_loads = pile_state[:num_piles]
         pile_nozzles = pile_state[num_piles:]
