@@ -11,10 +11,9 @@ data/
 *.csv
 *.parquet
 
-# Virtual environments (do not ignore the Gym package folder env/)
+# Virtual environments only (do not list ENV/ — on Windows it also matches env/)
 .venv/
 venv/
-ENV/
 
 # OS
 .DS_Store
