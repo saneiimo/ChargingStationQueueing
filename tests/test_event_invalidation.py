@@ -106,7 +106,9 @@ def test_zero_power_does_not_schedule_or_crash():
     heap = EventQueue()
     ev = EV(id=0, c_b=50.0, s_i=0.2, s_f=0.8, arrival_time=0.0)
     ev.update_charging_power(0.0, 0.0, heap)
-    print(f"  After update_charging_power(0): p_act={ev.p_act}, heap_empty={heap.empty()}")
+    print(
+        f"  After update_charging_power(0): p_act={ev.p_act}, heap_empty={heap.empty()}"
+    )
 
     assert ev.p_act == 0.0
     assert heap.empty()
