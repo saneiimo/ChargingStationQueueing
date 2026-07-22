@@ -1,6 +1,7 @@
 # Python
 __pycache__/
 *.pyc
+.pytest_cache/
 
 # Jupyter
 .ipynb_checkpoints/
@@ -10,9 +11,10 @@ data/
 *.csv
 *.parquet
 
-# Environments
+# Virtual environments (do not ignore the Gym package folder env/)
 .venv/
-env/
+venv/
+ENV/
 
 # OS
 .DS_Store
