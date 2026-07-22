@@ -3,6 +3,20 @@ Checks that ProportionalPower respects brick caps and fixed nozzle slots.
 
 These tests build a pile directly (no full DES) so failures point at the
 power policy or pile indexing, not at the event engine.
+
+Each test prints what it is checking and the numbers it sees.
+
+Run from the repo root (prints need -s):
+
+    python -m pytest tests/test_power_policy.py -s -v
+
+Or run this file directly:
+
+    python tests/test_power_policy.py
+
+In a notebook:
+
+    !python -m pytest tests/test_power_policy.py -s -v
 """
 
 from __future__ import annotations
@@ -14,29 +28,59 @@ from models.pile import ChargingPile
 from policy.power.proportional import ProportionalPower
 
 
-def _make_ev(ev_id: int, c_b: float, s_i: float = 0.2, s_f: float = 0.8, s_th: float = 0.5) -> EV:
+def _make_ev(
+    ev_id: int, c_b: float, s_i: float = 0.2, s_f: float = 0.8, s_th: float = 0.5
+) -> EV:
     return EV(id=ev_id, c_b=c_b, s_i=s_i, s_f=s_f, arrival_time=0.0, s_th=s_th)
 
 
 def test_non_overloaded_ceil_allocation():
+    """When demand fits, each EV gets ceil(p_req / p_brick) bricks."""
+    print("\n=== test_non_overloaded_ceil_allocation ===")
+    print(
+        "Intent: with enough bricks, allotment should be ceil of each EV's "
+        "isolated request (no sharing fight)."
+    )
+
     policy = ProportionalPower()
     pile = ChargingPile(id=0, n_nozzles=2, num_bricks=10, p_brick=10.0)
-    ev1 = _make_ev(1, 25)  # p_req = 25*(1/0.5)*(1-0.5)? tan_B = c_b*c_rate/(1-s_th)=25/0.5=50, p_req=50*(1-0.5)=25
-    ev2 = _make_ev(2, 35)  # p_req = 35
-    # Use c_b so p_req matches ceil targets used historically: p_req = c_b when s_th=0.5 and c_rate=1
-    # Actually p_req_max = c_b, tan_B = c_b/(1-s_th), p_req = tan_B*(1-s_th) = c_b when s < s_th.
+    # With s_th=0.5 and c_rate=1, p_req equals c_b while SoC < s_th.
+    ev1 = _make_ev(1, 25)
+    ev2 = _make_ev(2, 35)
     pile.connect_ev(ev1)
     pile.connect_ev(ev2)
-    assignments = policy.update_power(pile)
+    print(
+        f"  Setup: p_brick={pile.p_brick}, num_bricks={pile.num_bricks}, "
+        f"EV1 p_req={ev1.p_req:.1f}, EV2 p_req={ev2.p_req:.1f}"
+    )
 
-    assert pile.ev_bricks[ev1.nozzle_id] == ceil(ev1.p_req / pile.p_brick)
-    assert pile.ev_bricks[ev2.nozzle_id] == ceil(ev2.p_req / pile.p_brick)
+    assignments = policy.update_power(pile)
+    power_by_id = {e.id: p for e, p in assignments}
+    expected_1 = ceil(ev1.p_req / pile.p_brick)
+    expected_2 = ceil(ev2.p_req / pile.p_brick)
+
+    print(
+        f"  Result: ev_bricks={pile.ev_bricks}, "
+        f"expected=[{expected_1}, {expected_2}], "
+        f"powers={power_by_id}, overloaded={pile.is_overloaded}"
+    )
+
+    assert pile.ev_bricks[ev1.nozzle_id] == expected_1
+    assert pile.ev_bricks[ev2.nozzle_id] == expected_2
     assert sum(pile.ev_bricks) <= pile.num_bricks
-    assert {e.id: p for e, p in assignments}[1] == pile.ev_bricks[ev1.nozzle_id] * 10
-    assert {e.id: p for e, p in assignments}[2] == pile.ev_bricks[ev2.nozzle_id] * 10
+    assert power_by_id[1] == pile.ev_bricks[ev1.nozzle_id] * 10
+    assert power_by_id[2] == pile.ev_bricks[ev2.nozzle_id] * 10
+    print("  PASS")
 
 
 def test_overloaded_respects_brick_cap():
+    """When isolated demand exceeds bricks, total allotment must equal num_bricks."""
+    print("\n=== test_overloaded_respects_brick_cap ===")
+    print(
+        "Intent: if ceil requests sum above the brick pool, policy must still "
+        "assign exactly num_bricks and give each EV at least one."
+    )
+
     policy = ProportionalPower()
     pile = ChargingPile(id=0, n_nozzles=2, num_bricks=4, p_brick=50.0)
     # Isolated demand: ceil(105/50)+ceil(90/50) = 3+2 = 5 > 4
@@ -44,13 +88,37 @@ def test_overloaded_respects_brick_cap():
     ev2 = _make_ev(2, 90, s_th=0.5)
     pile.connect_ev(ev1)
     pile.connect_ev(ev2)
+
+    isolated = [
+        ceil(ev1.p_req / pile.p_brick),
+        ceil(ev2.p_req / pile.p_brick),
+    ]
+    print(
+        f"  Setup: p_reqs=[{ev1.p_req:.1f}, {ev2.p_req:.1f}], "
+        f"isolated ceils={isolated}, pool={pile.num_bricks}, "
+        f"is_overloaded={pile.is_overloaded}"
+    )
     assert pile.is_overloaded
+
     policy.update_power(pile)
+    print(
+        f"  Result: ev_bricks={pile.ev_bricks}, sum={sum(pile.ev_bricks)}, "
+        f"each >= 1? {all(pile.ev_bricks[e.nozzle_id] >= 1 for e in pile.evs)}"
+    )
+
     assert sum(pile.ev_bricks) == pile.num_bricks
     assert all(pile.ev_bricks[e.nozzle_id] >= 1 for e in pile.evs)
+    print("  PASS")
 
 
 def test_disconnect_middle_nozzle_keeps_slots():
+    """Removing the EV in slot 0 must not renumber the EV still in slot 1."""
+    print("\n=== test_disconnect_middle_nozzle_keeps_slots ===")
+    print(
+        "Intent: nozzle indices are fixed slots. After unplugging EV1 from slot 0, "
+        "EV2 should stay on nozzle_id=1 and brick vector stays aligned."
+    )
+
     policy = ProportionalPower()
     pile = ChargingPile(id=0, n_nozzles=2, num_bricks=5, p_brick=25.0)
     ev1 = _make_ev(1, 50)
@@ -58,22 +126,44 @@ def test_disconnect_middle_nozzle_keeps_slots():
     pile.connect_ev(ev1)
     pile.connect_ev(ev2)
     policy.update_power(pile)
+    print(
+        f"  Before disconnect: nozzles="
+        f"{[None if e is None else e.id for e in pile.nozzles]}, "
+        f"ev2.nozzle_id={ev2.nozzle_id}, ev_bricks={pile.ev_bricks}"
+    )
 
-    # Disconnect first slot; second EV must keep nozzle_id == 1
     slot1 = ev2.nozzle_id
     pile.disconnect_ev(ev1)
+    print(
+        f"  After disconnect EV1: nozzles="
+        f"{[None if e is None else e.id for e in pile.nozzles]}, "
+        f"ev2.nozzle_id={ev2.nozzle_id}, ev_bricks={pile.ev_bricks}"
+    )
+
     assert ev2.nozzle_id == slot1
     assert pile.nozzles[0] is None
     assert pile.nozzles[1] is ev2
     assert pile.ev_bricks[0] == 0
 
     policy.update_power(pile)
+    print(
+        f"  After redistribute: ev_bricks={pile.ev_bricks}, "
+        f"EV2 bricks={pile.ev_bricks[ev2.nozzle_id]}"
+    )
     assert pile.ev_bricks[ev2.nozzle_id] >= 1
     assert sum(pile.ev_bricks) <= pile.num_bricks
     pile.check_invariants()
+    print("  PASS")
 
 
 def test_micro_distribute_frees_brick_from_trigger_ev():
+    """CHARGE_CHANGE path: free one brick from the trigger EV, then refill leftovers."""
+    print("\n=== test_micro_distribute_frees_brick_from_trigger_ev ===")
+    print(
+        "Intent: update_power(pile, ev=EV1) should drop one brick from EV1 then "
+        "reassign any free bricks; total must stay at num_bricks."
+    )
+
     policy = ProportionalPower()
     pile = ChargingPile(id=0, n_nozzles=2, num_bricks=4, p_brick=25.0)
     ev1 = _make_ev(1, 100)
@@ -81,8 +171,23 @@ def test_micro_distribute_frees_brick_from_trigger_ev():
     pile.connect_ev(ev1)
     pile.connect_ev(ev2)
     policy.update_power(pile)
-    before = pile.ev_bricks[ev1.nozzle_id]
-    assert before >= 1
+    before = list(pile.ev_bricks)
+    before_ev1 = pile.ev_bricks[ev1.nozzle_id]
+    print(f"  Before micro: ev_bricks={before}, EV1 bricks={before_ev1}")
+    assert before_ev1 >= 1
+
     policy.update_power(pile, ev=ev1)
-    # Trigger EV lost one brick before refill; total still capped.
+    after = list(pile.ev_bricks)
+    print(f"  After micro (trigger=EV1): ev_bricks={after}, sum={sum(after)}")
+
     assert sum(pile.ev_bricks) == pile.num_bricks
+    print("  PASS")
+
+
+if __name__ == "__main__":
+    print("Running test_power_policy.py (direct mode)")
+    test_non_overloaded_ceil_allocation()
+    test_overloaded_respects_brick_cap()
+    test_disconnect_middle_nozzle_keeps_slots()
+    test_micro_distribute_frees_brick_from_trigger_ev()
+    print("\nAll tests in test_power_policy.py finished.")
