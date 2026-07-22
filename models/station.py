@@ -1,15 +1,29 @@
+"""
+Charging station: a finite waiting queue plus a list of piles.
+
+This is the "yard" the SimulationEngine drives. Arrivals are offered to the
+queue (or dropped if full). Assignment pops the head-of-line EV and plugs it
+into a chosen pile. The station does not decide *which* pile — that comes from
+a queue policy or the RL agent via the engine's assign_ev(pile_id).
+
+Clock properties (current_time / next_time) are delegated to the engine so
+piles and EVs can stamp service start / departure without importing the engine
+directly in hot paths.
+"""
+
 from __future__ import annotations
 from collections import deque
 from .pile import ChargingPile
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from ev import EV
+    from models.ev import EV
     from policy.power.base import PowerPolicy
-    from simulation.engine_2 import SimulationEngine
+    from simulation.engine import SimulationEngine
 
 
 class ChargingStation:
+    """Owns the queue, piles, arrival parameter, and the active power policy."""
 
     def __init__(
         self,
@@ -31,90 +45,88 @@ class ChargingStation:
         self.piles = [
             ChargingPile(i, n_nozzles, n_bricks, p_brick, self) for i in range(n_piles)
         ]
-        self.lam = lam  # Arrival rate (mean minutes); Number of arrivals in any interval of length t is Poisson(t / lambda)
-        # and each inter-arrival time is Exp(1 / lambda)
+        # Mean inter-arrival time (minutes). Count in an interval of length t
+        # is Poisson(t / lam); inter-arrivals are Exp with mean lam.
+        self.lam = lam
         self.queue = deque()
+        # Wired by SimulationEngine.__init__.
+        self.engine: SimulationEngine | None = None
 
     # --------------------------------------------------
-    # Reset station state
+    # Clock (delegates to SimulationEngine)
+    # --------------------------------------------------
+
+    @property
+    def current_time(self) -> float:
+        if self.engine is None:
+            return float("inf")
+        return self.engine.current_time
+
+    @property
+    def next_time(self) -> float:
+        if self.engine is None:
+            return float("inf")
+        return self.engine.next_time
+
+    # --------------------------------------------------
+    # Reset / queue / assignment
     # --------------------------------------------------
 
     def reset(self):
-
         self.queue.clear()
-        self.dropped_cars.clear()
-
         for pile in self.piles:
             pile.reset()
 
-    # --------------------------------------------------
-    # Queue management
-    # --------------------------------------------------
-
-    def add_to_queue(self, ev: EV):
-        # Queue full
+    def add_to_queue(self, ev: EV) -> bool:
+        """Return False if the queue is full (arrival is dropped)."""
         if len(self.queue) >= self.queue_capacity:
             return False
-        # Append to queue
         self.queue.append(ev)
         return True
 
     def pop_from_queue(self):
-
         if not self.queue:
             return None
-
         return self.queue.popleft()
 
-    # --------------------------------------------------
-    # Assignment logic
-    # --------------------------------------------------
-
     def assign_ev(self, pile: ChargingPile):
-
-        # Penalty for trying to assign from empty queue
+        """
+        Move the head-of-line EV onto `pile` if both queue and pile allow it.
+        Returns the EV, or None if the move is illegal.
+        """
         if not self.queue:
             return None
-
-        # Penalty for trying to assign to a full pile
         if pile.is_full:
             return None
 
         ev = self.pop_from_queue()
-        # Connect ev to the target pile
         pile.connect_ev(ev)
-
         return ev
 
     def remove_ev(self, ev: EV):
+        """Unplug an EV that has finished (or is otherwise leaving)."""
         pile = ev.pile
         pile.disconnect_ev(ev)
 
     # --------------------------------------------------
-    # System information helpers
+    # Snapshots used by metrics / heuristics
     # --------------------------------------------------
 
     def vehicles_in_system(self):
-
         charging = sum(len(pile.evs) for pile in self.piles)
         return charging + len(self.queue)
 
     def vehicles_charging(self):
-
         return sum(len(pile.evs) for pile in self.piles)
 
     def queue_length(self):
-
         return len(self.queue)
 
     def available_piles(self):
-
-        return [pile for pile in self.piles if not pile.is_full()]
+        return [pile for pile in self.piles if not pile.is_full]
 
     def is_queue_full(self):
-
         return len(self.queue) >= self.queue_capacity
 
     def is_idle(self):
-
         return self.vehicles_charging() == 0 and len(self.queue) == 0
