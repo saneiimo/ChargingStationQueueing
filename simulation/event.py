@@ -1,3 +1,12 @@
+"""
+Timed events for the discrete-event simulator.
+
+The engine keeps a min-heap of Event objects. ARRIVAL and SIM_OVER are always
+kept. DEPARTURE and CHARGE_CHANGE carry an event_id that must match the EV's
+current event_generation; otherwise they are stale (power was redistributed
+and a newer event replaced them) and get skipped.
+"""
+
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -10,24 +19,29 @@ if TYPE_CHECKING:
 
 @dataclass
 class Event:
+    """One scheduled instant in the simulation."""
+
     time: float
     event_type: EventType
-    # Used to invalidate CHARGE_CHANGE and DEPARTURE events for EVs; when there is a power redistribution, there next events of EVs might change and we need to invalidate the previous events
+    # Matches EV.event_generation for DEPARTURE / CHARGE_CHANGE; unused otherwise.
     event_id: int | None = None
-    obj: EV | None = None  # optional; if provided, must be EV
+    # The EV this event belongs to (arrivals, departures, charge changes).
+    obj: EV | None = None
 
     def __lt__(self, other: Event) -> bool:
+        # heapq needs a total order; earliest time wins.
         return self.time < other.time
 
 
 class EventType(Enum):
-    ARRIVAL = 1
-    DEPARTURE = 2
-    CHARGE_CHANGE = 3
-    SIM_OVER = 4
+    ARRIVAL = 1  # EV shows up and tries to join the station queue
+    DEPARTURE = 2  # EV reaches target SoC and leaves its nozzle
+    CHARGE_CHANGE = 3  # EV underuses a brick; pile should redistribute power
+    SIM_OVER = 4  # Hard stop at MAX_TIME
 
 
 class EventQueue:
+    """Thin wrapper around heapq so the engine can push/pop/clear events."""
 
     def __init__(self):
         self.heap = []
@@ -43,3 +57,6 @@ class EventQueue:
 
     def empty(self):
         return len(self.heap) == 0
+
+    def clear(self):
+        self.heap.clear()
