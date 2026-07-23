@@ -80,6 +80,7 @@ class ChargingPile:
                 ev.pile = self
                 ev.pile_tracker = self
                 ev.nozzle_id = i
+                ev.nozzle_id_tracker = i  # kept after departure for plots
                 # Assignment happens between events; clock is already at decision time.
                 ev.service_start_time = self.current_time
                 return
@@ -87,7 +88,14 @@ class ChargingPile:
         raise ValueError("Charging Pile is full.")
 
     def disconnect_ev(self, ev: EV):
-        """Unplug EV, free its nozzle/bricks, and invalidate its pending events."""
+        """
+        Unplug EV, free its nozzle/bricks, and invalidate its pending events.
+
+        Called after the engine has already projected energy over the last
+        interval and committed ``s_current`` (typically to ``s_f``). Energy
+        metrics for that interval used the pre-departure ``p_act``; they are
+        not recomputed here.
+        """
         if ev.pile is None:
             raise ValueError("EV is not assigned to any pile.")
         if ev.pile != self:
@@ -96,13 +104,25 @@ class ChargingPile:
             raise ValueError("EV nozzle slot is inconsistent.")
 
         idx = ev.nozzle_id
+        depart_t = self.next_time
+        last_allot = (
+            ev.charge_trace[-1][4] if ev.charge_trace else float(ev.p_act)
+        )
+        # Trace-only: SoC is already at the departure value, so p_req may have
+        # dropped (taper) while p_act still holds the last redistribution
+        # setpoint. Re-cap so the final sample is instantaneous draw at s_f
+        # under the same allotment — does not affect energy already accrued.
+        ev.p_act = min(ev.p_req, last_allot)
+        ev.record_charge_sample(depart_t, p_allot=last_allot)
+
         self.nozzles[idx] = None
         self.ev_bricks[idx] = 0
         ev.invalidate_pending_events()
         ev.pile = None
         ev.nozzle_id = None
+        # nozzle_id_tracker / pile_tracker kept for post-run visualization
         # Engine still has current_time < next_time while processing this departure.
-        ev.departure_time = self.next_time
+        ev.departure_time = depart_t
 
     @property
     def current_time(self) -> float:
