@@ -11,6 +11,10 @@ Given p_act, we can compute:
   - how much energy was delivered (compute_deltaE_power)
   - when the next DEPARTURE or CHARGE_CHANGE should fire (dt_next_candidate)
 
+SoC projection is piecewise (constant power to s_taper, then expo). After other
+DES events split an interval, s_current may already be past s_taper; those
+helpers continue expo from the current SoC so departure still lands on s_f.
+
 The SimulationEngine calls those helpers; this module does not own the clock.
 """
 
@@ -19,7 +23,7 @@ from dataclasses import dataclass
 from math import log, exp
 import numpy as np
 from typing import TYPE_CHECKING
-from config import S_THRESH, C_RATE
+from config import S_THRESH, C_RATE, HR2MIN
 from simulation.event import Event, EventQueue, EventType
 
 if TYPE_CHECKING:
@@ -38,7 +42,8 @@ class EV:
     service_start_time: float = None
     pile: ChargingPile = None  # Set while plugged in; cleared on disconnect
     pile_tracker: ChargingPile = None  # Last pile used (kept after departure)
-    nozzle_id: int = None  # Fixed slot index on the pile (stable if others leave)
+    nozzle_id: int = None  # Fixed slot index on the pile (cleared on disconnect)
+    nozzle_id_tracker: int = None  # Same slot, kept after departure (for plots)
     energy_received: float = 0  # Integrated from deltaE_power
     energy_received_2: float = 0  # Integrated from SoC deltas (sanity check)
     departure_time: float = float("inf")
@@ -54,10 +59,34 @@ class EV:
         self.s_next = self.s_current
         self.deltaE_power = 0.0
         self.p_act = 0.0
+        # Sparse log for visualization: (t, SoC, p_req, p_act, p_allot) at
+        # each redistribution and at departure. Samples are instantaneous
+        # (p_act <= p_req); interval energy uses the pre-event p_act in the
+        # engine, not these rows. See visualization/pile_power.py.
+        self.charge_trace: list[tuple[float, float, float, float, float]] = []
 
     def invalidate_pending_events(self) -> None:
         """Mark any previously scheduled EV-timed events as stale."""
         self.event_generation += 1
+
+    def record_charge_sample(self, t: float, p_allot: float) -> None:
+        """
+        Append one instantaneous (time, SoC, BMS request, actual power, allotment)
+        sample for plots / post-run inspection.
+
+        Caller must set ``p_act`` consistently with ``p_req`` at this SoC before
+        calling (``update_charging_power`` does; departure re-caps in
+        ``ChargingPile.disconnect_ev``). This log is not used for energy metrics.
+        """
+        self.charge_trace.append(
+            (
+                float(t),
+                float(self.s_current),
+                float(self.p_req),
+                float(self.p_act),
+                float(p_allot),
+            )
+        )
 
     def update_charging_power(
         self, power: float, schedule_time: float, event_heap: EventQueue
@@ -69,6 +98,7 @@ class EV:
         current event time). Old pending events are invalidated first.
         """
         self.p_act = min(self.p_req, power)
+        self.record_charge_sample(schedule_time, p_allot=power)
         self.invalidate_pending_events()
 
         if self.p_act <= 0:
@@ -100,8 +130,11 @@ class EV:
     @property
     def s_taper(self) -> float:
         """
-        SoC where the constant-power segment would end under this p_act.
-        If p_act == p_req_max then s_taper == s_th.
+        SoC knee where constant-power charging at this ``p_act`` would end.
+
+        Defined by ``p_act = tan_B * (1 - s_taper)``. If ``p_act == p_req_max``
+        then ``s_taper == s_th``. Independent of ``s_current``; after several DES
+        steps it is common that ``s_current > s_taper`` (already in expo region).
         """
         if self.p_act <= 0:
             return self.s_current
@@ -109,10 +142,19 @@ class EV:
 
     @property
     def dt_taper(self) -> float:
-        """Minutes from now until we hit s_taper (0 if already in taper)."""
+        """
+        Minutes until ``s_taper`` under current ``p_act``.
+
+        Returns 0 if already at or past the knee (``s_current >= s_taper``),
+        including the usual case after intermediate DES projections in taper.
+        Never returns a negative value.
+        """
         if self.p_act <= 0:
             return 0.0
-        return self.c_b / self.p_act * (self.s_taper - self.s_current)
+        gap = self.s_taper - self.s_current
+        if gap <= 0:
+            return 0.0
+        return self.c_b / self.p_act * gap
 
     @property
     def next_state(self) -> tuple[float, EventType]:
@@ -163,47 +205,75 @@ class EV:
         return self.c_b / self.p_act * (linear_term + log_term)
 
     def update_s_next(self, delta_t: float) -> None:
-        """Project SoC forward by delta_t minutes into s_next (does not commit)."""
+        """
+        Project SoC forward by ``delta_t`` minutes into ``s_next`` (no commit).
+
+        Under fixed ``p_act``: constant power until ``s_taper``, then exponential
+        taper. If ``s_current`` is already past ``s_taper`` (typical after other
+        DES events split the interval), continue with expo-from-**current** SoC.
+        The closed form that starts the expo at ``s_taper`` is only valid when
+        ``s_current <= s_taper``; using it after the knee undershoots SoC and
+        made finished EVs leave below ``s_f``.
+        """
         if self.p_act <= 0 or delta_t <= 0:
             self.s_next = self.s_current
             return
 
         k_tmp = delta_t * self.p_act / self.c_b
+        s_tap = self.s_taper
+        one_m_tap = 1.0 - s_tap
 
-        if np.isclose(self.dt_taper, 0, rtol=1e-6, atol=1e-9):
-            self.s_next = 1 - (1 - self.s_current) * exp(-k_tmp / (1 - self.s_taper))
+        # Already in expo region (or numerically at the knee).
+        if self.s_current >= s_tap - 1e-12:
+            self.s_next = 1.0 - (1.0 - self.s_current) * exp(-k_tmp / one_m_tap)
+            return
+
+        dt_tap = self.c_b / self.p_act * (s_tap - self.s_current)
+        if delta_t <= dt_tap:
+            self.s_next = self.s_current + k_tmp
         else:
-            if delta_t < self.dt_taper:
-                self.s_next = k_tmp + self.s_current
-            else:
-                exp_term = exp(
-                    (self.s_taper - self.s_current - k_tmp) / (1 - self.s_taper)
-                )
-                self.s_next = 1 - (1 - self.s_taper) * exp_term
+            # Linear to s_taper, then expo for the remainder (from the knee).
+            k_expo = k_tmp - (s_tap - self.s_current)
+            self.s_next = 1.0 - one_m_tap * exp(-k_expo / one_m_tap)
 
     def compute_deltaE_power(self, delta_t: float) -> None:
-        """Energy (kWh) delivered over delta_t under current p_act → deltaE_power."""
+        """
+        Energy (kWh) delivered over ``delta_t`` under current ``p_act``.
+
+        Matches ``update_s_next``: linear while below ``s_taper``, expo after.
+        When already past the knee, integrate expo from ``s_current`` (not from
+        ``s_taper``). ``c_b`` is stored in kW·min, so divide by ``HR2MIN`` for kWh.
+        """
         if self.p_act <= 0 or delta_t <= 0:
             self.deltaE_power = 0.0
             return
 
-        if np.isclose(self.dt_taper, 0, rtol=1e-6, atol=1e-9):
-            expo_t_i = exp(-self.tan_B / self.c_b * (-self.dt_taper))
-            expo_t_f = exp(-self.tan_B / self.c_b * (delta_t - self.dt_taper))
-            self.deltaE_power = -self.c_b * (1 - self.s_taper) * (expo_t_f - expo_t_i)
+        s_tap = self.s_taper
+        rate = self.tan_B / self.c_b  # == p_act / (c_b * (1 - s_tap))
+
+        # Already in expo region (or at the knee).
+        if self.s_current >= s_tap - 1e-12:
+            expo = exp(-rate * delta_t)
+            self.deltaE_power = (
+                -self.c_b * (1.0 - self.s_current) * (expo - 1.0) / HR2MIN
+            )
+            return
+
+        dt_tap = self.c_b / self.p_act * (s_tap - self.s_current)
+        if delta_t <= dt_tap:
+            self.deltaE_power = self.p_act * delta_t / HR2MIN
         else:
-            if delta_t < self.dt_taper:
-                self.deltaE_power = self.p_act * delta_t
-            else:
-                lin_part = self.p_act * self.dt_taper
-                expo_t_f = exp(-self.tan_B / self.c_b * (delta_t - self.dt_taper))
-                expo_part = -self.c_b * (1 - self.s_taper) * (expo_t_f - 1)
-                self.deltaE_power = lin_part + expo_part
+            lin_part = self.p_act * dt_tap
+            expo = exp(-rate * (delta_t - dt_tap))
+            expo_part = -self.c_b * (1.0 - s_tap) * (expo - 1.0)
+            self.deltaE_power = (lin_part + expo_part) / HR2MIN
 
     @property
     def deltaE_SoC(self) -> float:
-        """Energy implied by the SoC change s_next - s_current."""
-        return self.c_b * (self.s_next - self.s_current)
+        """Energy implied by the SoC change s_next - s_current.
+        Note that as C_b is converted to kWmin, we need to
+        do a unit conversion using HR2MIN"""
+        return self.c_b * (self.s_next - self.s_current) / HR2MIN
 
     @property
     def SoC_check(self) -> bool:
