@@ -32,7 +32,7 @@ class ProportionalPower(PowerPolicy):
             pile.ev_bricks = [0] * pile.n_nozzles
             return []
 
-        if ev is not None:
+        if ev is not None and pile.is_overloaded:
             self._micro_distribute(pile, ev)
         else:
             self._distribute(pile)
@@ -53,29 +53,19 @@ class ProportionalPower(PowerPolicy):
         self._clear_bricks(pile)
 
         if pile.is_overloaded:
+            # Overloaded: demand exceeds the brick pool.
+            # Guarantee one brick per plugged EV (safe: num_bricks >= n_nozzles >= n_evs),
+            # then greedily hand remaining bricks to the largest unmet p_req.
             total_req = sum(ev.p_req for ev in pile.evs)
             if total_req <= 0:
-                for connected in pile.evs:
-                    pile.ev_bricks[connected.nozzle_id] = 1
-            else:
-                for connected in pile.evs:
-                    share = connected.p_req / total_req
-                    bricks = int(share * pile.num_bricks)
-                    pile.ev_bricks[connected.nozzle_id] = max(1, bricks)
-
-            # max(1, floor(...)) can sum above num_bricks — peel extras back.
-            while sum(pile.ev_bricks) > pile.num_bricks:
-                donor = max(
-                    (e for e in pile.evs if pile.ev_bricks[e.nozzle_id] > 1),
-                    key=lambda e: pile.ev_bricks[e.nozzle_id],
-                    default=None,
+                raise ValueError(
+                    f"Overloaded pile {pile.id} has total_req={total_req} <= 0"
                 )
-                if donor is None:
-                    break
-                pile.ev_bricks[donor.nozzle_id] -= 1
-
-            self._micro_distribute(pile)
+            for connected in pile.evs:
+                pile.ev_bricks[connected.nozzle_id] = 1
+            self._micro_distribute(pile)  # fills up to num_bricks
         else:
+            # Not overloaded: each EV can take its isolated ceil(p_req / p_brick).
             for connected in pile.evs:
                 pile.ev_bricks[connected.nozzle_id] = ceil(
                     connected.p_req / pile.p_brick
