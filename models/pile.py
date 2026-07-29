@@ -105,9 +105,7 @@ class ChargingPile:
 
         idx = ev.nozzle_id
         depart_t = self.next_time
-        last_allot = (
-            ev.charge_trace[-1][4] if ev.charge_trace else float(ev.p_act)
-        )
+        last_allot = ev.charge_trace[-1][4] if ev.charge_trace else float(ev.p_act)
         # Trace-only: SoC is already at the departure value, so p_req may have
         # dropped (taper) while p_act still holds the last redistribution
         # setpoint. Re-cap so the final sample is instantaneous draw at s_f
