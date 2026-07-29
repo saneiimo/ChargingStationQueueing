@@ -1,0 +1,42 @@
+"""Small helpers to roll out demo episodes for plotting."""
+
+from __future__ import annotations
+
+import numpy as np
+
+from env.charging_env import ChargingStationEnv
+from policy.queue.fifo import FIFOQueuePolicy
+
+
+def run_fifo_episode(
+    n_piles: int = 4,
+    n_nozzles: int = 2,
+    n_bricks: int = 5,
+    p_brick: float = 25.0,
+    queue_capacity: int = 10,
+    lam: float = 5.0,
+    seed: int = 42,
+    policy_seed: int = 1,
+) -> ChargingStationEnv:
+    """Roll out one full day under FIFO pile choice (records charge traces)."""
+    env = ChargingStationEnv(
+        n_piles=n_piles,
+        n_nozzles=n_nozzles,
+        n_bricks=n_bricks,
+        p_brick=p_brick,
+        queue_capacity=queue_capacity,
+        lam=lam,
+    )
+    obs, _ = env.reset(seed=seed)
+    rng = np.random.default_rng(policy_seed)
+    policy = FIFOQueuePolicy()
+    done = bool(env.engine.terminated)
+    steps = 0
+    while not done and steps < 50000:
+        if not env.engine.needs_assignment_decision():
+            break
+        mask = env.action_masks()
+        action = policy.select_pile(obs, mask, rng)
+        obs, _, done, _, _ = env.step(action)
+        steps += 1
+    return env
