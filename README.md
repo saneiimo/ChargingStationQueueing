@@ -64,10 +64,57 @@ in the RL agent. The agent only chooses the pile for the head-of-line EV.
 
 ```bash
 python main.py
-pytest tests/
+
+# All tests (use -s so print statements show)
+python -m pytest tests/ -s -v
+
+# Individual suites
+python -m pytest tests/test_simulation_env.py -s -v
+python -m pytest tests/test_queueing_laws.py -s -v
+python tests/test_simulation_env.py
+python tests/test_queueing_laws.py
 ```
 
-## RL loop (decision-point MDP)
+In a notebook:
+
+```python
+!python -m pytest tests/test_simulation_env.py -s -v
+!python -m pytest tests/test_queueing_laws.py -s -v
+```
+
+## Visualization
+
+After a run (or via the CLI helper), plot BMS request vs actual power for every
+nozzle on one pile:
+
+```bash
+python -m visualization.pile_power --pile 0 --t-start 0 --t-end 240 --seed 42 --save pile0.png
+```
+
+Optional `--show` opens an interactive window. In a notebook:
+
+```python
+from visualization.pile_power import run_fifo_episode, plot_pile_nozzle_power
+import matplotlib.pyplot as plt
+
+env = run_fifo_episode(seed=42)
+fig = plot_pile_nozzle_power(env, pile_id=0, t_start=0, t_end=200)
+plt.show()
+```
+
+Per-EV theory vs simulation (`P-S`, `T-S`, `P-T`):
+
+```python
+from visualization.ev_curves import plot_ev_theory_vs_sim
+
+figs = plot_ev_theory_vs_sim(env, ev_ids=[0, 3], charts=["P-S", "T-S", "P-T"])
+plt.show()
+```
+
+```bash
+python -m visualization.ev_curves --evs 0,1,2 --charts P-S,T-S,P-T --seed 42
+```
+
 
 The env does **not** ask the agent to advance time. It auto-advances the
 simulator until either:
