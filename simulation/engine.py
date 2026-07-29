@@ -95,7 +95,9 @@ class SimulationEngine:
         event_id = event.event_id
 
         if ev is None or event_id is None:
-            return False
+            raise ValueError(
+                f"This shouldn't happen because ev is None: {ev is None} or there is no event id assigned to DEPARTURE or CHARGE_CHANGE event {event_id is None}."
+            )
 
         if event_type in (EventType.DEPARTURE, EventType.CHARGE_CHANGE):
             return event_id == ev.event_generation
