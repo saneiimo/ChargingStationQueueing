@@ -32,8 +32,9 @@ from simulation.engine import SimulationEngine
 from policy.power.proportional import ProportionalPower
 from config import (
     BATTERY_CAP_OPTIONS,
-    QUEUE_HOLDING_COST,
     DROP_PENALTY,
+    HR2MIN,
+    QUEUE_HOLDING_COST,
 )
 from typing import TYPE_CHECKING
 
@@ -131,7 +132,8 @@ class ChargingStationEnv(gym.Env):
             features.append(
                 min(hol.p_req / self._max_power, 1.0) if self._max_power else 0.0
             )
-            features.append(hol.energy_needed / self._max_battery)
+            # energy_needed is kWh; _max_battery is kW·min → convert to kWh.
+            features.append(hol.energy_needed / (self._max_battery / HR2MIN))
 
         features.append(len(self.engine.station.queue) / max(self.queue_capacity, 1))
         return np.array(features, dtype=np.float32)
@@ -161,8 +163,7 @@ class ChargingStationEnv(gym.Env):
         steps = 0
 
         while (
-            not self.engine.needs_assignment_decision()
-            and not self.engine.terminated
+            not self.engine.needs_assignment_decision() and not self.engine.terminated
         ):
             q_before = len(self.engine.station.queue)
             t_before = self.engine.current_time
