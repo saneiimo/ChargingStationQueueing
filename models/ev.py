@@ -39,11 +39,11 @@ class EV:
     arrival_time: float
     s_th: float = S_THRESH
     c_rate: float = C_RATE  # C-rate: p_req_max = c_b * c_rate
-    service_start_time: float = None
-    pile: ChargingPile = None  # Set while plugged in; cleared on disconnect
-    pile_tracker: ChargingPile = None  # Last pile used (kept after departure)
-    nozzle_id: int = None  # Fixed slot index on the pile (cleared on disconnect)
-    nozzle_id_tracker: int = None  # Same slot, kept after departure (for plots)
+    service_start_time: float | None = None
+    pile: ChargingPile | None = None  # Set while plugged in; cleared on disconnect
+    pile_tracker: ChargingPile | None = None  # Last pile used (kept after departure)
+    nozzle_id: int | None = None  # Fixed slot index on the pile (cleared on disconnect)
+    nozzle_id_tracker: int | None = None  # Same slot, kept after departure (for plots)
     energy_received: float = 0  # Integrated from deltaE_power
     energy_received_2: float = 0  # Integrated from SoC deltas (sanity check)
     departure_time: float = float("inf")
@@ -55,7 +55,8 @@ class EV:
         self.tan_B = self.p_req_max / (1 - self.s_th)  # Slope of the taper segment
         self.s_current = self.s_i
         self.t_th = self.c_b / self.p_req_max * (self.s_th - self.s_i)
-        self.energy_needed = (self.s_f - self.s_i) * self.c_b
+        # Target energy in kWh (c_b is stored in kW·min).
+        self.energy_needed = (self.s_f - self.s_i) * self.c_b / HR2MIN
         self.s_next = self.s_current
         self.deltaE_power = 0.0
         self.p_act = 0.0
@@ -101,7 +102,7 @@ class EV:
         self.record_charge_sample(schedule_time, p_allot=power)
         self.invalidate_pending_events()
 
-        if self.p_act <= 0:
+        if np.isclose(self.p_act, 0, rtol=1e-6, atol=1e-9):
             # Stuck until a later redistribution gives this EV some power.
             return
 
@@ -136,7 +137,7 @@ class EV:
         then ``s_taper == s_th``. Independent of ``s_current``; after several DES
         steps it is common that ``s_current > s_taper`` (already in expo region).
         """
-        if self.p_act <= 0:
+        if np.isclose(self.p_act, 0, rtol=1e-6, atol=1e-9):
             return self.s_current
         return 1 - self.p_act / self.tan_B
 
@@ -149,7 +150,7 @@ class EV:
         including the usual case after intermediate DES projections in taper.
         Never returns a negative value.
         """
-        if self.p_act <= 0:
+        if np.isclose(self.p_act, 0, rtol=1e-6, atol=1e-9):
             return 0.0
         gap = self.s_taper - self.s_current
         if gap <= 0:
@@ -175,9 +176,17 @@ class EV:
                 self.n_bricks - 1 + self.pile.brickCheck_thresh
             ) * self.pile.p_brick
             p_thresh_2 = (self.n_bricks - 1) * self.pile.p_brick
-            p_next = p_thresh if self.p_act > p_thresh else p_thresh_2
+            if self.p_act > p_thresh and not np.isclose(
+                self.p_act, p_thresh, rtol=1e-6, atol=1e-9
+            ):
+                p_next = p_thresh
+            else:
+                p_next = p_thresh_2
+
             local_next_s = 1 - p_next / self.tan_B
-            if local_next_s < self.s_f:
+            if local_next_s < self.s_f and not np.isclose(
+                local_next_s, self.s_f, rtol=1e-6, atol=1e-9
+            ):
                 return (local_next_s, EventType.CHARGE_CHANGE)
             return (self.s_f, EventType.DEPARTURE)
         return (self.s_f, EventType.DEPARTURE)
@@ -193,7 +202,7 @@ class EV:
     @property
     def dt_next_candidate(self) -> float:
         """Minutes until the next DEPARTURE or CHARGE_CHANGE under current p_act."""
-        if self.p_act <= 0:
+        if np.isclose(self.p_act, 0, rtol=1e-6, atol=1e-9):
             return float("inf")
         linear_term = min(self.s_taper, self.s_next_candidate) - min(
             self.s_taper, self.s_current
@@ -215,7 +224,9 @@ class EV:
         ``s_current <= s_taper``; using it after the knee undershoots SoC and
         made finished EVs leave below ``s_f``.
         """
-        if self.p_act <= 0 or delta_t <= 0:
+        if np.isclose(self.p_act, 0, rtol=1e-6, atol=1e-9) or np.isclose(
+            delta_t, 0, rtol=1e-6, atol=1e-9
+        ):
             self.s_next = self.s_current
             return
 
@@ -224,17 +235,20 @@ class EV:
         one_m_tap = 1.0 - s_tap
 
         # Already in expo region (or numerically at the knee).
-        if self.s_current >= s_tap - 1e-12:
+        if self.s_current >= s_tap - 1e-9:
             self.s_next = 1.0 - (1.0 - self.s_current) * exp(-k_tmp / one_m_tap)
-            return
 
-        dt_tap = self.c_b / self.p_act * (s_tap - self.s_current)
-        if delta_t <= dt_tap:
-            self.s_next = self.s_current + k_tmp
+        # In the linear region
         else:
-            # Linear to s_taper, then expo for the remainder (from the knee).
-            k_expo = k_tmp - (s_tap - self.s_current)
-            self.s_next = 1.0 - one_m_tap * exp(-k_expo / one_m_tap)
+            # Compute time to taper
+            dt_tap = self.c_b / self.p_act * (s_tap - self.s_current)
+            # Still in the linear section after delta_t
+            if delta_t <= dt_tap:
+                self.s_next = self.s_current + k_tmp
+            else:
+                # Linear to s_taper, then expo for the remainder (from the knee).
+                k_expo = k_tmp - (s_tap - self.s_current)
+                self.s_next = 1.0 - one_m_tap * exp(-k_expo / one_m_tap)
 
     def compute_deltaE_power(self, delta_t: float) -> None:
         """
@@ -277,16 +291,19 @@ class EV:
 
     @property
     def SoC_check(self) -> bool:
+        """True if committed SoC matches the departure target ``s_f``."""
         return np.isclose(self.s_current, self.s_f, rtol=1e-6, atol=1e-9)
 
     @property
     def energy_received_check(self) -> bool:
+        """True if accrued energy (kWh) matches ``energy_needed`` (also kWh)."""
         return np.isclose(
             self.energy_received, self.energy_needed, rtol=1e-6, atol=1e-9
         )
 
     @property
     def energy_received_check_2(self) -> bool:
+        """True if power-integral and SoC-delta energy tallies agree (both kWh)."""
         return np.isclose(
             self.energy_received, self.energy_received_2, rtol=1e-6, atol=1e-9
         )
