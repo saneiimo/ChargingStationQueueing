@@ -36,7 +36,7 @@ def run_fifo_episode(
         if not env.engine.needs_assignment_decision():
             break
         mask = env.action_masks()
-        action = policy.select_pile(obs, mask, rng)
-        obs, _, done, _, _ = env.step(action)
+        ev, pile_id = policy.decide(obs, mask, rng, env.engine.station)
+        obs, _, done, _, _ = env.step(pile_id, ev=ev)
         steps += 1
     return env

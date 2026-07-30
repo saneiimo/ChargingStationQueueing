@@ -1,9 +1,9 @@
 """
-Roll out one simulated day with the FIFO pile-choice baseline.
+Roll out one simulated day with a queue-assignment baseline.
 
 Useful as a smoke test after changing the station model or the Gym wrapper.
-For training, replace FIFOQueuePolicy with a masked RL policy that reads
-env.action_masks().
+For training, replace the heuristic with a masked RL policy that reads
+env.action_masks() and calls env.step(pile_id) (head-of-line EV).
 """
 
 import numpy as np
@@ -27,8 +27,8 @@ total_reward = 0.0
 
 while not done:
     mask = env.action_masks()
-    action = policy.select_pile(obs, mask, rng)
-    obs, reward, done, _, info = env.step(action)
+    ev, pile_id = policy.decide(obs, mask, rng, env.engine.station)
+    obs, reward, done, _, info = env.step(pile_id, ev=ev)
     total_reward += reward
 
 print(f"Finished EVs: {len(env.engine.metrics.finished_evs)}")

@@ -131,14 +131,14 @@ def test_env_decision_point_and_fifo_episode():
         assert env.engine.needs_assignment_decision() or env.engine.terminated
         mask = env.action_masks()
         assert mask.any()
-        action = policy.select_pile(obs, mask, rng)
-        obs, reward, done, truncated, info = env.step(action)
+        ev, pile_id = policy.decide(obs, mask, rng, env.engine.station)
+        obs, reward, done, truncated, info = env.step(pile_id, ev=ev)
         assert not truncated
         assert np.isfinite(reward)
         steps += 1
         if steps <= 5 or done:
             print(
-                f"  decision {steps}: action=pile {action}, reward={reward:.3f}, "
+                f"  decision {steps}: action=pile {pile_id}, reward={reward:.3f}, "
                 f"t={info['time']:.1f}, finished={info['finished']}, "
                 f"dropped={info['dropped']}, done={done}"
             )
