@@ -10,8 +10,8 @@ Typical step (advance_time):
      Redistribution here only updates p_act and schedules new EV events from T1.
   6. Set current_time = T1.
 
-assign_ev(pile_id) is called between events (by the Gym env or a heuristic)
-when the head-of-line EV should be plugged into a pile.
+assign_ev(pile_id, ev=None) is called between events (by the Gym env or a
+heuristic) to plug a waiting EV into a pile. ``ev=None`` means head-of-line.
 """
 
 from __future__ import annotations
@@ -136,11 +136,15 @@ class SimulationEngine:
             for ev in pile.evs:
                 ev.s_current = ev.s_next
 
-    def assign_ev(self, pile_id: int) -> bool:
-        """Plug the head-of-line EV into pile_id and redistribute that pile's power."""
+    def assign_ev(self, pile_id: int, ev: EV | None = None) -> bool:
+        """Plug a waiting EV into pile_id and redistribute that pile's power.
+
+        ``ev=None`` assigns head-of-line (RL / default). Heuristics pass the EV
+        chosen by ``QueuePolicy.select_ev``.
+        """
         pile = self.station.piles[pile_id]
-        ev = self.station.assign_ev(pile)
-        if ev is None:
+        assigned = self.station.assign_ev(pile, ev=ev)
+        if assigned is None:
             return False
         self._redistribute_power(pile)
         return True

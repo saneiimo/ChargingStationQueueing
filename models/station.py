@@ -2,9 +2,10 @@
 Charging station: a finite waiting queue plus a list of piles.
 
 This is the "yard" the SimulationEngine drives. Arrivals are offered to the
-queue (or dropped if full). Assignment pops the head-of-line EV and plugs it
-into a chosen pile. The station does not decide *which* pile — that comes from
-a queue policy or the RL agent via the engine's assign_ev(pile_id).
+queue (or dropped if full). Assignment removes a chosen waiting EV (head-of-line
+by default) and plugs it into a chosen pile. The station does not decide
+*which* EV or pile — that comes from a queue policy or the RL agent via the
+engine's ``assign_ev(pile_id, ev=...)``.
 
 Clock properties (current_time / next_time) are delegated to the engine so
 piles and EVs can stamp service start / departure without importing the engine
@@ -89,9 +90,12 @@ class ChargingStation:
             return None
         return self.queue.popleft()
 
-    def assign_ev(self, pile: ChargingPile):
+    def assign_ev(self, pile: ChargingPile, ev: EV | None = None):
         """
-        Move the head-of-line EV onto `pile` if both queue and pile allow it.
+        Move a waiting EV onto ``pile``.
+
+        If ``ev`` is None, assigns the head-of-line customer. Otherwise removes
+        that EV from the queue (must currently be waiting) and connects it.
         Returns the EV, or None if the move is illegal.
         """
         if not self.queue:
@@ -99,7 +103,13 @@ class ChargingStation:
         if pile.is_full:
             return None
 
-        ev = self.pop_from_queue()
+        if ev is None:
+            ev = self.pop_from_queue()
+        else:
+            if ev not in self.queue:
+                raise ValueError(f"EV {ev.id} is not in the waiting queue")
+            self.queue.remove(ev)
+
         pile.connect_ev(ev)
         return ev
 

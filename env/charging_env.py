@@ -1,9 +1,11 @@
 """
-Gymnasium env for learning head-of-line pile assignment.
+Gymnasium env for learning pile assignment (typically head-of-line).
 
 The agent does not advance the DES clock. We auto-advance until either a
 decision is needed (queue nonempty and a free nozzle exists) or the episode
 ends. Actions are pile indices; call action_masks() to hide full piles.
+Heuristic baselines may also pass ``ev=`` into ``step`` to assign a chosen
+waiting vehicle (see ``policy.queue.base.QueuePolicy.decide``).
 
 Observation (all scaled roughly to [0, 1]):
   for each pile:
@@ -190,7 +192,13 @@ class ChargingStationEnv(gym.Env):
         _, _, info = self._auto_advance_to_decision()
         return self._get_obs(), info
 
-    def step(self, action: int):
+    def step(self, action: int, ev=None):
+        """
+        Assign a waiting EV to ``action`` (pile id), then auto-advance.
+
+        ``ev=None`` assigns head-of-line (RL default). Heuristics pass the EV
+        from ``QueuePolicy.decide``.
+        """
         mask = self.action_masks()
         illegal = False
 
@@ -203,7 +211,7 @@ class ChargingStationEnv(gym.Env):
             illegal = True
             success = False
         else:
-            success = self.engine.assign_ev(int(action))
+            success = self.engine.assign_ev(int(action), ev=ev)
 
         reward = -1.0 if illegal or not success else 0.0
 
