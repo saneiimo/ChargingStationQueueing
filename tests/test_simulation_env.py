@@ -49,7 +49,7 @@ def test_des_projects_energy_between_events():
         p_brick=25.0,
         queue_capacity=5,
         power_policy=power_policy,
-        lam=100.0,
+        mean_interarrival=100.0,
     )
     metrics = MetricsTracker(n_piles=1, n_nozzles=2)
     engine = SimulationEngine(station, metrics, EventQueue())
@@ -113,7 +113,7 @@ def test_env_decision_point_and_fifo_episode():
         n_bricks=4,
         p_brick=25.0,
         queue_capacity=8,
-        lam=3.0,
+        mean_interarrival=3.0,
     )
     obs, info = env.reset(seed=7)
     print(
@@ -173,7 +173,7 @@ def test_action_mask_blocks_full_piles():
         n_bricks=2,
         p_brick=25.0,
         queue_capacity=10,
-        lam=1.0,
+        mean_interarrival=1.0,
     )
     obs, _ = env.reset(seed=1)
     print(f"  After reset: needs_decision={env.engine.needs_assignment_decision()}")

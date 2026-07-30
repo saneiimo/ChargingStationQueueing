@@ -55,11 +55,18 @@ class ChargingStationEnv(gym.Env):
         n_bricks: int = 5,
         p_brick: float = 25.0,
         queue_capacity: int = 10,
-        lam: float = 5.0,
+        mean_interarrival: float = 5.0,
         power_policy: PowerPolicy | None = None,
         queue_holding_cost: float = QUEUE_HOLDING_COST,
         drop_penalty: float = DROP_PENALTY,
     ):
+        """
+        Parameters
+        ----------
+        mean_interarrival :
+            Mean gap between arrivals in minutes. Arrival rate
+            λ = 1 / mean_interarrival (customers per minute).
+        """
         super().__init__()
 
         if power_policy is None:
@@ -70,6 +77,7 @@ class ChargingStationEnv(gym.Env):
         self.n_bricks = n_bricks
         self.p_brick = p_brick
         self.queue_capacity = queue_capacity
+        self.mean_interarrival = mean_interarrival
         self.queue_holding_cost = queue_holding_cost
         self.drop_penalty = drop_penalty
         self._max_battery = float(max(BATTERY_CAP_OPTIONS))
@@ -82,7 +90,7 @@ class ChargingStationEnv(gym.Env):
             p_brick=p_brick,
             queue_capacity=queue_capacity,
             power_policy=power_policy,
-            lam=lam,
+            mean_interarrival=mean_interarrival,
         )
         metrics = MetricsTracker(n_piles=n_piles, n_nozzles=n_nozzles)
         self.engine = SimulationEngine(station, metrics, EventQueue())
@@ -111,16 +119,18 @@ class ChargingStationEnv(gym.Env):
 
         for pile in piles:
             occ = len(pile.evs)
-            features.append(occ / pile.n_nozzles)
-            features.append(pile.free_nozzles / pile.n_nozzles)
-            features.append(1.0 if pile.is_overloaded else 0.0)
+            features.append(occ / pile.n_nozzles)  # occ fract
+            features.append(pile.free_nozzles / pile.n_nozzles)  # free-nozzle frac
+            features.append(1.0 if pile.is_overloaded else 0.0)  # overload flag
             total_req = sum(ev.p_req for ev in pile.evs)
             features.append(
                 min(total_req / self._max_power, 1.0) if self._max_power else 0.0
-            )
-            features.append(pile.bricks_used / pile.num_bricks)
+            )  # total p_req / max_power
+            features.append(pile.bricks_used / pile.num_bricks)  # brick used bricks
             if pile.evs:
-                features.append(float(np.mean([ev.s_current for ev in pile.evs])))
+                features.append(
+                    float(np.mean([ev.s_current for ev in pile.evs]))
+                )  # mean SoC of plugged EVs
             else:
                 features.append(0.0)
 

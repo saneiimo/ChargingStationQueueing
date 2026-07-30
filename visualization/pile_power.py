@@ -592,7 +592,12 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--n-nozzles", type=int, default=2)
     parser.add_argument("--n-bricks", type=int, default=5)
     parser.add_argument("--p-brick", type=float, default=25.0)
-    parser.add_argument("--lam", type=float, default=5.0)
+    parser.add_argument(
+        "--mean-interarrival",
+        type=float,
+        default=5.0,
+        help="Mean inter-arrival time in minutes (arrival rate λ = 1 / this)",
+    )
     parser.add_argument(
         "--save",
         type=str,
@@ -653,7 +658,7 @@ def main(argv: list[str] | None = None) -> None:
         n_nozzles=args.n_nozzles,
         n_bricks=args.n_bricks,
         p_brick=args.p_brick,
-        lam=args.lam,
+        mean_interarrival=args.mean_interarrival,
         seed=args.seed,
     )
     print(

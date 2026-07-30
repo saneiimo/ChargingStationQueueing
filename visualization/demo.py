@@ -14,7 +14,7 @@ def run_fifo_episode(
     n_bricks: int = 5,
     p_brick: float = 25.0,
     queue_capacity: int = 10,
-    lam: float = 5.0,
+    mean_interarrival: float = 5.0,
     seed: int = 42,
     policy_seed: int = 1,
 ) -> ChargingStationEnv:
@@ -25,7 +25,7 @@ def run_fifo_episode(
         n_bricks=n_bricks,
         p_brick=p_brick,
         queue_capacity=queue_capacity,
-        lam=lam,
+        mean_interarrival=mean_interarrival,
     )
     obs, _ = env.reset(seed=seed)
     rng = np.random.default_rng(policy_seed)

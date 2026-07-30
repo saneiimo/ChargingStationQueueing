@@ -24,7 +24,7 @@ if TYPE_CHECKING:
 
 
 class ChargingStation:
-    """Owns the queue, piles, arrival parameter, and the active power policy."""
+    """Owns the queue, piles, arrival gap, and the active power policy."""
 
     def __init__(
         self,
@@ -34,7 +34,7 @@ class ChargingStation:
         p_brick: float,
         queue_capacity: int,
         power_policy: PowerPolicy,
-        lam: float,
+        mean_interarrival: float,
     ):
 
         self.n_piles = n_piles
@@ -46,12 +46,21 @@ class ChargingStation:
         self.piles = [
             ChargingPile(i, n_nozzles, n_bricks, p_brick, self) for i in range(n_piles)
         ]
-        # Mean inter-arrival time (minutes). Count in an interval of length t
-        # is Poisson(t / lam); inter-arrivals are Exp with mean lam.
-        self.lam = lam
+        # Mean inter-arrival time (minutes). Arrival rate λ = 1 / mean_interarrival.
+        # Count in an interval of length t is Poisson(λ t); gaps are Exp(mean).
+        if mean_interarrival <= 0:
+            raise ValueError(
+                f"mean_interarrival must be positive, got {mean_interarrival}"
+            )
+        self.mean_interarrival = float(mean_interarrival)
         self.queue = deque()
         # Wired by SimulationEngine.__init__.
         self.engine: SimulationEngine | None = None
+
+    @property
+    def arrival_rate(self) -> float:
+        """Arrival rate λ (customers per minute) = 1 / mean_interarrival."""
+        return 1.0 / self.mean_interarrival
 
     # --------------------------------------------------
     # Clock (delegates to SimulationEngine)

@@ -35,7 +35,7 @@ N_NOZZLES = 1
 N_BRICKS = 4
 P_BRICK = 25.0
 QUEUE_CAPACITY = 50
-LAM = 1.0  # mean inter-arrival (minutes); arrival rate = 1/LAM
+LAM = 1.0  # mean inter-arrival (minutes); arrival rate λ = 1/LAM
 SEED = 42
 POLICY_SEED = 1
 
@@ -46,7 +46,7 @@ def _run_fifo_episode(
     n_bricks: int = N_BRICKS,
     p_brick: float = P_BRICK,
     queue_capacity: int = QUEUE_CAPACITY,
-    lam: float = LAM,
+    mean_interarrival: float = LAM,
     seed: int = SEED,
 ) -> ChargingStationEnv:
     """Roll out one full day under FIFO pile choice."""
@@ -56,7 +56,7 @@ def _run_fifo_episode(
         n_bricks=n_bricks,
         p_brick=p_brick,
         queue_capacity=queue_capacity,
-        lam=lam,
+        mean_interarrival=mean_interarrival,
     )
     obs, _ = env.reset(seed=seed)
     rng = np.random.default_rng(POLICY_SEED)
@@ -82,7 +82,8 @@ def erlang_c_wait(lam: float, mu: float, c: int) -> float:
     """
     Mean waiting time in queue for an M/M/c system (Erlang-C).
 
-    Returns inf if the system is unstable (rho >= 1).
+    ``lam`` here is the arrival **rate** λ (1 / mean_interarrival), not the
+    mean gap. Returns inf if the system is unstable (rho >= 1).
     """
     if lam <= 0 or mu <= 0 or c < 1:
         return float("nan")

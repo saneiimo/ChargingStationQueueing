@@ -34,7 +34,7 @@ def _run_short_episode(seed: int = 0) -> ChargingStationEnv:
         n_bricks=5,
         p_brick=25.0,
         queue_capacity=10,
-        lam=5.0,
+        mean_interarrival=5.0,
     )
     obs, _ = env.reset(seed=seed)
     rng = np.random.default_rng(1)

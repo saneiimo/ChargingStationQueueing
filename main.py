@@ -16,7 +16,7 @@ env = ChargingStationEnv(
     n_bricks=5,
     p_brick=25,
     queue_capacity=10,
-    lam=5.0,
+    mean_interarrival=5.0,
 )
 
 obs, info = env.reset(seed=42)

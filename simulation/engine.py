@@ -69,9 +69,10 @@ class SimulationEngine:
 
     def _generate_arrivals(self):
         """Pre-sample the whole arrival process into the heap, plus SIM_OVER."""
-        # station.lam is mean inter-arrival time (minutes); rate = 1/lam.
+        # mean_interarrival is the Exp scale (minutes); λ = 1 / mean_interarrival.
+        mean_gap = self.station.mean_interarrival
         arrivals = self.rng.exponential(
-            self.station.lam, int(self.max_time / self.station.lam * 5)
+            mean_gap, int(self.max_time / mean_gap * 5)
         ).cumsum()
 
         arrivals = arrivals[arrivals <= self.max_time]
