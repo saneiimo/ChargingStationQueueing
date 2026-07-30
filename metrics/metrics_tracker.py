@@ -126,11 +126,6 @@ class MetricsTracker:
             return np.zeros(self.n_piles)
         return self.pile_active_minutes / sim_time
 
-    def mean_pile_utilization(self, sim_time: float) -> float:
-        """Mean pile busy fraction across piles (average of ``pile_utilization``)."""
-        util = self.pile_utilization(sim_time)
-        return float(np.mean(util)) if util.size else 0.0
-
     def nozzle_utilization(self, sim_time: float) -> np.ndarray:
         """Fraction of time each nozzle was occupied (shape n_piles x n_nozzles)."""
         if sim_time <= 0:
@@ -285,8 +280,8 @@ class MetricsTracker:
         dict
             ``T``, ``n_finished``, ``lambda_eff``, ``W``, ``W_q``, ``W_q_max``,
             ``S``, ``mu``, ``c``, ``L_sim``, ``L_theory``, ``Q_sim``,
-            ``Q_theory``, ``rho_sim``, ``rho_theory``, ``rho_pile_avg``,
-            ``E_total``, ``E_avg``, ``c_s2``.
+            ``Q_theory``, ``rho_sim``, ``rho_theory``, ``E_total``, ``E_avg``,
+            ``c_s2``.
 
             Per-pile energy / utilization arrays are available via
             ``pile_energy``, ``average_pile_energy``, and ``pile_utilization``.
@@ -310,7 +305,6 @@ class MetricsTracker:
         Q_theory = lambda_eff * W_q
 
         rho_sim = self.mean_nozzle_utilization(T)
-        rho_pile_avg = self.mean_pile_utilization(T)
         rho_theory = (lambda_eff / (c * mu)) if (c > 0 and mu > 0) else 0.0
 
         return {
@@ -329,7 +323,6 @@ class MetricsTracker:
             "Q_theory": Q_theory,
             "rho_sim": rho_sim,
             "rho_theory": rho_theory,
-            "rho_pile_avg": rho_pile_avg,
             "E_total": self.total_energy(),
             "E_avg": self.average_energy(),
             "c_s2": float(c_s2) if np.isfinite(c_s2) else float("nan"),
