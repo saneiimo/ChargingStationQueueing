@@ -29,6 +29,14 @@ DEFAULT_METRICS: dict[str, Callable[[ChargingStationEnv], float]] = {
     "avg wait time": lambda e: e.engine.metrics.mean_wait(),
     "max wait time": lambda e: e.engine.metrics.max_wait(),
     "avg sys time": lambda e: e.engine.metrics.mean_sojourn(),
+    "util_rho_sim": lambda e: e.engine.metrics.queueing_summary(
+        e.engine.current_time,
+        n_servers=e.engine.station.n_piles * e.engine.station.n_nozzles,
+    )["rho_sim"],
+    "util_rho_theory": lambda e: e.engine.metrics.queueing_summary(
+        e.engine.current_time,
+        n_servers=e.engine.station.n_piles * e.engine.station.n_nozzles,
+    )["rho_theory"],
 }
 
 
@@ -116,7 +124,7 @@ if __name__ == "__main__":
             "n_bricks": 7,
             "p_brick": 25,
             "queue_capacity": 10,
-            "lam": 5.0,
+            "mean_interarrival": 5.0,
             "policy": FIFOQueuePolicy(),
         },
         n_reps=30,
