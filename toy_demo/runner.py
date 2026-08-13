@@ -119,6 +119,9 @@ def run_toy_episode(
 def metrics_table(env: ChargingStationEnv) -> pd.DataFrame:
     """
     One-row-per-metric summary for slides (uses ``queueing_summary`` + counts).
+
+    ``avg charge time`` is mean service time S (plug-in until departure)
+    among finished EVs, in minutes.
     """
     m = env.engine.metrics
     T = float(env.engine.current_time)
@@ -139,6 +142,7 @@ def metrics_table(env: ChargingStationEnv) -> pd.DataFrame:
         {"metric": "average L", "value": q["L_sim"]},
         {"metric": "average Q", "value": q["Q_sim"]},
         {"metric": "mean wait W_q (min)", "value": q["W_q"]},
+        {"metric": "avg charge time (min)", "value": q["S"]},
         {"metric": "mean service S (min)", "value": q["S"]},
         {"metric": "mean sojourn W (min)", "value": q["W"]},
         {"metric": "util_rho_sim", "value": q["rho_sim"]},
