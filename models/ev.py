@@ -9,7 +9,9 @@ p_req is flat up to s_th, then tapers linearly toward empty request at SoC=1.
 Given p_act, we can compute:
   - how SoC grows over a time interval (update_s_next)
   - how much energy was delivered (compute_deltaE_power)
-  - when the next DEPARTURE or CHARGE_CHANGE should fire (dt_next_candidate)
+  - when the next DEPARTURE or CHARGE_CHANGE should fire (dt_next_candidate).
+    CHARGE_CHANGE is scheduled only if the station power policy sets
+    ``supports_underuse_reallocation`` (see ``policy.power.base``).
 
 SoC projection is piecewise (constant power to s_taper, then expo). After other
 DES events split an interval, s_current may already be past s_taper; those
@@ -157,18 +159,35 @@ class EV:
             return 0.0
         return self.c_b / self.p_act * gap
 
+    def _power_policy_supports_underuse_reallocation(self) -> bool:
+        """
+        True only if the station's power policy opts into CHARGE_CHANGE.
+
+        Underuse events are for policies that free a brick on underutilization
+        (e.g. Proportional). Fixed-split policies (e.g. Static) leave the flag
+        False so we never schedule CHARGE_CHANGE. Missing station/policy is
+        treated as False (safe for unit tests that build a pile alone).
+        """
+        if self.pile is None or self.pile.station is None:
+            return False
+        policy = getattr(self.pile.station, "power_policy", None)
+        if policy is None:
+            return False
+        return bool(getattr(policy, "supports_underuse_reallocation", False))
+
     @property
     def next_state(self) -> tuple[float, EventType]:
         """
         Next SoC milestone and the event type that should fire there.
 
-        If the pile is overloaded and this EV holds more than one brick, we
-        watch for underutilization (CHARGE_CHANGE). Otherwise we aim for s_f
-        (DEPARTURE).
+        If the power policy supports underuse reallocation, the pile is
+        overloaded, and this EV holds more than one brick, we watch for
+        underutilization (CHARGE_CHANGE). Otherwise we aim for s_f (DEPARTURE).
         """
         if (
             self.pile is not None
             and self.n_bricks is not None
+            and self._power_policy_supports_underuse_reallocation()
             and self.pile.is_overloaded
             and self.n_bricks > 1
         ):
