@@ -1,9 +1,16 @@
 """
 Interface for how a pile splits its power bricks among plugged EVs.
 
-The SimulationEngine calls update_power after plug-in, departure, or a
-CHARGE_CHANGE. Implementations write pile.ev_bricks[nozzle_id] and return
-(EV, allotted_kW) pairs so the engine can update each EV's p_act.
+The SimulationEngine calls ``update_power`` after plug-in, departure, or a
+``CHARGE_CHANGE``. Implementations write ``pile.ev_bricks[nozzle_id]`` and
+return ``(EV, allotted_kW)`` pairs so the engine can update each EV's ``p_act``.
+
+``CHARGE_CHANGE`` (underuse reallocation) is **opt-in**. Set
+``supports_underuse_reallocation = True`` only if ``update_power(pile, ev=...)``
+actually frees / reassigns an underused brick. Policies that keep a fixed split
+until the plugged set changes (e.g. Static) must leave the flag ``False`` so
+``EV.next_state`` schedules ``DEPARTURE`` instead — otherwise equal rebuilds
+hand the brick back and the DES loops forever on ``CHARGE_CHANGE``.
 """
 
 from __future__ import annotations
@@ -16,6 +23,23 @@ if TYPE_CHECKING:
 
 
 class PowerPolicy(ABC):
+    """
+    Brick-sharing rule used inside DES events.
+
+    Display names for experiments are *not* stored on the instance. Pass a
+    parallel ``power_names`` list (same idea as ``queue_names``) into
+    ``experiments.replications.labeled_policy_grid``.
+
+    Class attributes
+    ----------------
+    supports_underuse_reallocation :
+        If True, overloaded EVs with more than one brick may schedule
+        ``CHARGE_CHANGE`` so the policy can free an underused brick.
+        Default False; Proportional opts in.
+    """
+
+    # Opt-in: EV.next_state only schedules CHARGE_CHANGE when this is True.
+    supports_underuse_reallocation: bool = False
 
     @abstractmethod
     def update_power(
@@ -27,6 +51,7 @@ class PowerPolicy(ABC):
         Recompute brick allotment on `pile`.
 
         If `ev` is set, this is a micro-update triggered by that EV underusing
-        a brick. Otherwise rebuild the allotment from scratch (arrival/departure).
+        a brick (only meaningful when ``supports_underuse_reallocation``).
+        Otherwise rebuild the allotment from scratch (arrival/departure).
         """
         pass
