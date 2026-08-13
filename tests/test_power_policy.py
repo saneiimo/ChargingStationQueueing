@@ -26,12 +26,22 @@ from math import ceil
 from models.ev import EV
 from models.pile import ChargingPile
 from policy.power.proportional import ProportionalPower
+from policy.power.static import StaticPower
+from simulation.event import EventType
 
 
 def _make_ev(
-    ev_id: int, c_b: float, s_i: float = 0.2, s_f: float = 0.8, s_th: float = 0.5
+    ev_id: int,
+    c_b: float,
+    s_i: float = 0.2,
+    s_f: float = 0.8,
+    s_th: float = 0.5,
+    c_rate: float | None = None,
 ) -> EV:
-    return EV(id=ev_id, c_b=c_b, s_i=s_i, s_f=s_f, arrival_time=0.0, s_th=s_th)
+    kwargs = dict(id=ev_id, c_b=c_b, s_i=s_i, s_f=s_f, arrival_time=0.0, s_th=s_th)
+    if c_rate is not None:
+        kwargs["c_rate"] = c_rate
+    return EV(**kwargs)
 
 
 def test_non_overloaded_ceil_allocation():
@@ -184,10 +194,126 @@ def test_micro_distribute_frees_brick_from_trigger_ev():
     print("  PASS")
 
 
+def test_static_equal_split_with_leftovers_by_unmet_request():
+    """
+    Static: equal base bricks, leftovers to largest unmet p_req.
+
+    Matches the documented example: 5 bricks, p_brick=25, requests
+    75 / 250 / 200 kW -> base 1 each, leftovers to 250 then 200 -> [1, 2, 2].
+    """
+    print("\n=== test_static_equal_split_with_leftovers_by_unmet_request ===")
+    print(
+        "Intent: with 5 bricks and three EVs at 75/250/200 kW, Static should "
+        "give 1 each then hand leftovers by unmet request -> bricks [1, 2, 2]."
+    )
+
+    policy = StaticPower()
+    pile = ChargingPile(id=0, n_nozzles=3, num_bricks=5, p_brick=25.0)
+    # c_rate=1 so flat-region p_req equals c_b (kW) for the documented numbers.
+    ev_low = _make_ev(0, 75.0, s_i=0.2, s_th=0.6, c_rate=1.0)
+    ev_hi = _make_ev(1, 250.0, s_i=0.2, s_th=0.6, c_rate=1.0)
+    ev_mid = _make_ev(2, 200.0, s_i=0.2, s_th=0.6, c_rate=1.0)
+    pile.connect_ev(ev_low)
+    pile.connect_ev(ev_hi)
+    pile.connect_ev(ev_mid)
+
+    print(
+        f"  Setup: p_reqs=[{ev_low.p_req:.1f}, {ev_hi.p_req:.1f}, {ev_mid.p_req:.1f}], "
+        f"pool={pile.num_bricks}, p_brick={pile.p_brick}"
+    )
+
+    policy.update_power(pile)
+    bricks = [
+        pile.ev_bricks[ev_low.nozzle_id],
+        pile.ev_bricks[ev_hi.nozzle_id],
+        pile.ev_bricks[ev_mid.nozzle_id],
+    ]
+    print(f"  Result: ev_bricks by EV order={bricks}, sum={sum(bricks)}")
+
+    assert bricks == [1, 2, 2]
+    assert sum(pile.ev_bricks) == pile.num_bricks
+    print("  PASS")
+
+
+def test_static_single_ev_gets_full_pool():
+    """One plugged EV receives the entire brick pool under equal split."""
+    print("\n=== test_static_single_ev_gets_full_pool ===")
+    print("Intent: with one EV, num_bricks // 1 assigns the full pool to that EV.")
+
+    policy = StaticPower()
+    pile = ChargingPile(id=0, n_nozzles=2, num_bricks=5, p_brick=25.0)
+    ev = _make_ev(1, 100.0, s_i=0.2, s_th=0.6, c_rate=1.0)
+    pile.connect_ev(ev)
+    policy.update_power(pile)
+
+    print(f"  Result: ev_bricks={pile.ev_bricks}")
+    assert pile.ev_bricks[ev.nozzle_id] == pile.num_bricks
+    assert sum(pile.ev_bricks) == pile.num_bricks
+    print("  PASS")
+
+
+def test_underuse_reallocation_flag_and_charge_change_gating():
+    """
+    Prop opts into CHARGE_CHANGE; Static opts out so next_state stays DEPARTURE.
+
+    Without this gate, Static rebuilds the equal split on underuse, hands the
+    brick back, and the DES can loop forever on CHARGE_CHANGE.
+    """
+    print("\n=== test_underuse_reallocation_flag_and_charge_change_gating ===")
+    print(
+        "Intent: Static.supports_underuse_reallocation is False and schedules "
+        "DEPARTURE even when overloaded with n_bricks>1; Prop can schedule "
+        "CHARGE_CHANGE."
+    )
+
+    assert ProportionalPower.supports_underuse_reallocation is True
+    assert StaticPower.supports_underuse_reallocation is False
+
+    class _StubStation:
+        def __init__(self, policy):
+            self.power_policy = policy
+            self.current_time = 0.0
+            self.next_time = 0.0
+
+    # Shared overloaded setup: two EVs, 4 bricks, p_brick=25, high p_req.
+    def _overloaded_pile(policy):
+        station = _StubStation(policy)
+        pile = ChargingPile(id=0, n_nozzles=2, num_bricks=4, p_brick=25.0, station=station)
+        ev1 = _make_ev(1, 200.0, s_i=0.2, s_f=0.95, s_th=0.6, c_rate=1.0)
+        ev2 = _make_ev(2, 200.0, s_i=0.2, s_f=0.95, s_th=0.6, c_rate=1.0)
+        pile.connect_ev(ev1)
+        pile.connect_ev(ev2)
+        policy.update_power(pile)
+        # Ensure CHARGE_CHANGE eligibility shape: >1 brick on an overloaded pile.
+        if pile.ev_bricks[ev1.nozzle_id] <= 1:
+            pile.ev_bricks[ev1.nozzle_id] = 2
+            pile.ev_bricks[ev2.nozzle_id] = pile.num_bricks - 2
+        ev1.p_act = pile.ev_bricks[ev1.nozzle_id] * pile.p_brick
+        return pile, ev1
+
+    pile_s, ev_s = _overloaded_pile(StaticPower())
+    assert pile_s.is_overloaded
+    assert ev_s.n_bricks > 1
+    typ_s = ev_s.event_type_next_candidate
+    print(f"  Static: overloaded={pile_s.is_overloaded}, bricks={ev_s.n_bricks}, next={typ_s.name}")
+    assert typ_s == EventType.DEPARTURE
+
+    pile_p, ev_p = _overloaded_pile(ProportionalPower())
+    assert pile_p.is_overloaded
+    assert ev_p.n_bricks > 1
+    typ_p = ev_p.event_type_next_candidate
+    print(f"  Prop: overloaded={pile_p.is_overloaded}, bricks={ev_p.n_bricks}, next={typ_p.name}")
+    assert typ_p == EventType.CHARGE_CHANGE
+    print("  PASS")
+
+
 if __name__ == "__main__":
     print("Running test_power_policy.py (direct mode)")
     test_non_overloaded_ceil_allocation()
     test_overloaded_respects_brick_cap()
     test_disconnect_middle_nozzle_keeps_slots()
     test_micro_distribute_frees_brick_from_trigger_ev()
+    test_static_equal_split_with_leftovers_by_unmet_request()
+    test_static_single_ev_gets_full_pool()
+    test_underuse_reallocation_flag_and_charge_change_gating()
     print("\nAll tests in test_power_policy.py finished.")
