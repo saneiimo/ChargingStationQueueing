@@ -15,10 +15,11 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 BRICK_CHECK_THRESH = 0.2
 
 # SoC where the BMS request starts tapering on the charging curve.
-S_THRESH = 0.6
+S_THRESH = 0.4
 
 # How we sample arriving EVs in the engine.
-BATTERY_CAP_OPTIONS = [50.0, 100.0, 150.0]
+# BATTERY_CAP_OPTIONS = [50.0, 100.0, 150.0]
+BATTERY_CAP_OPTIONS = [75.0]
 # Battery capacity are inputted as kWh, however for calculation
 # we need a unit conversion, as the simulation time is in minutes
 HR2MIN = 60
@@ -26,7 +27,7 @@ BATTERY_CAP_OPTIONS = [cap * HR2MIN for cap in BATTERY_CAP_OPTIONS]
 SOC_I_BOUNDS = [0.1, 0.3]
 SOC_F_BOUNDS = [0.7, 0.9]
 # C-rate: peak request p_req_max = battery_capacity_kWh * C_RATE.
-C_RATE = 1 / HR2MIN
+C_RATE = 2 / HR2MIN
 # Episode length (minutes).
 MAX_TIME = 1440
 
