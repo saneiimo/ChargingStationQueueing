@@ -8,6 +8,9 @@ has the largest unmet request (_micro_distribute).
 
 When the engine passes the triggering EV (CHARGE_CHANGE), we free one brick
 from that EV first, then run the same leftover fill.
+
+``supports_underuse_reallocation = True`` so ``EV.next_state`` may schedule
+``CHARGE_CHANGE`` while the pile is overloaded.
 """
 
 from __future__ import annotations
@@ -22,6 +25,8 @@ if TYPE_CHECKING:
 
 
 class ProportionalPower(PowerPolicy):
+    # Free underused bricks and reassign them (see _micro_distribute).
+    supports_underuse_reallocation = True
 
     def update_power(
         self,
