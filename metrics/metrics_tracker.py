@@ -225,7 +225,12 @@ class MetricsTracker:
         return float(np.max(waits)) if waits.size else 0.0
 
     def mean_service(self) -> float:
-        """Mean service / charge time S among finished EVs (0 if none)."""
+        """
+        Mean service / charge time S among finished EVs (0 if none).
+
+        S = departure_time - service_start_time (minutes plugged in).
+        Replication tables report this as ``avg charge time``.
+        """
         _, services, _ = self.finished_time_arrays()
         return float(np.mean(services)) if services.size else 0.0
 
