@@ -1,7 +1,7 @@
 """
 Serve the waiting EV with the smallest remaining SoC gap first.
 
-SoC difference is ``s_f - s_current``. Pile routing (most free nozzles) and
+SoC difference is ``s_f - s_current``. Pile routing (most free dispensers) and
 optional ``max_wait`` overdue override come from ``QueuePolicy``.
 
 Usage::
@@ -20,7 +20,7 @@ if TYPE_CHECKING:
 
 
 class LowestSoCDiffQueuePolicy(QueuePolicy):
-    """Lowest remaining SoC gap among waiting EVs; default free-nozzle piles."""
+    """Lowest remaining SoC gap among waiting EVs; default free-dispenser piles."""
 
     def _select_ev(self, station: ChargingStation) -> EV:
         queue = station.queue

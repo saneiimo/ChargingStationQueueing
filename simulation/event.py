@@ -38,9 +38,9 @@ class Event:
 
 class EventType(Enum):
     ARRIVAL = 1  # EV shows up and tries to join the station queue
-    DEPARTURE = 2  # EV reaches target SoC and leaves its nozzle
+    DEPARTURE = 2  # EV reaches target SoC and leaves its dispenser
     # Opt-in via PowerPolicy.supports_underuse_reallocation (Prop yes, Static no).
-    CHARGE_CHANGE = 3  # EV underuses a brick; policy may free/redistribute it
+    CHARGE_CHANGE = 3  # EV underuses a module; policy may free/redistribute it
     SIM_OVER = 4  # Hard stop at MAX_TIME
 
 

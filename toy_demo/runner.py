@@ -63,9 +63,9 @@ def make_toy_env(station: ToyStationSpec) -> ChargingStationEnv:
     """Build a Gym env whose layout matches ``station`` (arrivals still random until install)."""
     return ChargingStationEnv(
         n_piles=station.n_piles,
-        n_nozzles=station.n_nozzles,
-        n_bricks=station.n_bricks,
-        p_brick=station.p_brick,
+        n_dispensers=station.n_dispensers,
+        n_modules=station.n_modules,
+        p_module=station.p_module,
         queue_capacity=station.queue_capacity,
         mean_interarrival=station.mean_interarrival,
     )
@@ -86,11 +86,11 @@ def run_toy_episode(
     Parameters
     ----------
     station :
-        Pile / nozzle / brick layout.
+        Pile / dispenser / module layout.
     ev_specs :
         User-facing EV list (ids, arrivals, battery kWh, SoC targets).
     policy :
-        Queue assignment rule. Defaults to FIFO + most-free-nozzle piles.
+        Queue assignment rule. Defaults to FIFO + most-free-dispenser piles.
     horizon :
         SIM_OVER time in minutes. Default: last arrival + 90 min.
     seed, policy_seed :
@@ -125,7 +125,7 @@ def metrics_table(env: ChargingStationEnv) -> pd.DataFrame:
     """
     m = env.engine.metrics
     T = float(env.engine.current_time)
-    c = env.engine.station.n_piles * env.engine.station.n_nozzles
+    c = env.engine.station.n_piles * env.engine.station.n_dispensers
     q = m.queueing_summary(T, n_servers=c)
 
     rows: list[dict[str, Any]] = [
@@ -172,7 +172,7 @@ def finished_ev_table(env: ChargingStationEnv) -> pd.DataFrame:
                 "s_end": ev.s_current,
                 "battery_kwh": ev.c_b / HR2MIN,
                 "pile": pile,
-                "nozzle": ev.nozzle_id_tracker,
+                "dispenser": ev.dispenser_id_tracker,
                 "energy_kwh": ev.energy_received,
             }
         )

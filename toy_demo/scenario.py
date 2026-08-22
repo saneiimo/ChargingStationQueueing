@@ -30,9 +30,9 @@ class ToyStationSpec:
     """Charging-station layout for the toy run."""
 
     n_piles: int = 2
-    n_nozzles: int = 2
-    n_bricks: int = 5
-    p_brick: float = 25.0  # kW per brick
+    n_dispensers: int = 2
+    n_modules: int = 5
+    p_module: float = 25.0  # kW per module
     queue_capacity: int = 10
     # Dummy mean gap: arrivals are replaced by the fixed EV list.
     mean_interarrival: float = 60.0

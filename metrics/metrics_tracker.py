@@ -4,7 +4,7 @@ Episode statistics for the charging-station DES.
 ``MetricsTracker`` is the single place for simulation metrics:
 
 * **Online** (called by ``SimulationEngine`` each inter-event interval):
-  time-average system size L and queue size Q, nozzle/pile busy time,
+  time-average system size L and queue size Q, dispenser/pile busy time,
   energy sold, and lists of arrived / finished / dropped EVs.
 
 * **Offline** (derived after the run from finished-EV timestamps):
@@ -35,9 +35,9 @@ class MetricsError(ValueError):
 class MetricsTracker:
     """Collects online interval stats and exposes offline customer-level metrics."""
 
-    def __init__(self, n_piles: int, n_nozzles: int):
+    def __init__(self, n_piles: int, n_dispensers: int):
         self.n_piles = n_piles
-        self.n_nozzles = n_nozzles
+        self.n_dispensers = n_dispensers
         self.reset()
 
     def reset(self) -> None:
@@ -53,10 +53,10 @@ class MetricsTracker:
         self.event_durations: list[float] = []
 
         self.pile_active_minutes = np.zeros(self.n_piles)
-        self.nozzle_active_minutes = np.zeros((self.n_piles, self.n_nozzles))
+        self.dispenser_active_minutes = np.zeros((self.n_piles, self.n_dispensers))
 
         self.pile_energy_sold = np.zeros(self.n_piles)
-        self.nozzle_energy_sold = np.zeros((self.n_piles, self.n_nozzles))
+        self.dispenser_energy_sold = np.zeros((self.n_piles, self.n_dispensers))
 
     # ------------------------------------------------------------------
     # Online updates (DES)
@@ -93,9 +93,9 @@ class MetricsTracker:
 
             self.pile_active_minutes[pile_idx] += delta_t
             for ev in pile.evs:
-                nozzle_idx = ev.nozzle_id
-                self.nozzle_active_minutes[pile_idx][nozzle_idx] += delta_t
-                self.nozzle_energy_sold[pile_idx][nozzle_idx] += ev.deltaE_power
+                dispenser_idx = ev.dispenser_id
+                self.dispenser_active_minutes[pile_idx][dispenser_idx] += delta_t
+                self.dispenser_energy_sold[pile_idx][dispenser_idx] += ev.deltaE_power
                 self.pile_energy_sold[pile_idx] += ev.deltaE_power
                 ev.energy_received += ev.deltaE_power
                 ev.energy_received_2 += ev.deltaE_SoC
@@ -126,15 +126,15 @@ class MetricsTracker:
             return np.zeros(self.n_piles)
         return self.pile_active_minutes / sim_time
 
-    def nozzle_utilization(self, sim_time: float) -> np.ndarray:
-        """Fraction of time each nozzle was occupied (shape n_piles x n_nozzles)."""
+    def dispenser_utilization(self, sim_time: float) -> np.ndarray:
+        """Fraction of time each dispenser was occupied (shape n_piles x n_dispensers)."""
         if sim_time <= 0:
-            return np.zeros((self.n_piles, self.n_nozzles))
-        return self.nozzle_active_minutes / sim_time
+            return np.zeros((self.n_piles, self.n_dispensers))
+        return self.dispenser_active_minutes / sim_time
 
-    def mean_nozzle_utilization(self, sim_time: float) -> float:
-        """Mean nozzle busy fraction across all nozzles."""
-        util = self.nozzle_utilization(sim_time)
+    def mean_dispenser_utilization(self, sim_time: float) -> float:
+        """Mean dispenser busy fraction across all dispensers."""
+        util = self.dispenser_utilization(sim_time)
         return float(np.mean(util)) if util.size else 0.0
 
     def total_energy(self) -> float:
@@ -278,7 +278,7 @@ class MetricsTracker:
             Episode length T (usually ``engine.current_time``).
         n_servers :
             Number of parallel servers for rho theory. Defaults to
-            ``n_piles * n_nozzles``.
+            ``n_piles * n_dispensers``.
 
         Returns
         -------
@@ -303,13 +303,13 @@ class MetricsTracker:
         mu = (1.0 / S) if S > 0 else 0.0
         c_s2 = self.service_squared_cv()
 
-        c = int(n_servers) if n_servers is not None else self.n_piles * self.n_nozzles
+        c = int(n_servers) if n_servers is not None else self.n_piles * self.n_dispensers
         L_sim = self.average_L()
         Q_sim = self.average_Q()
         L_theory = lambda_eff * W
         Q_theory = lambda_eff * W_q
 
-        rho_sim = self.mean_nozzle_utilization(T)
+        rho_sim = self.mean_dispenser_utilization(T)
         rho_theory = (lambda_eff / (c * mu)) if (c > 0 and mu > 0) else 0.0
 
         return {

@@ -29,22 +29,22 @@ class ChargingStation:
     def __init__(
         self,
         n_piles: int,
-        n_nozzles: int,
-        n_bricks: int,
-        p_brick: float,
+        n_dispensers: int,
+        n_modules: int,
+        p_module: float,
         queue_capacity: int,
         power_policy: PowerPolicy,
         mean_interarrival: float,
     ):
 
         self.n_piles = n_piles
-        self.n_nozzles = n_nozzles
-        self.n_bricks = n_bricks
-        self.p_brick = p_brick
+        self.n_dispensers = n_dispensers
+        self.n_modules = n_modules
+        self.p_module = p_module
         self.queue_capacity = queue_capacity
         self.power_policy = power_policy
         self.piles = [
-            ChargingPile(i, n_nozzles, n_bricks, p_brick, self) for i in range(n_piles)
+            ChargingPile(i, n_dispensers, n_modules, p_module, self) for i in range(n_piles)
         ]
         # Mean inter-arrival time (minutes). Arrival rate λ = 1 / mean_interarrival.
         # Count in an interval of length t is Poisson(λ t); gaps are Exp(mean).

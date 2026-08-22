@@ -21,7 +21,7 @@ class ChargeTraceSample:
     p_req: float
     p_act: float
     p_allot: float
-    n_bricks: int
+    n_modules: int
 
 
 def unique_charge_samples(
@@ -37,15 +37,15 @@ def unique_charge_samples(
     return cleaned
 
 
-def bricks_from_allotment(p_allot: float, p_brick: float) -> int:
-    """Brick count implied by a kW allotment (allotment is n_bricks * p_brick)."""
-    if p_brick <= 0:
+def modules_from_allotment(p_allot: float, p_module: float) -> int:
+    """Module count implied by a kW allotment (allotment is n_modules * p_module)."""
+    if p_module <= 0:
         return 0
-    return int(round(p_allot / p_brick))
+    return int(round(p_allot / p_module))
 
 
-def parsed_trace_samples(ev: EV, p_brick: float) -> list[ChargeTraceSample]:
-    """Deduplicated ``charge_trace`` rows with brick counts."""
+def parsed_trace_samples(ev: EV, p_module: float) -> list[ChargeTraceSample]:
+    """Deduplicated ``charge_trace`` rows with module counts."""
     out: list[ChargeTraceSample] = []
     for t, s, p_req, p_act, p_allot in unique_charge_samples(ev):
         out.append(
@@ -55,7 +55,7 @@ def parsed_trace_samples(ev: EV, p_brick: float) -> list[ChargeTraceSample]:
                 p_req=float(p_req),
                 p_act=float(p_act),
                 p_allot=float(p_allot),
-                n_bricks=bricks_from_allotment(float(p_allot), p_brick),
+                n_modules=modules_from_allotment(float(p_allot), p_module),
             )
         )
     return out
@@ -63,7 +63,7 @@ def parsed_trace_samples(ev: EV, p_brick: float) -> list[ChargeTraceSample]:
 
 def trace_power_plateaus(
     ev: EV,
-    p_brick: float,
+    p_module: float,
     *,
     t_end: float | None = None,
 ) -> list[tuple[float, float, float, ChargeTraceSample]]:
@@ -73,7 +73,7 @@ def trace_power_plateaus(
     Returns (t_start, t_end, p_act, start_sample) for each segment. The last
     segment ends at ``t_end`` when provided, otherwise at the final sample time.
     """
-    samples = parsed_trace_samples(ev, p_brick)
+    samples = parsed_trace_samples(ev, p_module)
     if not samples:
         return []
 
@@ -94,13 +94,13 @@ def trace_label_text(sample: ChargeTraceSample) -> str:
         f"P={sample.p_act:.1f}\n"
         f"t={sample.t:.1f}\n"
         f"s={sample.s:.3f}\n"
-        f"n={sample.n_bricks}"
+        f"n={sample.n_modules}"
     )
 
 
 def charge_change_event_times(
     ev: EV,
-    p_brick: float,
+    p_module: float,
     *,
     t_lo: float | None = None,
     t_hi: float | None = None,
@@ -108,15 +108,15 @@ def charge_change_event_times(
     time_tol: float = 1e-6,
 ) -> list[float]:
     """
-    Times when this EV's brick allotment changes (redistribution / charge change).
+    Times when this EV's module allotment changes (redistribution / charge change).
 
-    Skips the initial plug-in sample. Keeps only samples whose ``n_bricks``
+    Skips the initial plug-in sample. Keeps only samples whose ``n_modules``
     differs from the previous sample. Optional ``t_lo`` / ``t_hi`` window filter.
 
     ``exclude_times`` drops any candidate that falls within ``time_tol`` of a
     listed instant (use plug-in / departure times to keep *sole* charge changes).
     """
-    samples = parsed_trace_samples(ev, p_brick)
+    samples = parsed_trace_samples(ev, p_module)
     if len(samples) < 2:
         return []
 
@@ -130,7 +130,7 @@ def charge_change_event_times(
 
     times: list[float] = []
     for prev, cur in zip(samples, samples[1:]):
-        if cur.n_bricks == prev.n_bricks:
+        if cur.n_modules == prev.n_modules:
             continue
         if t_lo is not None and cur.t < t_lo:
             continue
@@ -155,7 +155,7 @@ def densify_charge_trace(
     """
     Rebuild dense (t, SoC, p_req, p_act) from sparse charge_trace segments.
 
-    Between two logged samples we hold the brick allotment fixed and integrate
+    Between two logged samples we hold the module allotment fixed and integrate
     SoC with p_act = min(p_req(s), p_allot), which matches the DES physics.
     """
     cleaned = unique_charge_samples(ev)

@@ -3,11 +3,11 @@ Assign waiting EVs to piles by closest remaining-power match.
 
 At each assignment decision:
 
-1. For every pile with a free nozzle, compute leftover supply::
+1. For every pile with a free dispenser, compute leftover supply::
 
        remaining = pile.power_supp - sum(p_act of plugged EVs)
 
-   (``power_supp`` is the pile's brick pool in kW; ``p_act`` is what each
+   (``power_supp`` is the pile's module pool in kW; ``p_act`` is what each
    plugged EV is drawing right now.)
 
 2. For each candidate waiting EV, read its BMS request ``p_req`` at the
@@ -91,7 +91,7 @@ class ClosestPowerMatchQueuePolicy(QueuePolicy):
         """
         Pick (EV, pile_id) minimizing |remaining_power - p_req|.
 
-        Only piles with ``action_mask[i]`` True are considered (free nozzle).
+        Only piles with ``action_mask[i]`` True are considered (free dispenser).
         """
         evs = self._candidate_evs(station) if candidate_evs is None else candidate_evs
         if not evs:

@@ -30,9 +30,9 @@ from env.charging_env import ChargingStationEnv
 def _run_short_episode(seed: int = 0) -> ChargingStationEnv:
     env = ChargingStationEnv(
         n_piles=2,
-        n_nozzles=1,
-        n_bricks=5,
-        p_brick=25.0,
+        n_dispensers=1,
+        n_modules=5,
+        p_module=25.0,
         queue_capacity=10,
         mean_interarrival=5.0,
     )
@@ -79,7 +79,7 @@ def test_finished_missing_timestamps_raise():
     from metrics.metrics_tracker import MetricsError, MetricsTracker
     from models.ev import EV
 
-    m = MetricsTracker(n_piles=1, n_nozzles=1)
+    m = MetricsTracker(n_piles=1, n_dispensers=1)
     ev = EV(id=7, c_b=50.0, s_i=0.2, s_f=0.8, arrival_time=1.0)
     # Pretend finished without plug-in / departure stamps.
     m.finished_evs.append(ev)

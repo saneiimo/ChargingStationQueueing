@@ -8,15 +8,20 @@ in queue.
 
 Read the code in this order the first time through:
 
-1. `config.py` — shared constants (taper threshold, brick check, episode length, rewards).
+1. `config.py` — shared constants (taper threshold, module check, episode length, rewards).
 2. `models/` — physical objects: station, piles, EVs.
 3. `simulation/event.py` — timed events on a min-heap.
 4. `simulation/engine.py` — the clock: advance time, project SoC, process events.
-5. `policy/power/` — how a pile splits its power bricks among plugged EVs.
+5. `policy/power/` — how a pile splits its power modules among plugged EVs.
 6. `policy/queue/` — baseline rules for choosing a pile (e.g. FIFO / join-shortest).
 7. `metrics/` — L, Q, energy, utilization collected while the engine runs.
 8. `env/charging_env.py` — Gym API: agent only acts at assignment decision points.
 9. `main.py` — short script that rolls out the FIFO baseline.
+10. `offline_opt/` — offline (clairvoyant) lower-bound MILP for total sojourn
+    time, solved with gurobipy. Given full knowledge of arrivals up front, its
+    optimum lower-bounds every causal queue/power policy's cost on the same
+    instance — the benchmark to compare FIFO / heuristics / RL against. See
+    `offline_opt/README.md`.
 
 ```text
                     +------------------+
@@ -39,7 +44,7 @@ Read the code in this order the first time through:
            v
   +----------------+     update_power()     +----------------+
   |  ChargingPile  | <--------------------> |  PowerPolicy   |
-  | nozzles/bricks |                        | (e.g. proport.)|
+  | dispensers/modules |                        | (e.g. proport.)|
   +--------+-------+                        +----------------+
            |
            v
@@ -51,13 +56,13 @@ Read the code in this order the first time through:
 ## Station layout (in words)
 
 - A **station** has a waiting **queue** and several **piles**.
-- Each **pile** has a fixed number of **nozzles** (physical plugs) and a pool of
-  **power bricks** (discrete chunks of kW). Bricks are shared by all EVs on that pile.
+- Each **pile** has a fixed number of **dispensers** (physical plugs) and a pool of
+  **power modules** (discrete chunks of kW). Modules are shared by all EVs on that pile.
 - An **EV** arrives, waits in queue, gets assigned to one pile, charges until its
   target SoC, then leaves. Charging power follows a constant-then-taper curve.
 
 Power on a pile is **redistributed** when someone plugs in, leaves, or starts
-under-using a brick (`CHARGE_CHANGE`). That logic lives in `policy/power/`, not
+under-using a module (`CHARGE_CHANGE`). That logic lives in `policy/power/`, not
 in the RL agent. The agent only chooses the pile for the head-of-line EV.
 
 ## Running
@@ -85,7 +90,7 @@ In a notebook:
 ## Visualization
 
 After a run (or via the CLI helper), plot BMS request vs actual power for every
-nozzle on one pile:
+dispenser on one pile:
 
 ```bash
 python -m visualization.pile_power --pile 0 --t-start 0 --t-end 240 --seed 42 --save pile0.png
@@ -94,11 +99,11 @@ python -m visualization.pile_power --pile 0 --t-start 0 --t-end 240 --seed 42 --
 Optional `--show` opens an interactive window. In a notebook:
 
 ```python
-from visualization.pile_power import run_fifo_episode, plot_pile_nozzle_power
+from visualization.pile_power import run_fifo_episode, plot_pile_dispenser_power
 import matplotlib.pyplot as plt
 
 env = run_fifo_episode(seed=42)
-fig = plot_pile_nozzle_power(env, pile_id=0, t_start=0, t_end=200)
+fig = plot_pile_dispenser_power(env, pile_id=0, t_start=0, t_end=200)
 plt.show()
 ```
 
@@ -119,7 +124,7 @@ python -m visualization.ev_curves --evs 0,1,2 --charts P-S,T-S,P-T --seed 42
 The env does **not** ask the agent to advance time. It auto-advances the
 simulator until either:
 
-- there is a vehicle in queue and at least one free nozzle, or
+- there is a vehicle in queue and at least one free dispenser, or
 - the episode ends (`SIM_OVER`).
 
 At a decision point the action is a pile index. Use `env.action_masks()` so

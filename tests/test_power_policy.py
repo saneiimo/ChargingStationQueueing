@@ -1,5 +1,5 @@
 """
-Checks that ProportionalPower respects brick caps and fixed nozzle slots.
+Checks that ProportionalPower respects module caps and fixed dispenser slots.
 
 These tests build a pile directly (no full DES) so failures point at the
 power policy or pile indexing, not at the event engine.
@@ -45,54 +45,54 @@ def _make_ev(
 
 
 def test_non_overloaded_ceil_allocation():
-    """When demand fits, each EV gets ceil(p_req / p_brick) bricks."""
+    """When demand fits, each EV gets ceil(p_req / p_module) modules."""
     print("\n=== test_non_overloaded_ceil_allocation ===")
     print(
-        "Intent: with enough bricks, allotment should be ceil of each EV's "
+        "Intent: with enough modules, allotment should be ceil of each EV's "
         "isolated request (no sharing fight)."
     )
 
     policy = ProportionalPower()
-    pile = ChargingPile(id=0, n_nozzles=2, num_bricks=10, p_brick=10.0)
+    pile = ChargingPile(id=0, n_dispensers=2, num_modules=10, p_module=10.0)
     # With s_th=0.5 and c_rate=1, p_req equals c_b while SoC < s_th.
     ev1 = _make_ev(1, 25)
     ev2 = _make_ev(2, 35)
     pile.connect_ev(ev1)
     pile.connect_ev(ev2)
     print(
-        f"  Setup: p_brick={pile.p_brick}, num_bricks={pile.num_bricks}, "
+        f"  Setup: p_module={pile.p_module}, num_modules={pile.num_modules}, "
         f"EV1 p_req={ev1.p_req:.1f}, EV2 p_req={ev2.p_req:.1f}"
     )
 
     assignments = policy.update_power(pile)
     power_by_id = {e.id: p for e, p in assignments}
-    expected_1 = ceil(ev1.p_req / pile.p_brick)
-    expected_2 = ceil(ev2.p_req / pile.p_brick)
+    expected_1 = ceil(ev1.p_req / pile.p_module)
+    expected_2 = ceil(ev2.p_req / pile.p_module)
 
     print(
-        f"  Result: ev_bricks={pile.ev_bricks}, "
+        f"  Result: ev_modules={pile.ev_modules}, "
         f"expected=[{expected_1}, {expected_2}], "
         f"powers={power_by_id}, overloaded={pile.is_overloaded}"
     )
 
-    assert pile.ev_bricks[ev1.nozzle_id] == expected_1
-    assert pile.ev_bricks[ev2.nozzle_id] == expected_2
-    assert sum(pile.ev_bricks) <= pile.num_bricks
-    assert power_by_id[1] == pile.ev_bricks[ev1.nozzle_id] * 10
-    assert power_by_id[2] == pile.ev_bricks[ev2.nozzle_id] * 10
+    assert pile.ev_modules[ev1.dispenser_id] == expected_1
+    assert pile.ev_modules[ev2.dispenser_id] == expected_2
+    assert sum(pile.ev_modules) <= pile.num_modules
+    assert power_by_id[1] == pile.ev_modules[ev1.dispenser_id] * 10
+    assert power_by_id[2] == pile.ev_modules[ev2.dispenser_id] * 10
     print("  PASS")
 
 
-def test_overloaded_respects_brick_cap():
-    """When isolated demand exceeds bricks, total allotment must equal num_bricks."""
-    print("\n=== test_overloaded_respects_brick_cap ===")
+def test_overloaded_respects_module_cap():
+    """When isolated demand exceeds modules, total allotment must equal num_modules."""
+    print("\n=== test_overloaded_respects_module_cap ===")
     print(
-        "Intent: if ceil requests sum above the brick pool, policy must still "
-        "assign exactly num_bricks and give each EV at least one."
+        "Intent: if ceil requests sum above the module pool, policy must still "
+        "assign exactly num_modules and give each EV at least one."
     )
 
     policy = ProportionalPower()
-    pile = ChargingPile(id=0, n_nozzles=2, num_bricks=4, p_brick=50.0)
+    pile = ChargingPile(id=0, n_dispensers=2, num_modules=4, p_module=50.0)
     # Isolated demand: ceil(105/50)+ceil(90/50) = 3+2 = 5 > 4
     ev1 = _make_ev(1, 105, s_th=0.5)
     ev2 = _make_ev(2, 90, s_th=0.5)
@@ -100,115 +100,115 @@ def test_overloaded_respects_brick_cap():
     pile.connect_ev(ev2)
 
     isolated = [
-        ceil(ev1.p_req / pile.p_brick),
-        ceil(ev2.p_req / pile.p_brick),
+        ceil(ev1.p_req / pile.p_module),
+        ceil(ev2.p_req / pile.p_module),
     ]
     print(
         f"  Setup: p_reqs=[{ev1.p_req:.1f}, {ev2.p_req:.1f}], "
-        f"isolated ceils={isolated}, pool={pile.num_bricks}, "
+        f"isolated ceils={isolated}, pool={pile.num_modules}, "
         f"is_overloaded={pile.is_overloaded}"
     )
     assert pile.is_overloaded
 
     policy.update_power(pile)
     print(
-        f"  Result: ev_bricks={pile.ev_bricks}, sum={sum(pile.ev_bricks)}, "
-        f"each >= 1? {all(pile.ev_bricks[e.nozzle_id] >= 1 for e in pile.evs)}"
+        f"  Result: ev_modules={pile.ev_modules}, sum={sum(pile.ev_modules)}, "
+        f"each >= 1? {all(pile.ev_modules[e.dispenser_id] >= 1 for e in pile.evs)}"
     )
 
-    assert sum(pile.ev_bricks) == pile.num_bricks
-    assert all(pile.ev_bricks[e.nozzle_id] >= 1 for e in pile.evs)
+    assert sum(pile.ev_modules) == pile.num_modules
+    assert all(pile.ev_modules[e.dispenser_id] >= 1 for e in pile.evs)
     print("  PASS")
 
 
-def test_disconnect_middle_nozzle_keeps_slots():
+def test_disconnect_middle_dispenser_keeps_slots():
     """Removing the EV in slot 0 must not renumber the EV still in slot 1."""
-    print("\n=== test_disconnect_middle_nozzle_keeps_slots ===")
+    print("\n=== test_disconnect_middle_dispenser_keeps_slots ===")
     print(
-        "Intent: nozzle indices are fixed slots. After unplugging EV1 from slot 0, "
-        "EV2 should stay on nozzle_id=1 and brick vector stays aligned."
+        "Intent: dispenser indices are fixed slots. After unplugging EV1 from slot 0, "
+        "EV2 should stay on dispenser_id=1 and module vector stays aligned."
     )
 
     policy = ProportionalPower()
-    pile = ChargingPile(id=0, n_nozzles=2, num_bricks=5, p_brick=25.0)
+    pile = ChargingPile(id=0, n_dispensers=2, num_modules=5, p_module=25.0)
     ev1 = _make_ev(1, 50)
     ev2 = _make_ev(2, 50)
     pile.connect_ev(ev1)
     pile.connect_ev(ev2)
     policy.update_power(pile)
     print(
-        f"  Before disconnect: nozzles="
-        f"{[None if e is None else e.id for e in pile.nozzles]}, "
-        f"ev2.nozzle_id={ev2.nozzle_id}, ev_bricks={pile.ev_bricks}"
+        f"  Before disconnect: dispensers="
+        f"{[None if e is None else e.id for e in pile.dispensers]}, "
+        f"ev2.dispenser_id={ev2.dispenser_id}, ev_modules={pile.ev_modules}"
     )
 
-    slot1 = ev2.nozzle_id
+    slot1 = ev2.dispenser_id
     pile.disconnect_ev(ev1)
     print(
-        f"  After disconnect EV1: nozzles="
-        f"{[None if e is None else e.id for e in pile.nozzles]}, "
-        f"ev2.nozzle_id={ev2.nozzle_id}, ev_bricks={pile.ev_bricks}"
+        f"  After disconnect EV1: dispensers="
+        f"{[None if e is None else e.id for e in pile.dispensers]}, "
+        f"ev2.dispenser_id={ev2.dispenser_id}, ev_modules={pile.ev_modules}"
     )
 
-    assert ev2.nozzle_id == slot1
-    assert pile.nozzles[0] is None
-    assert pile.nozzles[1] is ev2
-    assert pile.ev_bricks[0] == 0
+    assert ev2.dispenser_id == slot1
+    assert pile.dispensers[0] is None
+    assert pile.dispensers[1] is ev2
+    assert pile.ev_modules[0] == 0
 
     policy.update_power(pile)
     print(
-        f"  After redistribute: ev_bricks={pile.ev_bricks}, "
-        f"EV2 bricks={pile.ev_bricks[ev2.nozzle_id]}"
+        f"  After redistribute: ev_modules={pile.ev_modules}, "
+        f"EV2 modules={pile.ev_modules[ev2.dispenser_id]}"
     )
-    assert pile.ev_bricks[ev2.nozzle_id] >= 1
-    assert sum(pile.ev_bricks) <= pile.num_bricks
+    assert pile.ev_modules[ev2.dispenser_id] >= 1
+    assert sum(pile.ev_modules) <= pile.num_modules
     pile.check_invariants()
     print("  PASS")
 
 
-def test_micro_distribute_frees_brick_from_trigger_ev():
-    """CHARGE_CHANGE path: free one brick from the trigger EV, then refill leftovers."""
-    print("\n=== test_micro_distribute_frees_brick_from_trigger_ev ===")
+def test_micro_distribute_frees_module_from_trigger_ev():
+    """CHARGE_CHANGE path: free one module from the trigger EV, then refill leftovers."""
+    print("\n=== test_micro_distribute_frees_module_from_trigger_ev ===")
     print(
-        "Intent: update_power(pile, ev=EV1) should drop one brick from EV1 then "
-        "reassign any free bricks; total must stay at num_bricks."
+        "Intent: update_power(pile, ev=EV1) should drop one module from EV1 then "
+        "reassign any free modules; total must stay at num_modules."
     )
 
     policy = ProportionalPower()
-    pile = ChargingPile(id=0, n_nozzles=2, num_bricks=4, p_brick=25.0)
+    pile = ChargingPile(id=0, n_dispensers=2, num_modules=4, p_module=25.0)
     ev1 = _make_ev(1, 100)
     ev2 = _make_ev(2, 100)
     pile.connect_ev(ev1)
     pile.connect_ev(ev2)
     policy.update_power(pile)
-    before = list(pile.ev_bricks)
-    before_ev1 = pile.ev_bricks[ev1.nozzle_id]
-    print(f"  Before micro: ev_bricks={before}, EV1 bricks={before_ev1}")
+    before = list(pile.ev_modules)
+    before_ev1 = pile.ev_modules[ev1.dispenser_id]
+    print(f"  Before micro: ev_modules={before}, EV1 modules={before_ev1}")
     assert before_ev1 >= 1
 
     policy.update_power(pile, ev=ev1)
-    after = list(pile.ev_bricks)
-    print(f"  After micro (trigger=EV1): ev_bricks={after}, sum={sum(after)}")
+    after = list(pile.ev_modules)
+    print(f"  After micro (trigger=EV1): ev_modules={after}, sum={sum(after)}")
 
-    assert sum(pile.ev_bricks) == pile.num_bricks
+    assert sum(pile.ev_modules) == pile.num_modules
     print("  PASS")
 
 
 def test_static_equal_split_with_leftovers_by_unmet_request():
     """
-    Static: equal base bricks, leftovers to largest unmet p_req.
+    Static: equal base modules, leftovers to largest unmet p_req.
 
-    Matches the documented example: 5 bricks, p_brick=25, requests
+    Matches the documented example: 5 modules, p_module=25, requests
     75 / 250 / 200 kW -> base 1 each, leftovers to 250 then 200 -> [1, 2, 2].
     """
     print("\n=== test_static_equal_split_with_leftovers_by_unmet_request ===")
     print(
-        "Intent: with 5 bricks and three EVs at 75/250/200 kW, Static should "
-        "give 1 each then hand leftovers by unmet request -> bricks [1, 2, 2]."
+        "Intent: with 5 modules and three EVs at 75/250/200 kW, Static should "
+        "give 1 each then hand leftovers by unmet request -> modules [1, 2, 2]."
     )
 
     policy = StaticPower()
-    pile = ChargingPile(id=0, n_nozzles=3, num_bricks=5, p_brick=25.0)
+    pile = ChargingPile(id=0, n_dispensers=3, num_modules=5, p_module=25.0)
     # c_rate=1 so flat-region p_req equals c_b (kW) for the documented numbers.
     ev_low = _make_ev(0, 75.0, s_i=0.2, s_th=0.6, c_rate=1.0)
     ev_hi = _make_ev(1, 250.0, s_i=0.2, s_th=0.6, c_rate=1.0)
@@ -219,36 +219,36 @@ def test_static_equal_split_with_leftovers_by_unmet_request():
 
     print(
         f"  Setup: p_reqs=[{ev_low.p_req:.1f}, {ev_hi.p_req:.1f}, {ev_mid.p_req:.1f}], "
-        f"pool={pile.num_bricks}, p_brick={pile.p_brick}"
+        f"pool={pile.num_modules}, p_module={pile.p_module}"
     )
 
     policy.update_power(pile)
-    bricks = [
-        pile.ev_bricks[ev_low.nozzle_id],
-        pile.ev_bricks[ev_hi.nozzle_id],
-        pile.ev_bricks[ev_mid.nozzle_id],
+    modules = [
+        pile.ev_modules[ev_low.dispenser_id],
+        pile.ev_modules[ev_hi.dispenser_id],
+        pile.ev_modules[ev_mid.dispenser_id],
     ]
-    print(f"  Result: ev_bricks by EV order={bricks}, sum={sum(bricks)}")
+    print(f"  Result: ev_modules by EV order={modules}, sum={sum(modules)}")
 
-    assert bricks == [1, 2, 2]
-    assert sum(pile.ev_bricks) == pile.num_bricks
+    assert modules == [1, 2, 2]
+    assert sum(pile.ev_modules) == pile.num_modules
     print("  PASS")
 
 
 def test_static_single_ev_gets_full_pool():
-    """One plugged EV receives the entire brick pool under equal split."""
+    """One plugged EV receives the entire module pool under equal split."""
     print("\n=== test_static_single_ev_gets_full_pool ===")
-    print("Intent: with one EV, num_bricks // 1 assigns the full pool to that EV.")
+    print("Intent: with one EV, num_modules // 1 assigns the full pool to that EV.")
 
     policy = StaticPower()
-    pile = ChargingPile(id=0, n_nozzles=2, num_bricks=5, p_brick=25.0)
+    pile = ChargingPile(id=0, n_dispensers=2, num_modules=5, p_module=25.0)
     ev = _make_ev(1, 100.0, s_i=0.2, s_th=0.6, c_rate=1.0)
     pile.connect_ev(ev)
     policy.update_power(pile)
 
-    print(f"  Result: ev_bricks={pile.ev_bricks}")
-    assert pile.ev_bricks[ev.nozzle_id] == pile.num_bricks
-    assert sum(pile.ev_bricks) == pile.num_bricks
+    print(f"  Result: ev_modules={pile.ev_modules}")
+    assert pile.ev_modules[ev.dispenser_id] == pile.num_modules
+    assert sum(pile.ev_modules) == pile.num_modules
     print("  PASS")
 
 
@@ -257,12 +257,12 @@ def test_underuse_reallocation_flag_and_charge_change_gating():
     Prop opts into CHARGE_CHANGE; Static opts out so next_state stays DEPARTURE.
 
     Without this gate, Static rebuilds the equal split on underuse, hands the
-    brick back, and the DES can loop forever on CHARGE_CHANGE.
+    module back, and the DES can loop forever on CHARGE_CHANGE.
     """
     print("\n=== test_underuse_reallocation_flag_and_charge_change_gating ===")
     print(
         "Intent: Static.supports_underuse_reallocation is False and schedules "
-        "DEPARTURE even when overloaded with n_bricks>1; Prop can schedule "
+        "DEPARTURE even when overloaded with n_modules>1; Prop can schedule "
         "CHARGE_CHANGE."
     )
 
@@ -275,34 +275,34 @@ def test_underuse_reallocation_flag_and_charge_change_gating():
             self.current_time = 0.0
             self.next_time = 0.0
 
-    # Shared overloaded setup: two EVs, 4 bricks, p_brick=25, high p_req.
+    # Shared overloaded setup: two EVs, 4 modules, p_module=25, high p_req.
     def _overloaded_pile(policy):
         station = _StubStation(policy)
-        pile = ChargingPile(id=0, n_nozzles=2, num_bricks=4, p_brick=25.0, station=station)
+        pile = ChargingPile(id=0, n_dispensers=2, num_modules=4, p_module=25.0, station=station)
         ev1 = _make_ev(1, 200.0, s_i=0.2, s_f=0.95, s_th=0.6, c_rate=1.0)
         ev2 = _make_ev(2, 200.0, s_i=0.2, s_f=0.95, s_th=0.6, c_rate=1.0)
         pile.connect_ev(ev1)
         pile.connect_ev(ev2)
         policy.update_power(pile)
-        # Ensure CHARGE_CHANGE eligibility shape: >1 brick on an overloaded pile.
-        if pile.ev_bricks[ev1.nozzle_id] <= 1:
-            pile.ev_bricks[ev1.nozzle_id] = 2
-            pile.ev_bricks[ev2.nozzle_id] = pile.num_bricks - 2
-        ev1.p_act = pile.ev_bricks[ev1.nozzle_id] * pile.p_brick
+        # Ensure CHARGE_CHANGE eligibility shape: >1 module on an overloaded pile.
+        if pile.ev_modules[ev1.dispenser_id] <= 1:
+            pile.ev_modules[ev1.dispenser_id] = 2
+            pile.ev_modules[ev2.dispenser_id] = pile.num_modules - 2
+        ev1.p_act = pile.ev_modules[ev1.dispenser_id] * pile.p_module
         return pile, ev1
 
     pile_s, ev_s = _overloaded_pile(StaticPower())
     assert pile_s.is_overloaded
-    assert ev_s.n_bricks > 1
+    assert ev_s.n_modules > 1
     typ_s = ev_s.event_type_next_candidate
-    print(f"  Static: overloaded={pile_s.is_overloaded}, bricks={ev_s.n_bricks}, next={typ_s.name}")
+    print(f"  Static: overloaded={pile_s.is_overloaded}, modules={ev_s.n_modules}, next={typ_s.name}")
     assert typ_s == EventType.DEPARTURE
 
     pile_p, ev_p = _overloaded_pile(ProportionalPower())
     assert pile_p.is_overloaded
-    assert ev_p.n_bricks > 1
+    assert ev_p.n_modules > 1
     typ_p = ev_p.event_type_next_candidate
-    print(f"  Prop: overloaded={pile_p.is_overloaded}, bricks={ev_p.n_bricks}, next={typ_p.name}")
+    print(f"  Prop: overloaded={pile_p.is_overloaded}, modules={ev_p.n_modules}, next={typ_p.name}")
     assert typ_p == EventType.CHARGE_CHANGE
     print("  PASS")
 
@@ -310,9 +310,9 @@ def test_underuse_reallocation_flag_and_charge_change_gating():
 if __name__ == "__main__":
     print("Running test_power_policy.py (direct mode)")
     test_non_overloaded_ceil_allocation()
-    test_overloaded_respects_brick_cap()
-    test_disconnect_middle_nozzle_keeps_slots()
-    test_micro_distribute_frees_brick_from_trigger_ev()
+    test_overloaded_respects_module_cap()
+    test_disconnect_middle_dispenser_keeps_slots()
+    test_micro_distribute_frees_module_from_trigger_ev()
     test_static_equal_split_with_leftovers_by_unmet_request()
     test_static_single_ev_gets_full_pool()
     test_underuse_reallocation_flag_and_charge_change_gating()

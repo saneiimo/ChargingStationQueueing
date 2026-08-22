@@ -2,15 +2,15 @@
 Gymnasium env for learning pile assignment (typically head-of-line).
 
 The agent does not advance the DES clock. We auto-advance until either a
-decision is needed (queue nonempty and a free nozzle exists) or the episode
+decision is needed (queue nonempty and a free dispenser exists) or the episode
 ends. Actions are pile indices; call action_masks() to hide full piles.
 Heuristic baselines may also pass ``ev=`` into ``step`` to assign a chosen
 waiting vehicle (see ``policy.queue.base.QueuePolicy.decide``).
 
 Observation (all scaled roughly to [0, 1]):
   for each pile:
-    occupancy fraction, free-nozzle fraction, overload flag,
-    total p_req / pile power, bricks used / bricks, mean SoC of plugged EVs
+    occupancy fraction, free-dispenser fraction, overload flag,
+    total p_req / pile power, modules used / modules, mean SoC of plugged EVs
   head-of-line EV (or zeros if queue empty):
     battery / max, s_current, s_f, p_req / max power, energy_needed / max
   queue length / capacity
@@ -51,9 +51,9 @@ class ChargingStationEnv(gym.Env):
     def __init__(
         self,
         n_piles: int = 4,
-        n_nozzles: int = 2,
-        n_bricks: int = 5,
-        p_brick: float = 25.0,
+        n_dispensers: int = 2,
+        n_modules: int = 5,
+        p_module: float = 25.0,
         queue_capacity: int = 10,
         mean_interarrival: float = 5.0,
         power_policy: PowerPolicy | None = None,
@@ -73,26 +73,26 @@ class ChargingStationEnv(gym.Env):
             power_policy = ProportionalPower()
 
         self.n_piles = n_piles
-        self.n_nozzles = n_nozzles
-        self.n_bricks = n_bricks
-        self.p_brick = p_brick
+        self.n_dispensers = n_dispensers
+        self.n_modules = n_modules
+        self.p_module = p_module
         self.queue_capacity = queue_capacity
         self.mean_interarrival = mean_interarrival
         self.queue_holding_cost = queue_holding_cost
         self.drop_penalty = drop_penalty
         self._max_battery = float(max(BATTERY_CAP_OPTIONS))
-        self._max_power = float(n_bricks * p_brick)
+        self._max_power = float(n_modules * p_module)
 
         station = ChargingStation(
             n_piles=n_piles,
-            n_nozzles=n_nozzles,
-            n_bricks=n_bricks,
-            p_brick=p_brick,
+            n_dispensers=n_dispensers,
+            n_modules=n_modules,
+            p_module=p_module,
             queue_capacity=queue_capacity,
             power_policy=power_policy,
             mean_interarrival=mean_interarrival,
         )
-        metrics = MetricsTracker(n_piles=n_piles, n_nozzles=n_nozzles)
+        metrics = MetricsTracker(n_piles=n_piles, n_dispensers=n_dispensers)
         self.engine = SimulationEngine(station, metrics, EventQueue())
 
         self.action_space = spaces.Discrete(n_piles)
@@ -104,7 +104,7 @@ class ChargingStationEnv(gym.Env):
         )
 
     def action_masks(self) -> np.ndarray:
-        """True where the pile still has a free nozzle."""
+        """True where the pile still has a free dispenser."""
         return np.array(
             [not pile.is_full for pile in self.engine.station.piles], dtype=np.bool_
         )
@@ -119,14 +119,14 @@ class ChargingStationEnv(gym.Env):
 
         for pile in piles:
             occ = len(pile.evs)
-            features.append(occ / pile.n_nozzles)  # occ fract
-            features.append(pile.free_nozzles / pile.n_nozzles)  # free-nozzle frac
+            features.append(occ / pile.n_dispensers)  # occ fract
+            features.append(pile.free_dispensers / pile.n_dispensers)  # free-dispenser frac
             features.append(1.0 if pile.is_overloaded else 0.0)  # overload flag
             total_req = sum(ev.p_req for ev in pile.evs)
             features.append(
                 min(total_req / self._max_power, 1.0) if self._max_power else 0.0
             )  # total p_req / max_power
-            features.append(pile.bricks_used / pile.num_bricks)  # brick used bricks
+            features.append(pile.modules_used / pile.num_modules)  # module used modules
             if pile.evs:
                 features.append(
                     float(np.mean([ev.s_current for ev in pile.evs]))

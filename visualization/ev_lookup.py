@@ -45,8 +45,8 @@ def get_evs_from_env(env: ChargingStationEnv, ev_ids: list[int]) -> list[EV]:
 def ev_location_label(ev: EV) -> str:
     pile = ev.pile_tracker
     pile_id = pile.id if pile is not None else "?"
-    nozzle = ev.nozzle_id_tracker if ev.nozzle_id_tracker is not None else "?"
-    return f"pile {pile_id}, nozzle {nozzle}"
+    dispenser = ev.dispenser_id_tracker if ev.dispenser_id_tracker is not None else "?"
+    return f"pile {pile_id}, dispenser {dispenser}"
 
 
 def ev_window_times(ev: EV, episode_time: float) -> tuple[float, float]:
@@ -63,7 +63,7 @@ def evs_for_pile(env: ChargingStationEnv, pile_id: int) -> list[EV]:
     out: list[EV] = []
 
     for ev in env.engine.metrics.finished_evs:
-        if ev.pile_tracker is pile and ev.nozzle_id_tracker is not None:
+        if ev.pile_tracker is pile and ev.dispenser_id_tracker is not None:
             out.append(ev)
             seen.add(ev.id)
 

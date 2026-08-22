@@ -1,12 +1,12 @@
 """
-Proportional brick sharing on a single pile.
+Proportional module sharing on a single pile.
 
-Not overloaded: each EV gets ceil(p_req / p_brick) bricks (fits by definition).
-Overloaded: give bricks in proportion to p_req (at least one each), repair if
-we overshot the pile's brick count, then hand leftover bricks to whoever still
+Not overloaded: each EV gets ceil(p_req / p_module) modules (fits by definition).
+Overloaded: give modules in proportion to p_req (at least one each), repair if
+we overshot the pile's module count, then hand leftover modules to whoever still
 has the largest unmet request (_micro_distribute).
 
-When the engine passes the triggering EV (CHARGE_CHANGE), we free one brick
+When the engine passes the triggering EV (CHARGE_CHANGE), we free one module
 from that EV first, then run the same leftover fill.
 
 ``supports_underuse_reallocation = True`` so ``EV.next_state`` may schedule
@@ -25,7 +25,7 @@ if TYPE_CHECKING:
 
 
 class ProportionalPower(PowerPolicy):
-    # Free underused bricks and reassign them (see _micro_distribute).
+    # Free underused modules and reassign them (see _micro_distribute).
     supports_underuse_reallocation = True
 
     def update_power(
@@ -34,7 +34,7 @@ class ProportionalPower(PowerPolicy):
         ev: EV | None = None,
     ) -> list[tuple[EV, float]]:
         if not pile.evs:
-            pile.ev_bricks = [0] * pile.n_nozzles
+            pile.ev_modules = [0] * pile.n_dispensers
             return []
 
         if ev is not None and pile.is_overloaded:
@@ -46,54 +46,54 @@ class ProportionalPower(PowerPolicy):
 
         assignments = []
         for connected in pile.evs:
-            power = pile.ev_bricks[connected.nozzle_id] * pile.p_brick
+            power = pile.ev_modules[connected.dispenser_id] * pile.p_module
             assignments.append((connected, power))
         return assignments
 
-    def _clear_bricks(self, pile: ChargingPile) -> None:
-        pile.ev_bricks = [0] * pile.n_nozzles
+    def _clear_modules(self, pile: ChargingPile) -> None:
+        pile.ev_modules = [0] * pile.n_dispensers
 
     def _distribute(self, pile: ChargingPile) -> None:
-        """Full rebuild of brick counts from current requests."""
-        self._clear_bricks(pile)
+        """Full rebuild of module counts from current requests."""
+        self._clear_modules(pile)
 
         if pile.is_overloaded:
-            # Overloaded: demand exceeds the brick pool.
-            # Guarantee one brick per plugged EV (safe: num_bricks >= n_nozzles >= n_evs),
-            # then greedily hand remaining bricks to the largest unmet p_req.
+            # Overloaded: demand exceeds the module pool.
+            # Guarantee one module per plugged EV (safe: num_modules >= n_dispensers >= n_evs),
+            # then greedily hand remaining modules to the largest unmet p_req.
             total_req = sum(ev.p_req for ev in pile.evs)
             if total_req <= 0:
                 raise ValueError(
                     f"Overloaded pile {pile.id} has total_req={total_req} <= 0"
                 )
             for connected in pile.evs:
-                pile.ev_bricks[connected.nozzle_id] = 1
-            self._micro_distribute(pile)  # fills up to num_bricks
+                pile.ev_modules[connected.dispenser_id] = 1
+            self._micro_distribute(pile)  # fills up to num_modules
         else:
-            # Not overloaded: each EV can take its isolated ceil(p_req / p_brick).
+            # Not overloaded: each EV can take its isolated ceil(p_req / p_module).
             for connected in pile.evs:
-                pile.ev_bricks[connected.nozzle_id] = ceil(
-                    connected.p_req / pile.p_brick
+                pile.ev_modules[connected.dispenser_id] = ceil(
+                    connected.p_req / pile.p_module
                 )
 
     def _micro_distribute(self, pile: ChargingPile, ev: EV | None = None) -> None:
         """
-        Give any free bricks to the nozzle with the largest remaining request.
-        Optional `ev`: drop one of that EV's bricks first (underutilization path).
+        Give any free modules to the dispenser with the largest remaining request.
+        Optional `ev`: drop one of that EV's modules first (underutilization path).
         """
         if not pile.evs:
-            self._clear_bricks(pile)
+            self._clear_modules(pile)
             return
 
         if ev is not None:
-            if ev.nozzle_id is None or pile.nozzles[ev.nozzle_id] is not ev:
+            if ev.dispenser_id is None or pile.dispensers[ev.dispenser_id] is not ev:
                 raise ValueError("CHARGE_CHANGE EV is not on this pile")
-            if pile.ev_bricks[ev.nozzle_id] > 0:
-                pile.ev_bricks[ev.nozzle_id] -= 1
+            if pile.ev_modules[ev.dispenser_id] > 0:
+                pile.ev_modules[ev.dispenser_id] -= 1
 
-        while sum(pile.ev_bricks) < pile.num_bricks:
+        while sum(pile.ev_modules) < pile.num_modules:
             reqs = pile.remaining_reqs
             idx = int(np.argmax(reqs))
             if not np.isfinite(reqs[idx]):
                 break
-            pile.ev_bricks[idx] += 1
+            pile.ev_modules[idx] += 1

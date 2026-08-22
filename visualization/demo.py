@@ -10,9 +10,9 @@ from policy.queue.fifo import FIFOQueuePolicy
 
 def run_fifo_episode(
     n_piles: int = 4,
-    n_nozzles: int = 2,
-    n_bricks: int = 5,
-    p_brick: float = 25.0,
+    n_dispensers: int = 2,
+    n_modules: int = 5,
+    p_module: float = 25.0,
     queue_capacity: int = 10,
     mean_interarrival: float = 5.0,
     seed: int = 42,
@@ -21,9 +21,9 @@ def run_fifo_episode(
     """Roll out one full day under FIFO pile choice (records charge traces)."""
     env = ChargingStationEnv(
         n_piles=n_piles,
-        n_nozzles=n_nozzles,
-        n_bricks=n_bricks,
-        p_brick=p_brick,
+        n_dispensers=n_dispensers,
+        n_modules=n_modules,
+        p_module=p_module,
         queue_capacity=queue_capacity,
         mean_interarrival=mean_interarrival,
     )

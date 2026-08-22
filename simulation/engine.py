@@ -163,7 +163,7 @@ class SimulationEngine:
         return self.current_time
 
     def _redistribute_power(self, pile: ChargingPile, ev: EV | None = None):
-        """Ask the power policy for new brick shares; schedule EV events only."""
+        """Ask the power policy for new module shares; schedule EV events only."""
         assignments = self.station.power_policy.update_power(pile, ev)
         schedule_time = self._schedule_time()
         for connected, power in assignments:
@@ -221,7 +221,7 @@ class SimulationEngine:
         return self.terminated
 
     def needs_assignment_decision(self) -> bool:
-        """True when someone is waiting and at least one nozzle is free."""
+        """True when someone is waiting and at least one dispenser is free."""
         if self.terminated:
             return False
         if not self.station.queue:

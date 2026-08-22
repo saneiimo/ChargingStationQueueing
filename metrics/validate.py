@@ -177,10 +177,10 @@ def validate_episode(
                 f"departure={t_dep}"
             )
 
-        if ev.pile_tracker is None or ev.nozzle_id_tracker is None:
+        if ev.pile_tracker is None or ev.dispenser_id_tracker is None:
             location_bad.append(
                 f"EV {ev.id}: pile_tracker={ev.pile_tracker}, "
-                f"nozzle_id_tracker={ev.nozzle_id_tracker}"
+                f"dispenser_id_tracker={ev.dispenser_id_tracker}"
             )
 
         # Instantaneous samples logged during the DES (and at departure).
@@ -238,7 +238,7 @@ def validate_episode(
     )
     _check(
         report,
-        "Finished: pile_tracker / nozzle_id_tracker set",
+        "Finished: pile_tracker / dispenser_id_tracker set",
         not location_bad,
         (
             f"ok for all finished EVs"
@@ -305,7 +305,7 @@ def report_queueing_laws(
     verbose: bool = False,
 ) -> dict[str, float]:
     """
-    Print / return Little's law (system / queue) and nozzle utilization.
+    Print / return Little's law (system / queue) and dispenser utilization.
 
     Delegates all computation to ``MetricsTracker.queueing_summary`` so
     notebooks, tests, and this helper share one implementation.
@@ -334,7 +334,7 @@ def report_queueing_laws(
     metrics = engine.metrics
     station = engine.station
     T = float(engine.current_time) if engine.current_time > 0 else 1.0
-    c = station.n_piles * station.n_nozzles
+    c = station.n_piles * station.n_dispensers
 
     try:
         out = metrics.queueing_summary(T, n_servers=c)

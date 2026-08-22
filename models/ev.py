@@ -3,7 +3,7 @@ Electric vehicle with a nonlinear charging curve.
 
 An EV arrives with battery size c_b, initial SoC s_i, and target SoC s_f.
 While plugged into a ChargingPile it draws power p_act (capped by the pile's
-brick allotment and by its own BMS request p_req).
+module allotment and by its own BMS request p_req).
 
 p_req is flat up to s_th, then tapers linearly toward empty request at SoC=1.
 Given p_act, we can compute:
@@ -44,8 +44,8 @@ class EV:
     service_start_time: float | None = None
     pile: ChargingPile | None = None  # Set while plugged in; cleared on disconnect
     pile_tracker: ChargingPile | None = None  # Last pile used (kept after departure)
-    nozzle_id: int | None = None  # Fixed slot index on the pile (cleared on disconnect)
-    nozzle_id_tracker: int | None = None  # Same slot, kept after departure (for plots)
+    dispenser_id: int | None = None  # Fixed slot index on the pile (cleared on disconnect)
+    dispenser_id_tracker: int | None = None  # Same slot, kept after departure (for plots)
     energy_received: float = 0  # Integrated from deltaE_power
     energy_received_2: float = 0  # Integrated from SoC deltas (sanity check)
     departure_time: float = float("inf")
@@ -120,10 +120,10 @@ class EV:
         )
 
     @property
-    def n_bricks(self) -> int | None:
-        if self.pile is None or self.nozzle_id is None:
+    def n_modules(self) -> int | None:
+        if self.pile is None or self.dispenser_id is None:
             return None
-        return self.pile.ev_bricks[self.nozzle_id]
+        return self.pile.ev_modules[self.dispenser_id]
 
     @property
     def p_req(self) -> float:
@@ -163,7 +163,7 @@ class EV:
         """
         True only if the station's power policy opts into CHARGE_CHANGE.
 
-        Underuse events are for policies that free a brick on underutilization
+        Underuse events are for policies that free a module on underutilization
         (e.g. Proportional). Fixed-split policies (e.g. Static) leave the flag
         False so we never schedule CHARGE_CHANGE. Missing station/policy is
         treated as False (safe for unit tests that build a pile alone).
@@ -181,20 +181,20 @@ class EV:
         Next SoC milestone and the event type that should fire there.
 
         If the power policy supports underuse reallocation, the pile is
-        overloaded, and this EV holds more than one brick, we watch for
+        overloaded, and this EV holds more than one module, we watch for
         underutilization (CHARGE_CHANGE). Otherwise we aim for s_f (DEPARTURE).
         """
         if (
             self.pile is not None
-            and self.n_bricks is not None
+            and self.n_modules is not None
             and self._power_policy_supports_underuse_reallocation()
             and self.pile.is_overloaded
-            and self.n_bricks > 1
+            and self.n_modules > 1
         ):
             p_thresh = (
-                self.n_bricks - 1 + self.pile.brickCheck_thresh
-            ) * self.pile.p_brick
-            p_thresh_2 = (self.n_bricks - 1) * self.pile.p_brick
+                self.n_modules - 1 + self.pile.moduleCheck_thresh
+            ) * self.pile.p_module
+            p_thresh_2 = (self.n_modules - 1) * self.pile.p_module
             if self.p_act > p_thresh and not np.isclose(
                 self.p_act, p_thresh, rtol=1e-6, atol=1e-9
             ):

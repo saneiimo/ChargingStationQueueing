@@ -10,16 +10,16 @@ from pathlib import Path
 # Repo root (directory containing this file).
 PROJECT_ROOT = Path(__file__).resolve().parent
 
-# When an EV is using less than this fraction of its last brick, we treat that
-# brick as underutilized and may free it for another EV on the same pile.
-BRICK_CHECK_THRESH = 0.2
+# When an EV is using less than this fraction of its last module, we treat that
+# module as underutilized and may free it for another EV on the same pile.
+MODULE_CHECK_THRESH = 0.2
 
 # SoC where the BMS request starts tapering on the charging curve.
 S_THRESH = 0.4
 
 # How we sample arriving EVs in the engine.
-# BATTERY_CAP_OPTIONS = [50.0, 100.0, 150.0]
-BATTERY_CAP_OPTIONS = [75.0]
+BATTERY_CAP_OPTIONS = [50.0]
+# BATTERY_CAP_OPTIONS = [75.0]
 # Battery capacity are inputted as kWh, however for calculation
 # we need a unit conversion, as the simulation time is in minutes
 HR2MIN = 60
@@ -31,7 +31,7 @@ C_RATE = 2 / HR2MIN
 # Episode length (minutes).
 MAX_TIME = 1440
 
-# If True, piles assert nozzle/brick consistency after redistributions.
+# If True, piles assert dispenser/module consistency after redistributions.
 CHECK_INVARIANTS = True
 
 # Gym reward pieces: cost of queue wait per (vehicle * minute), and per drop.
@@ -84,13 +84,15 @@ VIZ_PALETTE = (
     VIZ_COLORS["neutral"],
 )
 
-# Semantic colors for EV theory-vs-sim overlays.
+# Semantic colors for EV theory-vs-sim overlays (also reused by
+# offline_opt.visualization for the offline MILP's own solution plots).
 VIZ_SERIES = {
     "theory": VIZ_COLORS["neutral"],
     "sim_bms": VIZ_COLORS["sky"],
     "sim_actual": VIZ_COLORS["secondary"],
     "recorded": VIZ_COLORS["alert"],
     "recorded_edge": VIZ_COLORS["text"],
+    "modules": VIZ_COLORS["quaternary"],
 }
 
 # Colormaps for heatmaps / continuous fields (matplotlib names).

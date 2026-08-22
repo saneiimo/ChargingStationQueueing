@@ -1,30 +1,30 @@
 """
-Plot Power vs time for every nozzle on one charging pile.
+Plot Power vs time for every dispenser on one charging pile.
 
-For a chosen pile, builds one figure with ``n_nozzles`` vertically stacked axes.
-Each axis shows every EV that used that nozzle:
+For a chosen pile, builds one figure with ``n_dispensers`` vertically stacked axes.
+Each axis shows every EV that used that dispenser:
   - dashed: unconstrained theory P(t) (same as ``plot_ev_theory_vs_sim`` P-T)
   - solid: actual drawn power densified from DES ``charge_trace``
   - optional horizontal segments: piecewise-constant ``p_act`` plateaus between
     ``charge_trace`` samples (charge redistributions)
-  - optional vertical markers: sole brick-allotment change times
-    (shared across nozzles; plug-in / departure times excluded)
-  - optional labels at each trace sample: P, t, s, n_bricks
+  - optional vertical markers: sole module-allotment change times
+    (shared across dispensers; plug-in / departure times excluded)
+  - optional labels at each trace sample: P, t, s, n_modules
 
-Power-axis ticks and horizontal grid lines sit at multiples of one brick power.
+Power-axis ticks and horizontal grid lines sit at multiples of one module power.
 
 Styling comes from ``visualization.style`` / ``config`` ``VIZ_*`` constants.
-EV colors are assigned by plug-in time on the *pile* (not restarted per nozzle).
+EV colors are assigned by plug-in time on the *pile* (not restarted per dispenser).
 Plug-in / departure markers are drawn as shared vertical lines across all
-nozzle axes so events line up visually.
+dispenser axes so events line up visually.
 
 Example (after a FIFO run)::
 
-    from visualization.pile_power import plot_pile_nozzle_power, run_fifo_episode
+    from visualization.pile_power import plot_pile_dispenser_power, run_fifo_episode
     import matplotlib.pyplot as plt
 
     env = run_fifo_episode(seed=42)
-    fig = plot_pile_nozzle_power(env, pile_id=0, t_start=0, t_end=200)
+    fig = plot_pile_dispenser_power(env, pile_id=0, t_start=0, t_end=200)
     plt.show()
 
 Terminal::
@@ -62,27 +62,27 @@ DEFAULT_LABEL_ACTUAL = "Actual power"
 DEFAULT_LABEL_CHARGE_STEPS = "Allotted power"
 DEFAULT_LABEL_CHARGE_CHANGE = "Charge-change event"
 DEFAULT_TITLE_TEMPLATE = (
-    "Pile {pile_id}: theory vs actual power by nozzle "
+    "Pile {pile_id}: theory vs actual power by dispenser "
     "(t in [{t_lo:.1f}, {t_hi:.1f}])"
 )
 
 
-def _brick_power_ticks(p_brick: float, p_max: float) -> np.ndarray:
-    """Tick locations at 0, p_brick, 2*p_brick, ... covering ``p_max``."""
-    if p_brick <= 0:
+def _module_power_ticks(p_module: float, p_max: float) -> np.ndarray:
+    """Tick locations at 0, p_module, 2*p_module, ... covering ``p_max``."""
+    if p_module <= 0:
         return np.array([0.0])
-    n = int(np.ceil(max(p_max, 0.0) / p_brick - 1e-12))
-    return np.arange(0, n + 1, dtype=float) * p_brick
+    n = int(np.ceil(max(p_max, 0.0) / p_module - 1e-12))
+    return np.arange(0, n + 1, dtype=float) * p_module
 
 # Re-export for backward compatibility (tests / README import from here).
 __all__ = [
-    "plot_pile_nozzle_power",
+    "plot_pile_dispenser_power",
     "run_fifo_episode",
     "densify_charge_trace",
 ]
 
 
-def plot_pile_nozzle_power(
+def plot_pile_dispenser_power(
     env: ChargingStationEnv,
     pile_id: int,
     t_start: float | None = None,
@@ -111,7 +111,7 @@ def plot_pile_nozzle_power(
     theory_n_points: int = 200,
 ) -> plt.Figure:
     """
-    One figure for ``pile_id``: vertical subplots = nozzles; x = time; y = power.
+    One figure for ``pile_id``: vertical subplots = dispensers; x = time; y = power.
 
     Parameters
     ----------
@@ -135,11 +135,11 @@ def plot_pile_nozzle_power(
         Draw horizontal segments at ``p_act`` between consecutive ``charge_trace``
         samples (piecewise-constant power plateaus after each redistribution).
     show_charge_change_vlines :
-        Draw vertical markers at brick-allotment change times on **all** nozzle
+        Draw vertical markers at module-allotment change times on **all** dispenser
         axes, with a time label on the top axis. Times that coincide with any
         EV plug-in or departure on this pile are omitted (sole charge changes).
     show_trace_labels :
-        Annotate each ``charge_trace`` sample with P, t, s, and brick count.
+        Annotate each ``charge_trace`` sample with P, t, s, and module count.
     show_legend :
         If True, show a single shared legend (not per EV).
     label_theory, label_sim_bms, label_actual, label_charge_steps,
@@ -149,7 +149,7 @@ def plot_pile_nozzle_power(
         Optional figure title. Default uses ``DEFAULT_TITLE_TEMPLATE``.
     show_event_lines :
         If True, draw vertical lines at every EV plug-in / departure that fall
-        in the window, on **all** nozzle axes (aligned across the pile).
+        in the window, on **all** dispenser axes (aligned across the pile).
     event_line_alpha :
         Opacity of those shared event lines in ``[0, 1]``.
     charge_step_alpha :
@@ -163,13 +163,13 @@ def plot_pile_nozzle_power(
 
     Notes
     -----
-    Power-axis (y) ticks and grid lines are placed at multiples of one brick
-    power (``p_brick``), e.g. 0, 25, 50, ... kW.
+    Power-axis (y) ticks and grid lines are placed at multiples of one module
+    power (``p_module``), e.g. 0, 25, 50, ... kW.
 
     Returns
     -------
     matplotlib.figure.Figure
-        In Jupyter, assign to a variable (``fig = plot_pile_nozzle_power(...)``)
+        In Jupyter, assign to a variable (``fig = plot_pile_dispenser_power(...)``)
         or end the cell with a semicolon. Otherwise the inline backend may show
         the figure twice (once from pyplot, once from the returned object).
     """
@@ -180,7 +180,7 @@ def plot_pile_nozzle_power(
         raise ValueError(f"pile_id={pile_id} out of range [0, {station.n_piles - 1}]")
 
     pile = station.piles[pile_id]
-    n_nozzles = pile.n_nozzles
+    n_dispensers = pile.n_dispensers
     t_lo = 0.0 if t_start is None else float(t_start)
     t_hi = float(env.engine.current_time if t_end is None else t_end)
     if t_hi <= t_lo:
@@ -206,17 +206,17 @@ def plot_pile_nozzle_power(
     )
 
     episode_t = float(env.engine.current_time)
-    by_nozzle: dict[int, list[EV]] = defaultdict(list)
+    by_dispenser: dict[int, list[EV]] = defaultdict(list)
     pile_evs_in_window: list[EV] = []
 
     for ev in evs_for_pile(env, pile_id):
-        nid = ev.nozzle_id_tracker
+        nid = ev.dispenser_id_tracker
         if nid is None:
             continue
         t0, t1 = ev_window_times(ev, episode_t)
         if t1 < t_lo or t0 > t_hi:
             continue
-        by_nozzle[nid].append(ev)
+        by_dispenser[nid].append(ev)
         pile_evs_in_window.append(ev)
 
     color_of = color_by_plug_time(pile_evs_in_window)
@@ -230,7 +230,7 @@ def plot_pile_nozzle_power(
         if t_lo <= t1 <= t_hi:
             event_times.append((t1, color))
 
-    # Unique brick-change times across all EVs on this pile (shared vlines).
+    # Unique module-change times across all EVs on this pile (shared vlines).
     # Exclude plug-in / departure instants so only *sole* charge changes remain.
     charge_change_times: list[float] = []
     if show_charge_change_vlines:
@@ -239,7 +239,7 @@ def plot_pile_nozzle_power(
         for ev in pile_evs_in_window:
             for t_cc in charge_change_event_times(
                 ev,
-                pile.p_brick,
+                pile.p_module,
                 t_lo=t_lo,
                 t_hi=t_hi,
                 exclude_times=occupancy_times,
@@ -254,11 +254,11 @@ def plot_pile_nozzle_power(
     if figsize is None:
         figsize = (
             viz_style.FIGSIZE_WIDE[0],
-            max(viz_style.FIGSIZE_PANEL_HEIGHT * n_nozzles * 0.75, 4.0),
+            max(viz_style.FIGSIZE_PANEL_HEIGHT * n_dispensers * 0.75, 4.0),
         )
 
     fig, axes = plt.subplots(
-        n_nozzles,
+        n_dispensers,
         1,
         sharex=True,
         figsize=figsize,
@@ -268,17 +268,17 @@ def plot_pile_nozzle_power(
 
     any_curve = False
     any_charge_steps = False
-    p_brick = pile.p_brick
+    p_module = pile.p_module
 
-    for nozzle in range(n_nozzles):
-        ax = axes[nozzle]
+    for dispenser in range(n_dispensers):
+        ax = axes[dispenser]
         evs = sorted(
-            by_nozzle.get(nozzle, []),
+            by_dispenser.get(dispenser, []),
             key=lambda e: (e.service_start_time or 0.0, e.id),
         )
 
         if not evs:
-            ax.set_ylabel(f"Nozzle {nozzle}\nP (kW)")
+            ax.set_ylabel(f"Dispenser {dispenser}\nP (kW)")
             ax.text(
                 0.5,
                 0.5,
@@ -289,7 +289,7 @@ def plot_pile_nozzle_power(
                 **viz_style.annotation_kwargs(color=viz_style.COLORS["muted"]),
             )
             ax.set_xlim(t_lo, t_hi)
-            yticks = _brick_power_ticks(p_brick, pile.power_supp)
+            yticks = _module_power_ticks(p_module, pile.power_supp)
             ax.set_ylim(0.0, float(yticks[-1]) if yticks.size else pile.power_supp)
             ax.set_yticks(yticks)
             viz_style.style_axes(ax, title=None)
@@ -318,7 +318,7 @@ def plot_pile_nozzle_power(
                 t_act, _s, p_req, p_act = densify_charge_trace(ev, dt=densify_dt)
 
             if show_charge_change_lines:
-                plateaus = trace_power_plateaus(ev, p_brick, t_end=t1)
+                plateaus = trace_power_plateaus(ev, p_module, t_end=t1)
                 for t_seg_lo, t_seg_hi, p_seg, _sample in plateaus:
                     seg_lo = max(t_seg_lo, t_lo)
                     seg_hi = min(t_seg_hi, t_hi)
@@ -336,7 +336,7 @@ def plot_pile_nozzle_power(
                     )
 
             if show_trace_labels:
-                for sample in parsed_trace_samples(ev, p_brick):
+                for sample in parsed_trace_samples(ev, p_module):
                     if sample.t < t_lo or sample.t > t_hi:
                         continue
                     ax.scatter(
@@ -430,11 +430,11 @@ def plot_pile_nozzle_power(
                         ),
                     )
 
-        ax.set_ylabel(f"Nozzle {nozzle}\nP (kW)")
+        ax.set_ylabel(f"Dispenser {dispenser}\nP (kW)")
         ax.set_xlim(t_lo, t_hi)
-        # Power ticks / grid at multiples of one brick (kW).
+        # Power ticks / grid at multiples of one module (kW).
         y_top = max(pile.power_supp, ax.get_ylim()[1])
-        yticks = _brick_power_ticks(p_brick, y_top)
+        yticks = _module_power_ticks(p_module, y_top)
         ax.set_ylim(0.0, float(yticks[-1]) if yticks.size else pile.power_supp)
         ax.set_yticks(yticks)
         viz_style.style_axes(ax, title=None)
@@ -589,9 +589,9 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--t-end", type=float, default=None, help="Zoom end (min)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--n-piles", type=int, default=4)
-    parser.add_argument("--n-nozzles", type=int, default=2)
-    parser.add_argument("--n-bricks", type=int, default=5)
-    parser.add_argument("--p-brick", type=float, default=25.0)
+    parser.add_argument("--n-dispensers", type=int, default=2)
+    parser.add_argument("--n-modules", type=int, default=5)
+    parser.add_argument("--p-module", type=float, default=25.0)
     parser.add_argument(
         "--mean-interarrival",
         type=float,
@@ -637,12 +637,12 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--show-charge-vlines",
         action="store_true",
-        help="Draw shared vertical markers at brick-allotment change times",
+        help="Draw shared vertical markers at module-allotment change times",
     )
     parser.add_argument(
         "--show-trace-labels",
         action="store_true",
-        help="Label each charge_trace sample with P, t, s, n_bricks",
+        help="Label each charge_trace sample with P, t, s, n_modules",
     )
     parser.add_argument(
         "--event-line-alpha",
@@ -655,9 +655,9 @@ def main(argv: list[str] | None = None) -> None:
     print(f"Running FIFO episode (seed={args.seed}) then plotting pile {args.pile}...")
     env = run_fifo_episode(
         n_piles=args.n_piles,
-        n_nozzles=args.n_nozzles,
-        n_bricks=args.n_bricks,
-        p_brick=args.p_brick,
+        n_dispensers=args.n_dispensers,
+        n_modules=args.n_modules,
+        p_module=args.p_module,
         mean_interarrival=args.mean_interarrival,
         seed=args.seed,
     )
@@ -666,7 +666,7 @@ def main(argv: list[str] | None = None) -> None:
         f"finished={len(env.engine.metrics.finished_evs)}"
     )
 
-    fig = plot_pile_nozzle_power(
+    fig = plot_pile_dispenser_power(
         env,
         pile_id=args.pile,
         t_start=args.t_start,
