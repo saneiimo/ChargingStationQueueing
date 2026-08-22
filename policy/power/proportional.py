@@ -71,9 +71,11 @@ class ProportionalPower(PowerPolicy):
             self._micro_distribute(pile)  # fills up to num_modules
         else:
             # Not overloaded: each EV can take its isolated ceil(p_req / p_module).
+            # Epsilon guards against floating-point noise pushing a p_req that's
+            # essentially a module multiple into the next ceil bucket.
             for connected in pile.evs:
                 pile.ev_modules[connected.dispenser_id] = ceil(
-                    connected.p_req / pile.p_module
+                    connected.p_req / pile.p_module - 1e-9
                 )
 
     def _micro_distribute(self, pile: ChargingPile, ev: EV | None = None) -> None:

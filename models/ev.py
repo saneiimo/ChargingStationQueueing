@@ -44,8 +44,12 @@ class EV:
     service_start_time: float | None = None
     pile: ChargingPile | None = None  # Set while plugged in; cleared on disconnect
     pile_tracker: ChargingPile | None = None  # Last pile used (kept after departure)
-    dispenser_id: int | None = None  # Fixed slot index on the pile (cleared on disconnect)
-    dispenser_id_tracker: int | None = None  # Same slot, kept after departure (for plots)
+    dispenser_id: int | None = (
+        None  # Fixed slot index on the pile (cleared on disconnect)
+    )
+    dispenser_id_tracker: int | None = (
+        None  # Same slot, kept after departure (for plots)
+    )
     energy_received: float = 0  # Integrated from deltaE_power
     energy_received_2: float = 0  # Integrated from SoC deltas (sanity check)
     departure_time: float = float("inf")
@@ -203,11 +207,29 @@ class EV:
                 p_next = p_thresh_2
 
             local_next_s = 1 - p_next / self.tan_B
+
             if local_next_s < self.s_f and not np.isclose(
                 local_next_s, self.s_f, rtol=1e-6, atol=1e-9
             ):
                 return (local_next_s, EventType.CHARGE_CHANGE)
             return (self.s_f, EventType.DEPARTURE)
+
+            # If the target coincides with s_current, the last redistribution
+            # handed the freed module straight back to this EV (still the
+            # largest remaining request) and nothing actually changed.
+            # Scheduling another CHARGE_CHANGE here would refire at the same
+            # instant forever, so fall back to watching for DEPARTURE instead.
+            # no_progress = local_next_s <= self.s_current or np.isclose(
+            #     local_next_s, self.s_current, rtol=1e-6, atol=1e-9
+            # )
+
+            # if (
+            #     not no_progress
+            #     and local_next_s < self.s_f
+            #     and not np.isclose(local_next_s, self.s_f, rtol=1e-6, atol=1e-9)
+            # ):
+            #   return (local_next_s, EventType.CHARGE_CHANGE)
+            # return (self.s_f, EventType.DEPARTURE)
         return (self.s_f, EventType.DEPARTURE)
 
     @property

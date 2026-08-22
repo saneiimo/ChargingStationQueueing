@@ -147,7 +147,13 @@ class ChargingPile:
         """True if giving every EV its isolated ceil(p_req/p_module) needs more modules than we have."""
         if not self.evs:
             return False
-        return sum(ceil(ev.p_req / self.p_module) for ev in self.evs) > self.num_modules
+        # Small epsilon so floating-point noise from repeated SoC projections
+        # can't push a p_req that's essentially a module multiple into the
+        # next ceil bucket and falsely flag an extra module of overload.
+        return (
+            sum(ceil(ev.p_req / self.p_module - 1e-9) for ev in self.evs)
+            > self.num_modules
+        )
 
     @property
     def power_reqs(self) -> List[float]:
@@ -186,7 +192,9 @@ class ChargingPile:
                     raise AssertionError(f"empty dispenser {i} has modules")
                 continue
             if ev.dispenser_id != i:
-                raise AssertionError(f"EV {ev.id} dispenser_id {ev.dispenser_id} != slot {i}")
+                raise AssertionError(
+                    f"EV {ev.id} dispenser_id {ev.dispenser_id} != slot {i}"
+                )
             if ev.pile is not self:
                 raise AssertionError(f"EV {ev.id} pile link broken")
             if i in seen:
