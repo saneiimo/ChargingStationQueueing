@@ -25,8 +25,8 @@ class OfflineSolution:
     """Solved-instance summary: aggregate cost plus a per-vehicle timeline."""
 
     status: str
-    objective: float  # sum_{j,k} sigma[j,k] (vehicle-slots already finished)
-    total_sojourn: float  # sum_j (c_j - a_j), minutes
+    objective: float  # primary ObjVal = total sojourn sum_j (c_j - a_j), minutes
+    total_sojourn: float  # sum_j (c_j - a_j), minutes (from sigma; matches objective)
     mean_sojourn: float  # total_sojourn / n_vehicles, minutes
     mip_gap: float  # primary objective's gap; see extract_solution docstring re: tie_break
     runtime: float
@@ -44,10 +44,11 @@ def extract_solution(offline_model: OfflineModel) -> OfflineSolution:
     ``service_start = delta * k_service`` directly (no -1 needed). Departure
     follows eq. (1), ``c_j = delta * sum_k (1 - sigma[j,k])`` over the full
     0..K-1 range: the k < k_j portion (sigma implicitly 0, never modeled as a
-    variable) contributes ``delta * k_j`` on its own. ``total_sojourn`` is
-    always derived this way, directly off ``alpha``/``sigma`` values -- never
-    off ``model.ObjVal`` -- so it is unaffected by whether ``tie_break`` added
-    a second objective.
+    variable) contributes ``delta * k_j`` on its own. Vehicles that never
+    finish (sigma stays 0 through K-1) have ``c_j = delta * K``.
+    ``total_sojourn`` is always derived this way from ``alpha``/``sigma``;
+    with the primary objective minimizing sojourn directly it should match
+    ``model.ObjVal`` (read as ``objective``) up to solver tolerance.
 
     ``objective`` and ``mip_gap`` do need to account for ``tie_break``: with
     two objectives set, plain ``model.ObjVal`` reports the *last*
@@ -55,13 +56,11 @@ def extract_solution(offline_model: OfflineModel) -> OfflineSolution:
     ``offline_model.tie_break`` is set we read it via ``ObjNVal`` at index 0
     instead. ``model.MIPGap`` goes further and is not retrievable at all once
     more than one objective is set (Gurobi raises ``AttributeError``) -- in
-    that case ``mip_gap`` is reported as ``nan``. This isn't a meaningful
-    accuracy loss in practice: by the time the tie-break phase runs, the
-    primary objective is already fixed within ``abstol=1e-6`` of its optimum
-    (see the comment in ``build_offline_model``), and since it's a sum of
-    binary variables (always integer), a gap that small already certifies
-    the exact optimal value. Pass ``verbose=True`` to ``solve_offline_model``
-    if you want to see Gurobi's own per-phase gap reporting in the log.
+    that case ``mip_gap`` is reported as ``nan``. By the time the tie-break
+    phase runs, the primary sojourn is already fixed within ``abstol=1e-6``
+    of its optimum (see the comment in ``build_offline_model``). Pass
+    ``verbose=True`` to ``solve_offline_model`` if you want Gurobi's own
+    per-phase gap reporting in the log.
     """
     m = offline_model.model
     if m.SolCount == 0:
@@ -86,6 +85,11 @@ def extract_solution(offline_model: OfflineModel) -> OfflineSolution:
         alpha_on = [k for k in range(k_j, K) if offline_model.alpha[j, k].X > 0.5]
         service_start = delta * min(alpha_on) if alpha_on else float("nan")
 
+        finished_slots = [
+            k for k in range(k_j, K) if offline_model.sigma[j, k].X > 0.5
+        ]
+        finished = bool(finished_slots)
+
         tail_unfinished = sum(
             1.0 - offline_model.sigma[j, k].X for k in range(k_j, K)
         )
@@ -108,6 +112,7 @@ def extract_solution(offline_model: OfflineModel) -> OfflineSolution:
                 "service_start": service_start,
                 "departure": departure,
                 "sojourn": sojourn,
+                "finished": finished,
                 "energy_kwh": energy_delivered / HR2MIN,
                 "energy_required_kwh": v.W_kwh,
             }
