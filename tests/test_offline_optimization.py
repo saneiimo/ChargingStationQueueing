@@ -6,10 +6,11 @@ Validates the model against:
      (constraints 18/19 are wired correctly).
   2. Closed-form single-vehicle charge time (theory) -- no contention.
   3. The "no contention" case with two vehicles, one pile each.
-  4. Energy conservation (17) survives extraction.
+  4. Energy delivered never exceeds W_j (17); finished vehicles meet W_j.
   5. The central sanity check: the offline optimum must never exceed what a
      causal (FIFO) simulation achieves on the same instance.
-  6. Infeasible horizons raise a clear error.
+  6. A short horizon stays feasible (no finish-by-horizon constraint) with
+     unfinished vehicles contributing sojourn through T.
 
 Run: python -m pytest tests/test_offline_optimization.py -s -v
 """
@@ -87,7 +88,9 @@ def test_single_ev_matches_theory():
     # Up to ~1 slot of unavoidable release slack (mid-slot arrival) plus
     # completion rounding up to a slot boundary.
     assert row["sojourn"] == pytest.approx(t_min, abs=2 * delta + 1e-6)
+    assert row["finished"]
     assert row["energy_kwh"] == pytest.approx(v.W_kwh, rel=1e-6)
+    assert sol.objective == pytest.approx(sol.total_sojourn, abs=1e-4)
 
 
 # ---------------------------------------------------------------------------
@@ -155,17 +158,30 @@ def test_offline_bound_never_exceeds_fifo_simulation():
 
 
 # ---------------------------------------------------------------------------
-# 5. Infeasibility handling
+# 5. Short horizon: feasible but unfinished
 # ---------------------------------------------------------------------------
 
 
-def test_infeasible_horizon_raises_clear_error():
+def test_short_horizon_allows_unfinished_vehicles():
+    """Without (8), a horizon too short to finish is still feasible: the EV
+    stays unfinished (sigma=0) and sojourn runs through the end of T."""
     ev = _make_ev(0, 0.0, 75.0, 0.2, 0.8)
     v = VehicleData.from_ev(ev)
     station = StationSpec(n_piles=1, n_dispensers=1, n_modules=8, p_module=25.0)
-    om = build_offline_model([v], station, 1.0, 5.0, TAU)  # far too short to finish
-    with pytest.raises(RuntimeError, match="infeasible"):
-        solve_offline_model(om)
+    delta = 1.0
+    horizon = 5.0  # far too short to finish
+    om = build_offline_model([v], station, delta, horizon, TAU)
+    solve_offline_model(om, mip_gap=1e-6)
+    sol = extract_solution(om)
+    row = sol.per_vehicle.iloc[0]
+    K = om.K
+    print(
+        f"\nshort horizon: finished={row['finished']}, "
+        f"sojourn={row['sojourn']:.3f}, energy={row['energy_kwh']:.3f} kWh"
+    )
+    assert not row["finished"]
+    assert row["sojourn"] == pytest.approx(delta * K - v.a, abs=1e-6)
+    assert row["energy_kwh"] <= v.W_kwh + 1e-6
 
 
 # ---------------------------------------------------------------------------
@@ -218,9 +234,10 @@ def test_tie_break_front_loads_after_contention_ends():
     no artificial dip below what's physically achievable.
 
     Exception: the vehicle's very last (partial) slot is correctly capped by
-    *remaining energy needed* (eq. 17 forces total delivered == w_1 exactly),
-    which is generally less than a full slot at the physical rate caps --
-    that slot is skipped, it isn't a tie-break artifact to check for.
+    *remaining energy needed* (eq. 17 caps total delivered at w_1, and the
+    objective has no reason to overshoot), which is generally less than a
+    full slot at the physical rate caps -- that slot is skipped, it isn't a
+    tie-break artifact to check for.
     """
     vehicles, station, horizon = _tie_break_scenario()
     pile_cap = station.n_modules * station.p_module
@@ -286,10 +303,11 @@ def test_ip_bounds_sandwich_the_true_optimum():
     assert ip_sol.total_sojourn <= upper.total_sojourn + 1e-6
 
 
-def test_ip_bounds_infeasible_horizon_raises():
-    ev = _make_ev(0, 0.0, 75.0, 0.2, 0.8)
+def test_ip_bounds_release_outside_horizon_raises():
+    """Arrival after T still fails at build time (release slot out of range)."""
+    ev = _make_ev(0, 10.0, 75.0, 0.2, 0.8)
     station = StationSpec(n_piles=1, n_dispensers=1, n_modules=8, p_module=25.0)
-    with pytest.raises(RuntimeError, match="infeasible"):
+    with pytest.raises(ValueError, match="outside the horizon"):
         compute_ip_bounds([ev], station, delta=1.0, horizon_minutes=5.0)
 
 
@@ -299,9 +317,9 @@ if __name__ == "__main__":
     test_single_ev_matches_theory()
     test_two_piles_no_contention_matches_independent_theory()
     test_offline_bound_never_exceeds_fifo_simulation()
-    test_infeasible_horizon_raises_clear_error()
+    test_short_horizon_allows_unfinished_vehicles()
     test_tie_break_preserves_optimal_objective()
     test_tie_break_front_loads_after_contention_ends()
     test_ip_bounds_sandwich_the_true_optimum()
-    test_ip_bounds_infeasible_horizon_raises()
+    test_ip_bounds_release_outside_horizon_raises()
     print("\nAll tests in test_offline_optimization.py finished.")
