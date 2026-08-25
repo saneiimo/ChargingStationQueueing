@@ -17,11 +17,9 @@ relaxation removed it.
 
 Used to sandwich the true integer-program optimum IP(N*Delta) between two
 cheap, tractable bounds (see ``bound.compute_ip_bounds`` / README.md,
-"Continuous relaxation bounds"):
+"Continuous relaxation bounds"), all in *total sojourn* (minimize):
 
-    RP(N*Delta) <= IP(N*Delta) <= RP((N-C+1)*Delta)      [in objective terms;
-                                                            total_sojourn is
-                                                            the other way]
+    RP(N*Delta) <= IP(N*Delta) <= RP((N-C+1)*Delta)
 
 RP(N*Delta) -- the relaxation at full pile capacity -- is a pure relaxation
 of IP (drops integrality of the module count and of z), so its optimum can
@@ -82,7 +80,8 @@ def build_relaxed_model(
 ) -> OfflineRelaxedModel:
     """
     Build (but do not solve) the continuous relaxation RP(pile_capacity_kw):
-    objective (3), constraints (4)-(12), (16)-(19), (26)-(29).
+    minimize total sojourn (3), constraints (4)-(7), (9)-(12), (16)-(19),
+    (26)-(29). Constraint (8) is omitted, matching ``build_offline_model``.
 
     Parameters
     ----------
@@ -169,7 +168,7 @@ def build_relaxed_model(
     # --- (9): vehicle j is charged at exactly one pile -------------------------
     m.addConstrs((y.sum(j, "*") == 1 for j in by_id), name="C9_one_pile")
 
-    # --- (4)-(8): timeline logic -------------------------------------------------
+    # --- (4)-(7): timeline logic (no (8): finish-by-horizon is not enforced) ----
     for v in vehicles:
         j, k0 = v.id, releases[v.id]
         for k in range(k0, K - 1):
@@ -180,10 +179,8 @@ def build_relaxed_model(
         for k in range(k0, K):
             # (6): a vehicle cannot finish before it has started.
             m.addConstr(sigma[j, k] <= alpha[j, k], name=f"C6_sigma_le_alpha[{j},{k}]")
-        # (8): every vehicle is finished by the last slot of the horizon.
         # (7) [alpha_jk = 0 for k < k_j] is enforced implicitly: those
-        # variables are simply never created.
-        m.addConstr(sigma[j, K - 1] == 1, name=f"C8_finish_by_horizon[{j}]")
+        # variables are simply never created. (8) is omitted on purpose.
 
     # --- (10)-(12): dispenser occupancy and capacity --------------------------------
     for v in vehicles:
@@ -247,23 +244,44 @@ def build_relaxed_model(
             m.addConstr(p[j, k] * tau <= v.R0 - x[j, k], name=f"C19_taper_cap[{j},{k}]")
             running = running + delta * p[j, k]
         x[j, K] = running  # total energy delivered over the whole horizon
-        # (17): each vehicle receives exactly the energy it came for.
-        m.addConstr(x[j, K] == v.W, name=f"C17_energy_requirement[{j}]")
+        # (17): delivered energy cannot exceed the requirement W_j (vehicles
+        # may leave unfinished with a partial charge; C16 still requires a
+        # full W_j before sigma may flip to 1).
+        m.addConstr(x[j, K] <= v.W, name=f"C17_energy_cap[{j}]")
 
-    # --- (3): objective, identical to build_offline_model -----------------------
-    primary_obj = gp.quicksum(sigma[j, k] for j, k in jk_pairs)
+    # --- (3): objective -- minimize total sojourn, same as build_offline_model --
+    primary_obj = gp.LinExpr(0.0)
+    for v in vehicles:
+        j, k0 = v.id, releases[v.id]
+        unfinished = gp.quicksum(1.0 - sigma[j, k] for k in range(k0, K))
+        primary_obj += delta * (k0 + unfinished) - v.a
 
     if tie_break:
         # Same tie-break as build_offline_model -- see its comment there and
-        # README.md, "Tie breaking". Even more freely tied here than in the
-        # integer model, since q offers continuum-many ways to split a pile's
-        # capacity among vehicles for the same p_jk trajectory.
+        # README.md, "Tie breaking". Negated under ModelSense=MINIMIZE so the
+        # secondary still *maximizes* cumulative energy among sojourn-optimal
+        # schedules. Even more freely tied here than in the integer model,
+        # since q offers continuum-many ways to split a pile's capacity.
         tie_break_obj = gp.quicksum(x[j, k] for j, k in jk_pairs)
-        m.ModelSense = GRB.MAXIMIZE
-        m.setObjectiveN(primary_obj, index=0, priority=1, weight=1.0, abstol=1e-6, reltol=0.0, name="total_sojourn")
-        m.setObjectiveN(tie_break_obj, index=1, priority=0, weight=1.0, name="front_load_tiebreak")
+        m.ModelSense = GRB.MINIMIZE
+        m.setObjectiveN(
+            primary_obj,
+            index=0,
+            priority=1,
+            weight=1.0,
+            abstol=1e-6,
+            reltol=0.0,
+            name="total_sojourn",
+        )
+        m.setObjectiveN(
+            -tie_break_obj,
+            index=1,
+            priority=0,
+            weight=1.0,
+            name="front_load_tiebreak",
+        )
     else:
-        m.setObjective(primary_obj, GRB.MAXIMIZE)
+        m.setObjective(primary_obj, GRB.MINIMIZE)
 
     m.update()
 
