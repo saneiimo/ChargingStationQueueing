@@ -47,12 +47,12 @@ at a slot boundary.
 
 | Eq. | Code (`model.py`) | Meaning |
 |---|---|---|
-| (3) | objective | maximize `sum sigma[j,k]` |
+| (3) | objective | minimize `sum_j (c_j - a_j)` (total sojourn) |
 | (4) | `C4_alpha_mono` | once plugged in, stays plugged in |
 | (5) | `C5_sigma_mono` | once finished, stays finished |
 | (6) | `C6_sigma_le_alpha` | can't finish before starting |
 | (7) | *(implicit)* | `alpha[j,k]` for `k < k_j` is never created — provably 0 |
-| (8) | `C8_finish_by_horizon` | every vehicle finished by the last slot |
+| (8) | *(omitted)* | finish-by-horizon is **not** enforced; unfinished vehicles are allowed |
 | (9) | `C9_one_pile` | each vehicle uses exactly one pile |
 | (10) | `C10_occupancy` | occupies exactly one dispenser while plugged-in-and-unfinished |
 | (11) | `C11_pile_link` | that dispenser is on the vehicle's assigned pile |
@@ -60,16 +60,18 @@ at a slot boundary.
 | (13) | `C13_module_pool` | `N` power modules per pile |
 | (14) | `C14_module_link` | modules only held on the pile the vehicle occupies |
 | (15) | `C15_power_from_modules` | power comes from the modules actually held |
-| (16) | `C16_completion` | can only be marked finished once fully charged |
-| (17) | `C17_energy_requirement` | each vehicle receives exactly the energy it came for |
+| (16) | `C16_completion` | can only be marked finished once fully charged (`x >= W·sigma`) |
+| (17) | `C17_energy_cap` | delivered energy at most `W_j` (`x[j,K] <= W_j`) |
 | (18) | `C18_flat_cap` | flat part of the BMS curve, `p <= P_max` |
 | (19) | `C19_taper_cap` | taper part of the BMS curve, `p <= (R0 - x) / tau` |
 | (20) | `C20_no_idle_modules` | at most one held module may go unused (not in the write-up — see "Module efficiency") |
 
 Only variables for `k >= k_j` (a vehicle's release slot) are created —
-everything earlier is forced to zero by (7)/(8)/(18) anyway, so skipping them
+everything earlier is forced to zero by (7)/(18) anyway, so skipping them
 keeps instances with staggered arrivals far smaller than a dense `0..K-1`
-grid would be.
+grid would be. Without (8), a short horizon no longer makes the model
+infeasible: vehicles that cannot finish by `T` simply stay unfinished
+(`sigma` stays 0) and contribute sojourn through the end of the horizon.
 
 ## `z` is continuous, not binary
 
@@ -97,38 +99,39 @@ extra slot the way `floor(a_j/delta) + 1` would.
 
 ## Tie breaking
 
-`sum sigma[j,k]` (the real objective) only rewards *when* a vehicle
-finishes, never how its power is distributed within its own charging window.
-So whenever a vehicle has slack — e.g. it's alone on a pile with the taper
-already binding well below the pile's module cap — many different power
-profiles tie the true optimum exactly, and Gurobi is free to return any of
-them. In practice this can look like a vehicle briefly drawing less than it
-could, then making it up later: not a bug, just one of several equally-valid
-optimal schedules, and `total_sojourn` is identical across all of them.
+The primary objective (minimize total sojourn) only cares *when* a vehicle
+finishes (and who finishes), never how its power is distributed within its
+own charging window. So whenever a vehicle has slack — e.g. it's alone on a
+pile with the taper already binding well below the pile's module cap — many
+different power profiles tie the true optimum exactly, and Gurobi is free to
+return any of them. In practice this can look like a vehicle briefly drawing
+less than it could, then making it up later: not a bug, just one of several
+equally-valid optimal schedules, and `total_sojourn` is identical across all
+of them.
 
 `build_offline_model(..., tie_break=True)` (or `compute_offline_bound(...,
 tie_break=True)`) adds a second, lower-priority objective — maximize
 `sum(x[j,k])`, the cumulative energy delivered before each slot, already
 built for constraints (16)/(19) — which prefers front-loaded profiles among
 the tied solutions, so the plotted power trace looks "maxed out whenever
-physically possible" instead of arbitrary.
+physically possible" instead of arbitrary. Under Gurobi's minimize model
+sense this secondary is entered as `-sum(x)` so that minimizing it is
+equivalent to maximizing cumulative energy.
 
 The guarantee that this can't change the real answer comes from *how* it's
 implemented, not from picking a small-enough weight: it uses Gurobi's native
 hierarchical multi-objective mode (`Model.setObjectiveN` with `priority=1`
-on the real objective, `priority=0` on the tie-break). Gurobi solves the
+on the sojourn objective, `priority=0` on the tie-break). Gurobi solves the
 priority-1 objective to its true optimum first, then re-optimizes
-priority-0 *holding that value fixed* (within `abstol=1e-6`). Since
-`sum(sigma)` is a sum of binaries — always an integer — any two distinct
-achievable values differ by at least 1, far above that tolerance, so the
-tie-break provably cannot alter which solutions count as optimal.
+priority-0 *holding that value fixed* (within `abstol=1e-6`). Distinct
+finish-slot patterns change sojourn by multiples of `delta`, far above that
+tolerance for typical slot lengths, so the tie-break provably cannot alter
+which schedules count as optimal.
 
 Costs roughly 2x solve time (two hierarchical phases); off by default.
 Also, `Model.MIPGap` isn't retrievable at all once a second objective is
 set (Gurobi raises `AttributeError`), so `OfflineSolution.mip_gap` reports
-`nan` when `tie_break=True` — see `extract_solution`'s docstring for why
-this isn't a meaningful accuracy loss given the integer-objective argument
-above.
+`nan` when `tie_break=True` — see `extract_solution`'s docstring.
 
 ## Module efficiency
 
@@ -183,14 +186,8 @@ assignment, dispenser capacity, the BMS curve — is untouched. Call this
 `RP` is cheaper to solve than the true integer program `IP`, but its
 optimum, `RP(N*Delta)`, is not itself a valid stand-in for `IP(N*Delta)` —
 it's only a relaxation, so it can (and generally will) do strictly better.
-What *is* provably true is a two-sided bracket:
-
-```
-RP(N*Delta) <= IP(N*Delta) <= RP((N-C+1)*Delta)
-```
-
-in objective terms (`sum sigma`); since higher objective means lower
-sojourn, that reads the other way for `total_sojourn`:
+What *is* provably true is a two-sided bracket on total sojourn (both models
+minimize `sum_j (c_j - a_j)`):
 
 ```
 RP(N*Delta).total_sojourn <= IP(N*Delta).total_sojourn <= RP((N-C+1)*Delta).total_sojourn
@@ -247,13 +244,15 @@ module reuses that convention (`VehicleData.Q`, `.W`, `.R0`) so `delta`
   hour or two at `delta=0.5-1` min this solves in seconds; a full simulated
   day with many vehicles will be much slower — use a coarser `delta`, or a
   `time_limit` / looser `mip_gap` to trade exactness for speed.
-- If `solve_offline_model` raises "infeasible", the usual cause is
-  `horizon_minutes` too short for every vehicle to finish given dispenser/module
-  capacity — `default_horizon_minutes` gives a generous starting guess, but
-  is not a feasibility proof.
+- A short `horizon_minutes` no longer makes the model infeasible (constraint
+  (8) is omitted): unfinished vehicles stay unfinished and contribute sojourn
+  through `T`. Use `default_horizon_minutes` when you want a horizon long
+  enough that the optimum can finish everyone. Build-time errors still occur
+  if a vehicle's release slot falls *outside* the horizon (arrival after `T`).
 - `OfflineSolution.status` is `"OPTIMAL"` only when the solver actually
   closed the gap; check `mip_gap` when you pass a `time_limit` (`nan` when
-  `tie_break=True` — see "Tie breaking" above).
+  `tie_break=True` — see "Tie breaking" above). `objective` is the primary
+  Gurobi value (total sojourn in minutes) and should match `total_sojourn`.
 
 See `tests/test_offline_optimization.py` for worked examples, including the
 central check that the offline optimum never exceeds a FIFO simulation's
