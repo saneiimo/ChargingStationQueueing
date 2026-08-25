@@ -14,14 +14,20 @@ earlier slot is fixed at alpha = sigma = 0 by construction rather than by an
 explicit constraint, which keeps instances with staggered arrivals far
 smaller than a dense k = 0..K-1 grid would be.
 
-Optional tie-break (``tie_break=True``): the objective only rewards *when*
-each vehicle finishes, never how its power is distributed within its own
-charging window, so many power profiles can tie the true optimum exactly.
-A lower-priority secondary objective (see the comment above ``setObjectiveN``
-in ``build_offline_model``) prefers front-loaded profiles among those ties,
-using Gurobi's native hierarchical multi-objective mode -- which is what
-actually guarantees the primary optimum (and hence total_sojourn) cannot
-change, not a hand-tuned weighting. See README.md, "Tie breaking".
+The primary objective minimizes total sojourn ``sum_j (c_j - a_j)`` directly
+(eq. 1). Vehicles are *not* forced to finish by the horizon (no constraint
+(8)); unfinished vehicles contribute a sojourn through to slot ``K``, and
+delivered energy is capped by ``W_j`` rather than forced to equal it (17).
+
+Optional tie-break (``tie_break=True``): the primary objective only cares
+*when* each vehicle finishes (and who finishes), never how its power is
+distributed within its own charging window, so many power profiles can tie
+the true optimum exactly. A lower-priority secondary objective (see the
+comment above ``setObjectiveN`` in ``build_offline_model``) prefers
+front-loaded profiles among those ties, using Gurobi's native hierarchical
+multi-objective mode -- which is what actually guarantees the primary
+optimum (and hence total_sojourn) cannot change, not a hand-tuned weighting.
+See README.md, "Tie breaking".
 """
 
 from __future__ import annotations
@@ -82,9 +88,10 @@ def build_offline_model(
     model_name: str = "offline_lower_bound",
 ) -> OfflineModel:
     """
-    Build (but do not solve) the offline MILP: objective (3) and
-    constraints (4)-(19), plus (20) (module efficiency, not in the original
-    write-up -- see README.md, "Module efficiency").
+    Build (but do not solve) the offline MILP: minimize total sojourn (3)
+    subject to constraints (4)-(7), (9)-(20) (module efficiency (20) is not
+    in the original write-up -- see README.md, "Module efficiency").
+    Constraint (8) (finish-by-horizon) is intentionally omitted.
 
     Parameters
     ----------
@@ -95,9 +102,11 @@ def build_offline_model(
     delta :
         Slot length in minutes.
     horizon_minutes :
-        T, the horizon length; K = ceil(T / delta) slots. Every vehicle must
-        reach s_f within this horizon or the model is infeasible -- see
-        ``bound.default_horizon_minutes`` for a safe starting guess.
+        T, the horizon length; K = ceil(T / delta) slots. Vehicles that cannot
+        finish by T remain unfinished (sigma stays 0) and still contribute to
+        sojourn through the end of the horizon. See
+        ``bound.default_horizon_minutes`` for a generous starting guess when
+        you want everyone to be finishable.
     tau :
         Shared taper time constant (minutes); see ``instance.taper_time_constant``.
     tie_break :
@@ -177,7 +186,7 @@ def build_offline_model(
     # --- (9): vehicle j is charged at exactly one pile -------------------------
     m.addConstrs((y.sum(j, "*") == 1 for j in by_id), name="C9_one_pile")
 
-    # --- (4)-(8): timeline logic -------------------------------------------------
+    # --- (4)-(7): timeline logic (no (8): finish-by-horizon is not enforced) ----
     for v in vehicles:
         j, k0 = v.id, releases[v.id]
         for k in range(k0, K - 1):
@@ -188,10 +197,8 @@ def build_offline_model(
         for k in range(k0, K):
             # (6): a vehicle cannot finish before it has started.
             m.addConstr(sigma[j, k] <= alpha[j, k], name=f"C6_sigma_le_alpha[{j},{k}]")
-        # (8): every vehicle is finished by the last slot of the horizon.
         # (7) [alpha_jk = 0 for k < k_j] is enforced implicitly: those
-        # variables are simply never created.
-        m.addConstr(sigma[j, K - 1] == 1, name=f"C8_finish_by_horizon[{j}]")
+        # variables are simply never created. (8) is omitted on purpose.
 
     # --- (10)-(12): dispenser occupancy and capacity --------------------------------
     for v in vehicles:
@@ -271,42 +278,58 @@ def build_offline_model(
             m.addConstr(p[j, k] * tau <= v.R0 - x[j, k], name=f"C19_taper_cap[{j},{k}]")
             running = running + delta * p[j, k]
         x[j, K] = running  # total energy delivered over the whole horizon
-        # (17): each vehicle receives exactly the energy it came for.
-        m.addConstr(x[j, K] == v.W, name=f"C17_energy_requirement[{j}]")
+        # (17): delivered energy cannot exceed the requirement W_j (vehicles
+        # may leave unfinished with a partial charge; C16 still requires a
+        # full W_j before sigma may flip to 1).
+        m.addConstr(x[j, K] <= v.W, name=f"C17_energy_cap[{j}]")
 
-    # --- (3): objective --------------------------------------------------------
-    # Minimizing total sojourn sum(c_j - a_j) is equivalent to *maximizing*
-    # sum(sigma_jk): from c_j = delta * sum_k(1 - sigma_jk) (eq. 1), summing
-    # over j gives sum(c_j) = const - delta * sum(sigma), so minimizing
-    # sum(c_j) means maximizing sum(sigma) (every slot already finished
-    # "scores a point", pushing completions as early as possible).
-    primary_obj = gp.quicksum(sigma[j, k] for j, k in jk_pairs)
+    # --- (3): objective -- minimize total sojourn sum_j (c_j - a_j) -------------
+    # From eq. (1): c_j = delta * (k_j + sum_{k>=k_j} (1 - sigma[j,k])), with
+    # the k < k_j unfinished slots contributing delta * k_j.
+    primary_obj = gp.LinExpr(0.0)
+    for v in vehicles:
+        j, k0 = v.id, releases[v.id]
+        unfinished = gp.quicksum(1.0 - sigma[j, k] for k in range(k0, K))
+        primary_obj += delta * (k0 + unfinished) - v.a
 
     if tie_break:
         # Optional secondary objective, purely to break ties among solutions
-        # that already achieve the true optimum above. sum(sigma) only cares
+        # that already achieve the true sojourn optimum. The primary only cares
         # *when* each vehicle finishes, never how its power is distributed
-        # within its own charging window, so many power profiles can tie the
-        # primary objective exactly (see README.md, "Tie breaking"). Maximizing
-        # sum(x[j,k]) -- cumulative energy delivered before each slot, already
-        # built above for C16/C19, reused here rather than adding new terms --
-        # rewards front-loading a vehicle's (fixed) total energy as early as
-        # possible, for a fixed completion slot.
+        # within its own charging window, so many power profiles can tie
+        # exactly (see README.md, "Tie breaking"). Maximizing sum(x[j,k]) --
+        # cumulative energy delivered before each slot, already built above
+        # for C16/C19 -- rewards front-loading for a fixed completion schedule.
+        # Negated because ModelSense is MINIMIZE (primary); -sum(x) under
+        # minimize is equivalent to maximizing sum(x).
         #
         # Priority 1 > 0 makes this strictly hierarchical (lexicographic):
         # Gurobi first solves the priority-1 objective to its true optimum,
         # then re-optimizes the priority-0 objective *holding that value
-        # fixed* (within abstol/reltol below). sum(sigma) is a sum of binary
-        # variables, so it is always integer -- any two distinct achievable
-        # values differ by at least 1, far above the 1e-6 tolerance, so the
-        # tie-break can never change which solutions count as optimal, and
-        # therefore never changes the reported total_sojourn.
+        # fixed* (within abstol/reltol below). Sojourn values from (1) differ
+        # by multiples of delta across distinct finish-slot patterns, far
+        # above the 1e-6 tolerance for typical delta, so the tie-break cannot
+        # change which schedules count as optimal.
         tie_break_obj = gp.quicksum(x[j, k] for j, k in jk_pairs)
-        m.ModelSense = GRB.MAXIMIZE
-        m.setObjectiveN(primary_obj, index=0, priority=1, weight=1.0, abstol=1e-6, reltol=0.0, name="total_sojourn")
-        m.setObjectiveN(tie_break_obj, index=1, priority=0, weight=1.0, name="front_load_tiebreak")
+        m.ModelSense = GRB.MINIMIZE
+        m.setObjectiveN(
+            primary_obj,
+            index=0,
+            priority=1,
+            weight=1.0,
+            abstol=1e-6,
+            reltol=0.0,
+            name="total_sojourn",
+        )
+        m.setObjectiveN(
+            -tie_break_obj,
+            index=1,
+            priority=0,
+            weight=1.0,
+            name="front_load_tiebreak",
+        )
     else:
-        m.setObjective(primary_obj, GRB.MAXIMIZE)
+        m.setObjective(primary_obj, GRB.MINIMIZE)
 
     m.update()
 
@@ -356,10 +379,10 @@ def solve_offline_model(
 
     if m.Status == GRB.INFEASIBLE:
         raise RuntimeError(
-            "Offline MILP is infeasible. Common causes: horizon_minutes too "
-            "short for every vehicle to receive its required energy given "
-            "dispenser/module capacity, or a vehicle's release slot falling "
-            "outside the horizon. Try a larger horizon_minutes."
+            "Offline MILP is infeasible. A common cause is a vehicle's release "
+            "slot falling outside the horizon (arrival after T). Try a larger "
+            "horizon_minutes. Note: a short horizon alone no longer forces "
+            "infeasibility -- unfinished vehicles are allowed."
         )
     if m.Status in (GRB.INF_OR_UNBD, GRB.UNBOUNDED):
         raise RuntimeError(
