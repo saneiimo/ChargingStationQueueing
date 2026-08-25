@@ -17,7 +17,12 @@ Read the code in this order the first time through:
 7. `metrics/` — L, Q, energy, utilization collected while the engine runs.
 8. `env/charging_env.py` — Gym API: agent only acts at assignment decision points.
 9. `main.py` — short script that rolls out the FIFO baseline.
-10. `offline_opt/` — offline (clairvoyant) lower-bound MILP for total sojourn
+10. Notebooks at the repo root (run with the project root as the working
+    directory / kernel cwd so package imports resolve):
+    - `simulate_episode.ipynb` — one DES episode + validation / power plots
+    - `compare_policies.ipynb` — Monte Carlo replications across queue/power policies
+    - `offline_opt.ipynb` — clairvoyant MILP / relaxation bounds on a toy instance
+11. `offline_opt/` — offline (clairvoyant) lower-bound MILP for total sojourn
     time, solved with gurobipy. Given full knowledge of arrivals up front, its
     optimum lower-bounds every causal queue/power policy's cost on the same
     instance — the benchmark to compare FIFO / heuristics / RL against. See
