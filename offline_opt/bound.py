@@ -37,15 +37,16 @@ def default_horizon_minutes(
     min_buffer: float = 30.0,
 ) -> float:
     """
-    A generous, safe-starting-point horizon: last arrival, plus the slowest
-    vehicle's own solo charge time, plus a congestion allowance scaled by
-    total work over total servers, plus a flat buffer.
+    A generous horizon when you want the optimum to be able to finish every
+    vehicle: last arrival, plus the slowest vehicle's own solo charge time,
+    plus a congestion allowance scaled by total work over total servers, plus
+    a flat buffer.
 
-    Heuristic for seeding ``compute_offline_bound``, not a proof of
-    feasibility -- if the solver still reports INFEASIBLE, pass a larger
-    ``horizon_minutes`` explicitly. Per-vehicle solo time accounts for the
-    station's module cap as well as the BMS taper, since a pile can bind below
-    a vehicle's own peak acceptance.
+    Heuristic for seeding ``compute_offline_bound``. A shorter horizon is
+    still feasible (unfinished vehicles are allowed), but sojourns then run
+    through the end of T for anyone who cannot finish. Per-vehicle solo time
+    accounts for the station's module cap as well as the BMS taper, since a
+    pile can bind below a vehicle's own peak acceptance.
     """
     if not vehicles:
         raise ValueError("Need at least one vehicle")
