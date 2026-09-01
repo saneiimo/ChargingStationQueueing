@@ -1,6 +1,6 @@
 """
 End-to-end checks: energy accrues between events, and the Gym env only stops
-for an assignment when the queue and a free dispenser both exist.
+for an assignment when the queue and a free connector both exist.
 
 Each test prints the steps it takes and the numbers it checks so you can follow
 the logic when running with stdout visible.
@@ -44,14 +44,14 @@ def test_des_projects_energy_between_events():
     power_policy = ProportionalPower()
     station = ChargingStation(
         n_piles=1,
-        n_dispensers=2,
+        n_connectors=2,
         n_modules=5,
         p_module=25.0,
         queue_capacity=5,
         power_policy=power_policy,
         mean_interarrival=100.0,
     )
-    metrics = MetricsTracker(n_piles=1, n_dispensers=2)
+    metrics = MetricsTracker(n_piles=1, n_connectors=2)
     engine = SimulationEngine(station, metrics, EventQueue())
     engine.rng = np.random.default_rng(0)
     engine.current_time = 0.0
@@ -64,7 +64,7 @@ def test_des_projects_energy_between_events():
     print(f"  Queued EV0: c_b={ev.c_b}, s_i={ev.s_i}, s_f={ev.s_f}")
 
     ok = engine.assign_ev(0)
-    print(f"  assign_ev(pile=0) -> {ok}, dispenser_id={ev.dispenser_id}, p_act={ev.p_act:.3f}")
+    print(f"  assign_ev(pile=0) -> {ok}, connector_id={ev.connector_id}, p_act={ev.p_act:.3f}")
     assert ok
     assert ev.pile is not None
     s0 = ev.s_current
@@ -103,13 +103,13 @@ def test_env_decision_point_and_fifo_episode():
     print("\n=== test_env_decision_point_and_fifo_episode ===")
     print(
         "Intent: the Gym env should only ask for a pile choice when the queue is "
-        "nonempty and a dispenser is free, then auto-advance until SIM_OVER."
+        "nonempty and a connector is free, then auto-advance until SIM_OVER."
     )
-    print("Logic: reset Gym env, assign with FIFO whenever a dispenser is free, run to end.")
+    print("Logic: reset Gym env, assign with FIFO whenever a connector is free, run to end.")
 
     env = ChargingStationEnv(
         n_piles=2,
-        n_dispensers=2,
+        n_connectors=2,
         n_modules=4,
         p_module=25.0,
         queue_capacity=8,
@@ -159,17 +159,17 @@ def test_env_decision_point_and_fifo_episode():
 
 
 def test_action_mask_blocks_full_piles():
-    """action_masks() should report False for piles with no free dispensers."""
+    """action_masks() should report False for piles with no free connectors."""
     print("\n=== test_action_mask_blocks_full_piles ===")
     print(
         "Intent: action_masks() must mark full piles False so a masked policy "
         "cannot assign into them."
     )
-    print("Logic: 2 piles x 1 dispenser; assign into free piles and watch the mask.")
+    print("Logic: 2 piles x 1 connector; assign into free piles and watch the mask.")
 
     env = ChargingStationEnv(
         n_piles=2,
-        n_dispensers=1,
+        n_connectors=1,
         n_modules=2,
         p_module=25.0,
         queue_capacity=10,

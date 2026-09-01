@@ -1,5 +1,5 @@
 """
-Checks that ProportionalPower respects module caps and fixed dispenser slots.
+Checks that ProportionalPower respects module caps and fixed connector slots.
 
 These tests build a pile directly (no full DES) so failures point at the
 power policy or pile indexing, not at the event engine.
@@ -53,7 +53,7 @@ def test_non_overloaded_ceil_allocation():
     )
 
     policy = ProportionalPower()
-    pile = ChargingPile(id=0, n_dispensers=2, num_modules=10, p_module=10.0)
+    pile = ChargingPile(id=0, n_connectors=2, num_modules=10, p_module=10.0)
     # With s_th=0.5 and c_rate=1, p_req equals c_b while SoC < s_th.
     ev1 = _make_ev(1, 25)
     ev2 = _make_ev(2, 35)
@@ -75,11 +75,11 @@ def test_non_overloaded_ceil_allocation():
         f"powers={power_by_id}, overloaded={pile.is_overloaded}"
     )
 
-    assert pile.ev_modules[ev1.dispenser_id] == expected_1
-    assert pile.ev_modules[ev2.dispenser_id] == expected_2
+    assert pile.ev_modules[ev1.connector_id] == expected_1
+    assert pile.ev_modules[ev2.connector_id] == expected_2
     assert sum(pile.ev_modules) <= pile.num_modules
-    assert power_by_id[1] == pile.ev_modules[ev1.dispenser_id] * 10
-    assert power_by_id[2] == pile.ev_modules[ev2.dispenser_id] * 10
+    assert power_by_id[1] == pile.ev_modules[ev1.connector_id] * 10
+    assert power_by_id[2] == pile.ev_modules[ev2.connector_id] * 10
     print("  PASS")
 
 
@@ -92,7 +92,7 @@ def test_overloaded_respects_module_cap():
     )
 
     policy = ProportionalPower()
-    pile = ChargingPile(id=0, n_dispensers=2, num_modules=4, p_module=50.0)
+    pile = ChargingPile(id=0, n_connectors=2, num_modules=4, p_module=50.0)
     # Isolated demand: ceil(105/50)+ceil(90/50) = 3+2 = 5 > 4
     ev1 = _make_ev(1, 105, s_th=0.5)
     ev2 = _make_ev(2, 90, s_th=0.5)
@@ -113,54 +113,54 @@ def test_overloaded_respects_module_cap():
     policy.update_power(pile)
     print(
         f"  Result: ev_modules={pile.ev_modules}, sum={sum(pile.ev_modules)}, "
-        f"each >= 1? {all(pile.ev_modules[e.dispenser_id] >= 1 for e in pile.evs)}"
+        f"each >= 1? {all(pile.ev_modules[e.connector_id] >= 1 for e in pile.evs)}"
     )
 
     assert sum(pile.ev_modules) == pile.num_modules
-    assert all(pile.ev_modules[e.dispenser_id] >= 1 for e in pile.evs)
+    assert all(pile.ev_modules[e.connector_id] >= 1 for e in pile.evs)
     print("  PASS")
 
 
-def test_disconnect_middle_dispenser_keeps_slots():
+def test_disconnect_middle_connector_keeps_slots():
     """Removing the EV in slot 0 must not renumber the EV still in slot 1."""
-    print("\n=== test_disconnect_middle_dispenser_keeps_slots ===")
+    print("\n=== test_disconnect_middle_connector_keeps_slots ===")
     print(
-        "Intent: dispenser indices are fixed slots. After unplugging EV1 from slot 0, "
-        "EV2 should stay on dispenser_id=1 and module vector stays aligned."
+        "Intent: connector indices are fixed slots. After unplugging EV1 from slot 0, "
+        "EV2 should stay on connector_id=1 and module vector stays aligned."
     )
 
     policy = ProportionalPower()
-    pile = ChargingPile(id=0, n_dispensers=2, num_modules=5, p_module=25.0)
+    pile = ChargingPile(id=0, n_connectors=2, num_modules=5, p_module=25.0)
     ev1 = _make_ev(1, 50)
     ev2 = _make_ev(2, 50)
     pile.connect_ev(ev1)
     pile.connect_ev(ev2)
     policy.update_power(pile)
     print(
-        f"  Before disconnect: dispensers="
-        f"{[None if e is None else e.id for e in pile.dispensers]}, "
-        f"ev2.dispenser_id={ev2.dispenser_id}, ev_modules={pile.ev_modules}"
+        f"  Before disconnect: connectors="
+        f"{[None if e is None else e.id for e in pile.connectors]}, "
+        f"ev2.connector_id={ev2.connector_id}, ev_modules={pile.ev_modules}"
     )
 
-    slot1 = ev2.dispenser_id
+    slot1 = ev2.connector_id
     pile.disconnect_ev(ev1)
     print(
-        f"  After disconnect EV1: dispensers="
-        f"{[None if e is None else e.id for e in pile.dispensers]}, "
-        f"ev2.dispenser_id={ev2.dispenser_id}, ev_modules={pile.ev_modules}"
+        f"  After disconnect EV1: connectors="
+        f"{[None if e is None else e.id for e in pile.connectors]}, "
+        f"ev2.connector_id={ev2.connector_id}, ev_modules={pile.ev_modules}"
     )
 
-    assert ev2.dispenser_id == slot1
-    assert pile.dispensers[0] is None
-    assert pile.dispensers[1] is ev2
+    assert ev2.connector_id == slot1
+    assert pile.connectors[0] is None
+    assert pile.connectors[1] is ev2
     assert pile.ev_modules[0] == 0
 
     policy.update_power(pile)
     print(
         f"  After redistribute: ev_modules={pile.ev_modules}, "
-        f"EV2 modules={pile.ev_modules[ev2.dispenser_id]}"
+        f"EV2 modules={pile.ev_modules[ev2.connector_id]}"
     )
-    assert pile.ev_modules[ev2.dispenser_id] >= 1
+    assert pile.ev_modules[ev2.connector_id] >= 1
     assert sum(pile.ev_modules) <= pile.num_modules
     pile.check_invariants()
     print("  PASS")
@@ -175,14 +175,14 @@ def test_micro_distribute_frees_module_from_trigger_ev():
     )
 
     policy = ProportionalPower()
-    pile = ChargingPile(id=0, n_dispensers=2, num_modules=4, p_module=25.0)
+    pile = ChargingPile(id=0, n_connectors=2, num_modules=4, p_module=25.0)
     ev1 = _make_ev(1, 100)
     ev2 = _make_ev(2, 100)
     pile.connect_ev(ev1)
     pile.connect_ev(ev2)
     policy.update_power(pile)
     before = list(pile.ev_modules)
-    before_ev1 = pile.ev_modules[ev1.dispenser_id]
+    before_ev1 = pile.ev_modules[ev1.connector_id]
     print(f"  Before micro: ev_modules={before}, EV1 modules={before_ev1}")
     assert before_ev1 >= 1
 
@@ -208,7 +208,7 @@ def test_static_equal_split_with_leftovers_by_unmet_request():
     )
 
     policy = StaticPower()
-    pile = ChargingPile(id=0, n_dispensers=3, num_modules=5, p_module=25.0)
+    pile = ChargingPile(id=0, n_connectors=3, num_modules=5, p_module=25.0)
     # c_rate=1 so flat-region p_req equals c_b (kW) for the documented numbers.
     ev_low = _make_ev(0, 75.0, s_i=0.2, s_th=0.6, c_rate=1.0)
     ev_hi = _make_ev(1, 250.0, s_i=0.2, s_th=0.6, c_rate=1.0)
@@ -224,9 +224,9 @@ def test_static_equal_split_with_leftovers_by_unmet_request():
 
     policy.update_power(pile)
     modules = [
-        pile.ev_modules[ev_low.dispenser_id],
-        pile.ev_modules[ev_hi.dispenser_id],
-        pile.ev_modules[ev_mid.dispenser_id],
+        pile.ev_modules[ev_low.connector_id],
+        pile.ev_modules[ev_hi.connector_id],
+        pile.ev_modules[ev_mid.connector_id],
     ]
     print(f"  Result: ev_modules by EV order={modules}, sum={sum(modules)}")
 
@@ -241,13 +241,13 @@ def test_static_single_ev_gets_full_pool():
     print("Intent: with one EV, num_modules // 1 assigns the full pool to that EV.")
 
     policy = StaticPower()
-    pile = ChargingPile(id=0, n_dispensers=2, num_modules=5, p_module=25.0)
+    pile = ChargingPile(id=0, n_connectors=2, num_modules=5, p_module=25.0)
     ev = _make_ev(1, 100.0, s_i=0.2, s_th=0.6, c_rate=1.0)
     pile.connect_ev(ev)
     policy.update_power(pile)
 
     print(f"  Result: ev_modules={pile.ev_modules}")
-    assert pile.ev_modules[ev.dispenser_id] == pile.num_modules
+    assert pile.ev_modules[ev.connector_id] == pile.num_modules
     assert sum(pile.ev_modules) == pile.num_modules
     print("  PASS")
 
@@ -278,17 +278,17 @@ def test_underuse_reallocation_flag_and_charge_change_gating():
     # Shared overloaded setup: two EVs, 4 modules, p_module=25, high p_req.
     def _overloaded_pile(policy):
         station = _StubStation(policy)
-        pile = ChargingPile(id=0, n_dispensers=2, num_modules=4, p_module=25.0, station=station)
+        pile = ChargingPile(id=0, n_connectors=2, num_modules=4, p_module=25.0, station=station)
         ev1 = _make_ev(1, 200.0, s_i=0.2, s_f=0.95, s_th=0.6, c_rate=1.0)
         ev2 = _make_ev(2, 200.0, s_i=0.2, s_f=0.95, s_th=0.6, c_rate=1.0)
         pile.connect_ev(ev1)
         pile.connect_ev(ev2)
         policy.update_power(pile)
         # Ensure CHARGE_CHANGE eligibility shape: >1 module on an overloaded pile.
-        if pile.ev_modules[ev1.dispenser_id] <= 1:
-            pile.ev_modules[ev1.dispenser_id] = 2
-            pile.ev_modules[ev2.dispenser_id] = pile.num_modules - 2
-        ev1.p_act = pile.ev_modules[ev1.dispenser_id] * pile.p_module
+        if pile.ev_modules[ev1.connector_id] <= 1:
+            pile.ev_modules[ev1.connector_id] = 2
+            pile.ev_modules[ev2.connector_id] = pile.num_modules - 2
+        ev1.p_act = pile.ev_modules[ev1.connector_id] * pile.p_module
         return pile, ev1
 
     pile_s, ev_s = _overloaded_pile(StaticPower())
@@ -311,7 +311,7 @@ if __name__ == "__main__":
     print("Running test_power_policy.py (direct mode)")
     test_non_overloaded_ceil_allocation()
     test_overloaded_respects_module_cap()
-    test_disconnect_middle_dispenser_keeps_slots()
+    test_disconnect_middle_connector_keeps_slots()
     test_micro_distribute_frees_module_from_trigger_ev()
     test_static_equal_split_with_leftovers_by_unmet_request()
     test_static_single_ev_gets_full_pool()

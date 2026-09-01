@@ -34,12 +34,12 @@ def test_event_generation_invalidates_both_event_types():
     )
 
     heap = EventQueue()
-    pile = ChargingPile(id=0, n_dispensers=2, num_modules=4, p_module=25.0)
+    pile = ChargingPile(id=0, n_connectors=2, num_modules=4, p_module=25.0)
     ev = EV(id=0, c_b=50.0, s_i=0.2, s_f=0.8, arrival_time=0.0)
     pile.connect_ev(ev)
 
     ProportionalPower().update_power(pile)
-    ev.update_charging_power(pile.ev_modules[ev.dispenser_id] * pile.p_module, 0.0, heap)
+    ev.update_charging_power(pile.ev_modules[ev.connector_id] * pile.p_module, 0.0, heap)
     assert heap.heap
     first = heap.heap[0]
     print(
@@ -52,15 +52,15 @@ def test_event_generation_invalidates_both_event_types():
     ev2 = EV(id=1, c_b=150.0, s_i=0.2, s_f=0.9, arrival_time=0.0)
     pile.connect_ev(ev2)
     ProportionalPower().update_power(pile)
-    if pile.is_overloaded and pile.ev_modules[ev.dispenser_id] <= 1:
-        pile.ev_modules[ev.dispenser_id] = 2
-        pile.ev_modules[ev2.dispenser_id] = max(1, pile.num_modules - 2)
+    if pile.is_overloaded and pile.ev_modules[ev.connector_id] <= 1:
+        pile.ev_modules[ev.connector_id] = 2
+        pile.ev_modules[ev2.connector_id] = max(1, pile.num_modules - 2)
         print(
             f"  Forced modules for CHARGE_CHANGE eligibility: "
             f"ev_modules={pile.ev_modules}, overloaded={pile.is_overloaded}"
         )
 
-    ev.update_charging_power(pile.ev_modules[ev.dispenser_id] * pile.p_module, 0.0, heap)
+    ev.update_charging_power(pile.ev_modules[ev.connector_id] * pile.p_module, 0.0, heap)
     print(
         f"  After reschedule: generation={ev.event_generation}, "
         f"old DEPARTURE id={old_id}, heap_size={len(heap.heap)}"
@@ -80,7 +80,7 @@ def test_disconnect_invalidates_pending_events():
     )
 
     heap = EventQueue()
-    pile = ChargingPile(id=0, n_dispensers=2, num_modules=5, p_module=25.0)
+    pile = ChargingPile(id=0, n_connectors=2, num_modules=5, p_module=25.0)
     ev = EV(id=0, c_b=50.0, s_i=0.2, s_f=0.8, arrival_time=0.0)
     pile.connect_ev(ev)
     ProportionalPower().update_power(pile)

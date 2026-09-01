@@ -29,9 +29,9 @@ from policy.queue.fifo import FIFOQueuePolicy
 from config import MAX_TIME
 
 
-# Station setup: few dispensers + fast arrivals so the queue is not always empty.
+# Station setup: few connectors + fast arrivals so the queue is not always empty.
 N_PILES = 2
-N_DISPENSERS = 1
+N_CONNECTORS = 1
 N_MODULES = 4
 P_MODULE = 25.0
 QUEUE_CAPACITY = 50
@@ -42,7 +42,7 @@ POLICY_SEED = 1
 
 def _run_fifo_episode(
     n_piles: int = N_PILES,
-    n_dispensers: int = N_DISPENSERS,
+    n_connectors: int = N_CONNECTORS,
     n_modules: int = N_MODULES,
     p_module: float = P_MODULE,
     queue_capacity: int = QUEUE_CAPACITY,
@@ -52,7 +52,7 @@ def _run_fifo_episode(
     """Roll out one full day under FIFO pile choice."""
     env = ChargingStationEnv(
         n_piles=n_piles,
-        n_dispensers=n_dispensers,
+        n_connectors=n_connectors,
         n_modules=n_modules,
         p_module=p_module,
         queue_capacity=queue_capacity,
@@ -136,12 +136,12 @@ def test_queueing_laws_side_by_side():
     print("\n=== test_queueing_laws_side_by_side ===")
     print(
         "Intent: after one FIFO simulated day, compare Little's law L and Q, "
-        "dispenser utilization, and Kingman W_q against the same run's empirical averages."
+        "connector utilization, and Kingman W_q against the same run's empirical averages."
     )
-    c = N_PILES * N_DISPENSERS
+    c = N_PILES * N_CONNECTORS
     lam_offered = 1.0 / LAM
     print(
-        f"Setup: {N_PILES} piles x {N_DISPENSERS} dispensers "
+        f"Setup: {N_PILES} piles x {N_CONNECTORS} connectors "
         f"(c={c} servers), mean interarrival={LAM} min "
         f"(lambda_offered={lam_offered:.4f}/min), T={MAX_TIME} min."
     )
@@ -149,7 +149,7 @@ def test_queueing_laws_side_by_side():
     env = _run_fifo_episode()
     metrics = env.engine.metrics
     T = float(env.engine.current_time)
-    summary = metrics.queueing_summary(T, n_servers=N_PILES * N_DISPENSERS)
+    summary = metrics.queueing_summary(T, n_servers=N_PILES * N_CONNECTORS)
     _waits, services, _sojourns = metrics.finished_time_arrays()
 
     n_arrived = len(metrics.arrived_evs)
@@ -190,7 +190,7 @@ def test_queueing_laws_side_by_side():
     print(f"  c_a^2 (arrivals)         = {ca2:.4f}")
     print(f"  c_s^2 (service)          = {cs2:.4f}")
     print(f"  rho_theory=lambda_eff/(c*mu) = {rho_theory:.4f}")
-    print(f"  rho_sim (dispenser busy)    = {rho_sim:.4f}")
+    print(f"  rho_sim (connector busy)    = {rho_sim:.4f}")
 
     print("\n  --- Side-by-side: theory vs simulation ---")
     r_L = _side_by_side("Little L = lambda_eff * W", L_ll, L_sim, "cars")

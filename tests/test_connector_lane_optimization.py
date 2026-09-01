@@ -199,7 +199,7 @@ def test_offline_bound_never_exceeds_fifo_simulation():
         ToyEVSpec(id=2, arrival_time=8.0, battery_kwh=50.0, s_i=0.25, s_f=0.75),
         ToyEVSpec(id=3, arrival_time=12.0, battery_kwh=150.0, s_i=0.10, s_f=0.80),
     ]
-    station_spec = ToyStationSpec(n_piles=2, n_dispensers=2, n_modules=5, p_module=25.0)
+    station_spec = ToyStationSpec(n_piles=2, n_connectors=2, n_modules=5, p_module=25.0)
 
     env = run_toy_episode(station_spec, specs, seed=0, policy_seed=1)
     fifo_total_sojourn = float(
@@ -208,7 +208,7 @@ def test_offline_bound_never_exceeds_fifo_simulation():
 
     cl_station = StationSpec(
         n_piles=station_spec.n_piles,
-        n_connectors=station_spec.n_dispensers,
+        n_connectors=station_spec.n_connectors,
         n_modules=station_spec.n_modules,
         p_module=station_spec.p_module,
     )
@@ -461,7 +461,7 @@ def test_cutoff_from_real_simulation_preserves_optimum():
     ]
     toy_station = ToyStationSpec(
         n_piles=station.n_piles,
-        n_dispensers=station.n_connectors,
+        n_connectors=station.n_connectors,
         n_modules=station.n_modules,
         p_module=station.p_module,
     )
@@ -585,7 +585,7 @@ def _symmetric_sim_test_instance():
         ToyEVSpec(id=1, arrival_time=0.0, battery_kwh=100.0, s_i=0.15, s_f=0.85),
         ToyEVSpec(id=2, arrival_time=5.0, battery_kwh=50.0, s_i=0.20, s_f=0.80),
     ]
-    toy_station = ToyStationSpec(n_piles=2, n_dispensers=2, n_modules=4, p_module=25.0)
+    toy_station = ToyStationSpec(n_piles=2, n_connectors=2, n_modules=4, p_module=25.0)
     station = StationSpec(n_piles=2, n_connectors=2, n_modules=4, p_module=25.0)
     vehicles = vehicles_from_evs(build_evs(specs))
     return specs, toy_station, station, vehicles
