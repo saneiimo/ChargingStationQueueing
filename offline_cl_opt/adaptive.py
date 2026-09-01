@@ -348,11 +348,11 @@ def _seed_values_from_evs(cl_model: ConnectorLaneModel, evs: list["EV"], *, brea
     for ev in evs:
         if ev.id not in cl_model.vehicles:
             continue
-        if ev.pile_tracker is None or ev.dispenser_id_tracker is None:
+        if ev.pile_tracker is None or ev.connector_id_tracker is None:
             continue
         if ev.service_start_time is None or not math.isfinite(ev.departure_time):
             continue
-        raw_lane_by_vehicle[ev.id] = (ev.pile_tracker.id, ev.dispenser_id_tracker)
+        raw_lane_by_vehicle[ev.id] = (ev.pile_tracker.id, ev.connector_id_tracker)
         evs_by_id[ev.id] = ev
 
     sorted_ids = sorted(cl_model.vehicles)

@@ -30,7 +30,7 @@ class ToyStationSpec:
     """Charging-station layout for the toy run."""
 
     n_piles: int = 2
-    n_dispensers: int = 2
+    n_connectors: int = 2
     n_modules: int = 5
     p_module: float = 25.0  # kW per module
     queue_capacity: int = 10

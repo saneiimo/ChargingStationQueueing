@@ -4,8 +4,9 @@ Run one toy episode with fixed EVs / arrivals, then summarize metrics.
 Flow
 ----
 1. Build ``ChargingStationEnv`` from ``ToyStationSpec``.
-2. Replace ``engine._generate_arrivals`` so ``reset`` pushes only your EVs
-   (plus ``SIM_OVER`` at ``horizon``).
+2. Install your fixed EVs as the arrival list (``engine.set_arrivals``) so
+   ``reset`` pushes only those (plus ``SIM_OVER`` at ``horizon``) instead of
+   sampling a random Poisson process.
 3. Roll out with a ``QueuePolicy`` via ``decide`` / ``step``, same as ``main.py``.
 """
 
@@ -20,7 +21,6 @@ from env.charging_env import ChargingStationEnv
 from models.ev import EV
 from policy.queue.base import QueuePolicy
 from policy.queue.fifo import FIFOQueuePolicy
-from simulation.event import Event, EventType
 
 from .scenario import ToyEVSpec, ToyStationSpec, build_evs, suggest_horizon
 
@@ -34,7 +34,9 @@ def install_fixed_arrivals(
     """
     Make the next ``env.reset`` use ``evs`` instead of a random Poisson process.
 
-    Also sets ``engine.max_time`` to ``horizon`` so SIM_OVER matches the toy day.
+    Also sets ``engine.max_time`` to ``horizon`` so SIM_OVER matches the toy day,
+    and clears ``mean_interarrival`` so the engine's external-arrivals list
+    (rather than a freshly-sampled process) is what actually gets used.
     """
     if horizon <= 0:
         raise ValueError(f"horizon must be positive, got {horizon}")
@@ -43,27 +45,15 @@ def install_fixed_arrivals(
 
     engine = env.engine
     engine.max_time = float(horizon)
-
-    # Copy the list so later notebook edits to ``evs`` do not change a run
-    # that already installed arrivals.
-    fixed = list(evs)
-
-    def _generate_arrivals() -> None:
-        engine.event_heap.clear()
-        for ev in fixed:
-            engine.event_heap.push(
-                Event(ev.arrival_time, EventType.ARRIVAL, obj=ev)
-            )
-        engine.event_heap.push(Event(engine.max_time, EventType.SIM_OVER))
-
-    engine._generate_arrivals = _generate_arrivals  # type: ignore[method-assign]
+    engine.station.mean_interarrival = None
+    engine.set_arrivals(evs)
 
 
 def make_toy_env(station: ToyStationSpec) -> ChargingStationEnv:
     """Build a Gym env whose layout matches ``station`` (arrivals still random until install)."""
     return ChargingStationEnv(
         n_piles=station.n_piles,
-        n_dispensers=station.n_dispensers,
+        n_connectors=station.n_connectors,
         n_modules=station.n_modules,
         p_module=station.p_module,
         queue_capacity=station.queue_capacity,
@@ -86,11 +76,11 @@ def run_toy_episode(
     Parameters
     ----------
     station :
-        Pile / dispenser / module layout.
+        Pile / connector / module layout.
     ev_specs :
         User-facing EV list (ids, arrivals, battery kWh, SoC targets).
     policy :
-        Queue assignment rule. Defaults to FIFO + most-free-dispenser piles.
+        Queue assignment rule. Defaults to FIFO + most-free-connector piles.
     horizon :
         SIM_OVER time in minutes. Default: last arrival + 90 min.
     seed, policy_seed :
@@ -125,7 +115,7 @@ def metrics_table(env: ChargingStationEnv) -> pd.DataFrame:
     """
     m = env.engine.metrics
     T = float(env.engine.current_time)
-    c = env.engine.station.n_piles * env.engine.station.n_dispensers
+    c = env.engine.station.n_piles * env.engine.station.n_connectors
     q = m.queueing_summary(T, n_servers=c)
 
     rows: list[dict[str, Any]] = [
@@ -172,7 +162,7 @@ def finished_ev_table(env: ChargingStationEnv) -> pd.DataFrame:
                 "s_end": ev.s_current,
                 "battery_kwh": ev.c_b / HR2MIN,
                 "pile": pile,
-                "dispenser": ev.dispenser_id_tracker,
+                "connector": ev.connector_id_tracker,
                 "energy_kwh": ev.energy_received,
             }
         )

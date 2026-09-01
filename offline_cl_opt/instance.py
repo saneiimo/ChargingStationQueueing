@@ -129,11 +129,11 @@ class StationSpec:
 
     @classmethod
     def from_station(cls, station: "ChargingStation") -> "StationSpec":
-        """``station.n_dispensers`` becomes ``n_connectors`` here -- same
-        physical thing, named to match this formulation's own notation."""
+        """Mirrors ``station.n_connectors`` here, named to match this
+        formulation's own notation."""
         return cls(
             n_piles=station.n_piles,
-            n_connectors=station.n_dispensers,
+            n_connectors=station.n_connectors,
             n_modules=station.n_modules,
             p_module=station.p_module,
         )

@@ -24,42 +24,57 @@ class DWSolution:
     """
     Bracket + schedule from ``solve_by_decomposition``.
 
-    ``lower_bound`` is ``best_lower_bound`` from column generation -- a
-    certified lower bound on the true optimum (32), valid even if
-    ``converged`` is False (an anytime bound, Section 6.4). ``upper_bound``
-    is the price-and-branch integer master's objective (Section 9.1) -- a
-    genuine feasible schedule's cost, valid regardless of convergence.
-    ``gap`` is ``upper_bound - lower_bound``. All three are in the compact
+    ``LB`` is ``best_lower_bound`` from column generation -- a certified
+    lower bound on the true optimum (32), valid even if ``converged`` is
+    False (an anytime bound, Section 6.4). ``UB`` is the price-and-branch
+    integer master's objective (Section 9.1) -- a genuine feasible
+    schedule's cost, valid regardless of convergence. ``gap`` is
+    ``UB - LB``, the certified bracket width. All three are in the compact
     model's own raw objective units (eq. 1: ``sum_j D_j``, each vehicle's
     *absolute* departure slot counted from ``t=0``) -- **not** sojourn
     minutes, and not directly comparable to a simulation's total-sojourn
     metric (``sum_j (departure - arrival)``), which nets out arrival time
-    and this objective does not. Comparing ``lower_bound``/``upper_bound``
-    straight against a sojourn number is an apples-to-oranges mistake that
-    looks exactly like an invalid bound (e.g. ``lower_bound`` appearing to
-    exceed a feasible sojourn total) without actually being one.
+    and this objective does not. Comparing ``LB``/``UB`` straight against a
+    sojourn number is an apples-to-oranges mistake that looks exactly like
+    an invalid bound (e.g. ``LB`` appearing to exceed a feasible sojourn
+    total) without actually being one.
 
-    ``total_sojourn``/``mean_sojourn`` give the *schedule*'s (i.e.
-    ``upper_bound``'s) cost already converted to sojourn minutes -- mirrors
+    ``rmp_gap`` is a *different* quantity from ``gap`` -- it is
+    ``z_RMP - LB`` at the end of column generation (the final entry of
+    ``ColGenResult.z_rmp_history``, minus ``best_lower_bound``), Section
+    7.4's own stopping-criterion gap. Unlike ``gap``, it is **not** a
+    certified bound on the distance to the true optimum: the *restricted*
+    master's own LP value ``z_RMP`` has no guaranteed ordering relative to
+    the true optimum before convergence -- only ``LB`` does (see
+    ``colgen.py``'s own module docstring). Read ``rmp_gap`` as "how close is
+    column generation to proving ``z_RMP == z_MP``", never as a substitute
+    for ``gap`` (``UB - LB``), which remains the only certified bracket.
+    They typically end up close once ``converged`` is True, but are not the
+    same thing even then, since price-and-branch's ``UB`` need not equal
+    the LP optimum exactly.
+
+    ``total_sojourn_UB``/``mean_sojourn_UB`` give the *schedule*'s (i.e.
+    ``UB``'s) cost already converted to sojourn minutes -- mirrors
     ``offline_cl_opt.solution.ConnectorLaneSolution`` exactly (``delta*
     objective - sum_j a_j``) and equals ``per_vehicle["sojourn_min"].sum()``
-    /``.mean()``. ``total_sojourn_lower_bound`` applies the same conversion
-    to ``lower_bound`` instead, so it -- not ``lower_bound`` itself -- is
-    what should be compared against a simulation's total sojourn.
+    /``.mean()``. ``total_sojourn_LB`` applies the same conversion to
+    ``LB`` instead, so it -- not ``LB`` itself -- is what should be
+    compared against a simulation's total sojourn.
 
     ``columns_purged`` is copied straight from ``ColGenResult.columns_purged``
     (Section 8.3) -- the cumulative count of non-basic columns swept out of
     the master over the run, ``0`` if ``purge_every=None`` disabled it. Purely
-    informational: purging never changes ``lower_bound``/``upper_bound``, only
-    how much work reaching them cost.
+    informational: purging never changes ``LB``/``UB``, only how much work
+    reaching them cost.
     """
 
-    lower_bound: float
-    upper_bound: float
+    LB: float
+    UB: float
     gap: float
-    total_sojourn: float
-    mean_sojourn: float
-    total_sojourn_lower_bound: float
+    rmp_gap: float
+    total_sojourn_UB: float
+    mean_sojourn_UB: float
+    total_sojourn_LB: float
     converged: bool
     iterations: int
     columns_purged: int
@@ -78,8 +93,9 @@ def extract_solution(
     delta: float,
     K: int,
     *,
-    lower_bound: float,
-    upper_bound: float,
+    LB: float,
+    UB: float,
+    rmp_gap: float,
     converged: bool,
     iterations: int,
     columns_purged: int = 0,
@@ -118,17 +134,18 @@ def extract_solution(
 
     n = len(vehicles)
     total_arrival = sum(v.a for v in vehicles)
-    total_sojourn = delta * upper_bound - total_arrival
-    mean_sojourn = total_sojourn / n if n else 0.0
-    total_sojourn_lower_bound = delta * lower_bound - total_arrival
+    total_sojourn_UB = delta * UB - total_arrival
+    mean_sojourn_UB = total_sojourn_UB / n if n else 0.0
+    total_sojourn_LB = delta * LB - total_arrival
 
     return DWSolution(
-        lower_bound=lower_bound,
-        upper_bound=upper_bound,
-        gap=upper_bound - lower_bound,
-        total_sojourn=total_sojourn,
-        mean_sojourn=mean_sojourn,
-        total_sojourn_lower_bound=total_sojourn_lower_bound,
+        LB=LB,
+        UB=UB,
+        gap=UB - LB,
+        rmp_gap=rmp_gap,
+        total_sojourn_UB=total_sojourn_UB,
+        mean_sojourn_UB=mean_sojourn_UB,
+        total_sojourn_LB=total_sojourn_LB,
         converged=converged,
         iterations=iterations,
         columns_purged=columns_purged,
@@ -198,8 +215,8 @@ def solve_by_decomposition(
     iterations, sweep non-basic master columns whose reduced cost exceeds
     ``purge_threshold`` -- keeps ``solve_lp``'s own cost from growing
     unbounded as the master accumulates columns over a long run. Set
-    ``purge_every=None`` to disable. Never changes ``lower_bound``/
-    ``upper_bound``; a purged column can always be regenerated later if it
+    ``purge_every=None`` to disable. Never changes ``LB``/``UB``; a purged
+    column can always be regenerated later if it
     becomes attractive again (the pricer searches the full plan space, not
     the historical pool -- see ``master.purge_columns``'s own docstring).
     The cumulative count removed is reported on the returned
@@ -240,14 +257,16 @@ def solve_by_decomposition(
     )
 
     K = math.ceil(round(horizon_minutes / delta, 9))
+    z_rmp_final = cg.z_rmp_history[-1] if cg.z_rmp_history else float("nan")
     solution = extract_solution(
         integer_result.chosen,
         vehicles,
         station,
         delta,
         K,
-        lower_bound=cg.best_lower_bound,
-        upper_bound=integer_result.objective,
+        LB=cg.best_lower_bound,
+        UB=integer_result.objective,
+        rmp_gap=z_rmp_final - cg.best_lower_bound,
         converged=cg.converged,
         iterations=cg.iterations,
         columns_purged=cg.columns_purged,

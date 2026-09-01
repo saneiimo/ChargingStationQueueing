@@ -19,9 +19,9 @@ Adapted from ``offline_opt/visualization.py``'s ``plot_vehicle_power_and_modules
     the modules this vehicle's own delivered power genuinely requires, not
     a stored decision variable.
   - Connector identity **is** a real decision here (``y[j,m,c]``), unlike
-    ``offline_opt`` where a pile's dispensers aren't individually named by
+    ``offline_opt`` where a pile's connectors aren't individually named by
     the model and have to be assigned for display only
-    (``assign_display_dispensers``). There is no equivalent step in this
+    (``assign_display_connectors``). There is no equivalent step in this
     file -- vehicles are grouped by the connector the model actually chose.
 
 Styling reuses ``visualization.style``, same as ``offline_opt/visualization.py``.
@@ -619,7 +619,7 @@ def plot_pile_power_and_modules(
 
 # ---------------------------------------------------------------------------
 # Per-pile figure (simulation-style step curves) -- directly comparable to
-# visualization.pile_power.plot_pile_dispenser_power on the same PLOT_KW.
+# visualization.pile_power.plot_pile_connector_power on the same PLOT_KW.
 # ---------------------------------------------------------------------------
 
 DEFAULT_LABEL_THEORY_V2 = "Unconstrained"
@@ -768,7 +768,7 @@ def plot_pile_power_and_modules_v2(
     """
     Simulation-style pile figure for a *solved* connector-lane MILP.
 
-    Same visual contract as ``visualization.pile_power.plot_pile_dispenser_power``
+    Same visual contract as ``visualization.pile_power.plot_pile_connector_power``
     (stacked connectors, EV colors by plug-in, shared event / charge-change
     markers) -- same parameter names too (minus ``s_th``, since this
     package's ``VehicleData`` already carries its own), so the exact same
@@ -777,8 +777,8 @@ def plot_pile_power_and_modules_v2(
     piecewise-constant holds on ``[kδ, (k+1)δ)``, not as bar tips connected
     across slots.
 
-    Unlike ``offline_opt`` (whose MILP tracks dispenser *occupancy* per pile
-    but not *identity*, needing ``assign_display_dispensers`` for display),
+    Unlike ``offline_opt`` (whose MILP tracks connector *occupancy* per pile
+    but not *identity*, needing ``assign_display_connectors`` for display),
     connector identity is a real decision here (``y[j,m,c]``) -- occupants
     are grouped by the connector the model actually chose, straight off
     ``pile_vehicle_intervals``.

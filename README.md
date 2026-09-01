@@ -49,7 +49,7 @@ Read the code in this order the first time through:
            v
   +----------------+     update_power()     +----------------+
   |  ChargingPile  | <--------------------> |  PowerPolicy   |
-  | dispensers/modules |                        | (e.g. proport.)|
+  | connectors/modules |                        | (e.g. proport.)|
   +--------+-------+                        +----------------+
            |
            v
@@ -61,7 +61,7 @@ Read the code in this order the first time through:
 ## Station layout (in words)
 
 - A **station** has a waiting **queue** and several **piles**.
-- Each **pile** has a fixed number of **dispensers** (physical plugs) and a pool of
+- Each **pile** has a fixed number of **connectors** (physical plugs) and a pool of
   **power modules** (discrete chunks of kW). Modules are shared by all EVs on that pile.
 - An **EV** arrives, waits in queue, gets assigned to one pile, charges until its
   target SoC, then leaves. Charging power follows a constant-then-taper curve.
@@ -95,7 +95,7 @@ In a notebook:
 ## Visualization
 
 After a run (or via the CLI helper), plot BMS request vs actual power for every
-dispenser on one pile:
+connector on one pile:
 
 ```bash
 python -m visualization.pile_power --pile 0 --t-start 0 --t-end 240 --seed 42 --save pile0.png
@@ -104,11 +104,11 @@ python -m visualization.pile_power --pile 0 --t-start 0 --t-end 240 --seed 42 --
 Optional `--show` opens an interactive window. In a notebook:
 
 ```python
-from visualization.pile_power import run_fifo_episode, plot_pile_dispenser_power
+from visualization.pile_power import run_fifo_episode, plot_pile_connector_power
 import matplotlib.pyplot as plt
 
 env = run_fifo_episode(seed=42)
-fig = plot_pile_dispenser_power(env, pile_id=0, t_start=0, t_end=200)
+fig = plot_pile_connector_power(env, pile_id=0, t_start=0, t_end=200)
 plt.show()
 ```
 
@@ -129,7 +129,7 @@ python -m visualization.ev_curves --evs 0,1,2 --charts P-S,T-S,P-T --seed 42
 The env does **not** ask the agent to advance time. It auto-advances the
 simulator until either:
 
-- there is a vehicle in queue and at least one free dispenser, or
+- there is a vehicle in queue and at least one free connector, or
 - the episode ends (`SIM_OVER`).
 
 At a decision point the action is a pile index. Use `env.action_masks()` so

@@ -217,7 +217,7 @@ of two sources:
   e.g. `env.engine.metrics.finished_evs`): `_seed_values_from_evs`
   reconstructs a discretized schedule directly from each vehicle's own
   recorded pile/connector, timing, and power trace (`EV.pile_tracker`,
-  `.dispenser_id_tracker`, `.service_start_time`, `.departure_time`,
+  `.connector_id_tracker`, `.service_start_time`, `.departure_time`,
   `.charge_trace`) — no MILP solve needed to build it at all, only as good
   a starting point as the simulation itself was. `x`'s `.Start` values are
   reconstructed from the same seeded `p` trajectory via the model's own
@@ -442,7 +442,7 @@ lower bound, but via different formulations:
 
 - **`offline_opt`** tracks per-slot completion state (`alpha`/`sigma`) and
   module counts per (vehicle, pile, slot); pile assignment is implicit
-  through which pile's dispenser capacity a vehicle's modules draw from.
+  through which pile's connector capacity a vehicle's modules draw from.
 - **`offline_cl_opt`** (this package) assigns each vehicle to one *lane*
   (a specific pile+connector pair) for its whole stay, and sequences
   vehicles sharing a lane via an explicit disjunctive precedence variable

@@ -1,30 +1,30 @@
 """
-Plot Power vs time for every dispenser on one charging pile.
+Plot Power vs time for every connector on one charging pile.
 
-For a chosen pile, builds one figure with ``n_dispensers`` vertically stacked axes.
-Each axis shows every EV that used that dispenser:
+For a chosen pile, builds one figure with ``n_connectors`` vertically stacked axes.
+Each axis shows every EV that used that connector:
   - dashed: unconstrained theory P(t) (same as ``plot_ev_theory_vs_sim`` P-T)
   - solid: actual drawn power densified from DES ``charge_trace``
   - optional horizontal segments: piecewise-constant ``p_act`` plateaus between
     ``charge_trace`` samples (charge redistributions)
   - optional vertical markers: sole module-allotment change times
-    (shared across dispensers; plug-in / departure times excluded)
+    (shared across connectors; plug-in / departure times excluded)
   - optional labels at each trace sample: P, t, s, n_modules
 
 Power-axis ticks and horizontal grid lines sit at multiples of one module power.
 
 Styling comes from ``visualization.style`` / ``config`` ``VIZ_*`` constants.
-EV colors are assigned by plug-in time on the *pile* (not restarted per dispenser).
+EV colors are assigned by plug-in time on the *pile* (not restarted per connector).
 Plug-in / departure markers are drawn as shared vertical lines across all
-dispenser axes so events line up visually.
+connector axes so events line up visually.
 
 Example (after a FIFO run)::
 
-    from visualization.pile_power import plot_pile_dispenser_power, run_fifo_episode
+    from visualization.pile_power import plot_pile_connector_power, run_fifo_episode
     import matplotlib.pyplot as plt
 
     env = run_fifo_episode(seed=42)
-    fig = plot_pile_dispenser_power(env, pile_id=0, t_start=0, t_end=200)
+    fig = plot_pile_connector_power(env, pile_id=0, t_start=0, t_end=200)
     plt.show()
 
 Terminal::
@@ -62,7 +62,7 @@ DEFAULT_LABEL_ACTUAL = "Actual power"
 DEFAULT_LABEL_CHARGE_STEPS = "Allotted power"
 DEFAULT_LABEL_CHARGE_CHANGE = "Charge-change event"
 DEFAULT_TITLE_TEMPLATE = (
-    "Pile {pile_id}: theory vs actual power by dispenser "
+    "Pile {pile_id}: theory vs actual power by connector "
     "(t in [{t_lo:.1f}, {t_hi:.1f}])"
 )
 
@@ -76,13 +76,13 @@ def _module_power_ticks(p_module: float, p_max: float) -> np.ndarray:
 
 # Re-export for backward compatibility (tests / README import from here).
 __all__ = [
-    "plot_pile_dispenser_power",
+    "plot_pile_connector_power",
     "run_fifo_episode",
     "densify_charge_trace",
 ]
 
 
-def plot_pile_dispenser_power(
+def plot_pile_connector_power(
     env: ChargingStationEnv,
     pile_id: int,
     t_start: float | None = None,
@@ -111,7 +111,7 @@ def plot_pile_dispenser_power(
     theory_n_points: int = 200,
 ) -> plt.Figure:
     """
-    One figure for ``pile_id``: vertical subplots = dispensers; x = time; y = power.
+    One figure for ``pile_id``: vertical subplots = connectors; x = time; y = power.
 
     Parameters
     ----------
@@ -135,7 +135,7 @@ def plot_pile_dispenser_power(
         Draw horizontal segments at ``p_act`` between consecutive ``charge_trace``
         samples (piecewise-constant power plateaus after each redistribution).
     show_charge_change_vlines :
-        Draw vertical markers at module-allotment change times on **all** dispenser
+        Draw vertical markers at module-allotment change times on **all** connector
         axes, with a time label on the top axis. Times that coincide with any
         EV plug-in or departure on this pile are omitted (sole charge changes).
     show_trace_labels :
@@ -149,7 +149,7 @@ def plot_pile_dispenser_power(
         Optional figure title. Default uses ``DEFAULT_TITLE_TEMPLATE``.
     show_event_lines :
         If True, draw vertical lines at every EV plug-in / departure that fall
-        in the window, on **all** dispenser axes (aligned across the pile).
+        in the window, on **all** connector axes (aligned across the pile).
     event_line_alpha :
         Opacity of those shared event lines in ``[0, 1]``.
     charge_step_alpha :
@@ -169,7 +169,7 @@ def plot_pile_dispenser_power(
     Returns
     -------
     matplotlib.figure.Figure
-        In Jupyter, assign to a variable (``fig = plot_pile_dispenser_power(...)``)
+        In Jupyter, assign to a variable (``fig = plot_pile_connector_power(...)``)
         or end the cell with a semicolon. Otherwise the inline backend may show
         the figure twice (once from pyplot, once from the returned object).
     """
@@ -180,7 +180,7 @@ def plot_pile_dispenser_power(
         raise ValueError(f"pile_id={pile_id} out of range [0, {station.n_piles - 1}]")
 
     pile = station.piles[pile_id]
-    n_dispensers = pile.n_dispensers
+    n_connectors = pile.n_connectors
     t_lo = 0.0 if t_start is None else float(t_start)
     t_hi = float(env.engine.current_time if t_end is None else t_end)
     if t_hi <= t_lo:
@@ -206,17 +206,17 @@ def plot_pile_dispenser_power(
     )
 
     episode_t = float(env.engine.current_time)
-    by_dispenser: dict[int, list[EV]] = defaultdict(list)
+    by_connector: dict[int, list[EV]] = defaultdict(list)
     pile_evs_in_window: list[EV] = []
 
     for ev in evs_for_pile(env, pile_id):
-        nid = ev.dispenser_id_tracker
+        nid = ev.connector_id_tracker
         if nid is None:
             continue
         t0, t1 = ev_window_times(ev, episode_t)
         if t1 < t_lo or t0 > t_hi:
             continue
-        by_dispenser[nid].append(ev)
+        by_connector[nid].append(ev)
         pile_evs_in_window.append(ev)
 
     color_of = color_by_plug_time(pile_evs_in_window)
@@ -254,11 +254,11 @@ def plot_pile_dispenser_power(
     if figsize is None:
         figsize = (
             viz_style.FIGSIZE_WIDE[0],
-            max(viz_style.FIGSIZE_PANEL_HEIGHT * n_dispensers * 0.75, 4.0),
+            max(viz_style.FIGSIZE_PANEL_HEIGHT * n_connectors * 0.75, 4.0),
         )
 
     fig, axes = plt.subplots(
-        n_dispensers,
+        n_connectors,
         1,
         sharex=True,
         figsize=figsize,
@@ -270,15 +270,15 @@ def plot_pile_dispenser_power(
     any_charge_steps = False
     p_module = pile.p_module
 
-    for dispenser in range(n_dispensers):
-        ax = axes[dispenser]
+    for connector in range(n_connectors):
+        ax = axes[connector]
         evs = sorted(
-            by_dispenser.get(dispenser, []),
+            by_connector.get(connector, []),
             key=lambda e: (e.service_start_time or 0.0, e.id),
         )
 
         if not evs:
-            ax.set_ylabel(f"Dispenser {dispenser}\nP (kW)")
+            ax.set_ylabel(f"Connector {connector}\nP (kW)")
             ax.text(
                 0.5,
                 0.5,
@@ -430,7 +430,7 @@ def plot_pile_dispenser_power(
                         ),
                     )
 
-        ax.set_ylabel(f"Dispenser {dispenser}\nP (kW)")
+        ax.set_ylabel(f"Connector {connector}\nP (kW)")
         ax.set_xlim(t_lo, t_hi)
         # Power ticks / grid at multiples of one module (kW).
         y_top = max(pile.power_supp, ax.get_ylim()[1])
@@ -589,7 +589,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--t-end", type=float, default=None, help="Zoom end (min)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--n-piles", type=int, default=4)
-    parser.add_argument("--n-dispensers", type=int, default=2)
+    parser.add_argument("--n-connectors", type=int, default=2)
     parser.add_argument("--n-modules", type=int, default=5)
     parser.add_argument("--p-module", type=float, default=25.0)
     parser.add_argument(
@@ -655,7 +655,7 @@ def main(argv: list[str] | None = None) -> None:
     print(f"Running FIFO episode (seed={args.seed}) then plotting pile {args.pile}...")
     env = run_fifo_episode(
         n_piles=args.n_piles,
-        n_dispensers=args.n_dispensers,
+        n_connectors=args.n_connectors,
         n_modules=args.n_modules,
         p_module=args.p_module,
         mean_interarrival=args.mean_interarrival,
@@ -666,7 +666,7 @@ def main(argv: list[str] | None = None) -> None:
         f"finished={len(env.engine.metrics.finished_evs)}"
     )
 
-    fig = plot_pile_dispenser_power(
+    fig = plot_pile_connector_power(
         env,
         pile_id=args.pile,
         t_start=args.t_start,

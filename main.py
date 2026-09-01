@@ -12,7 +12,7 @@ from policy.queue.fifo import FIFOQueuePolicy
 
 env = ChargingStationEnv(
     n_piles=4,
-    n_dispensers=2,
+    n_connectors=2,
     n_modules=5,
     p_module=25,
     queue_capacity=10,

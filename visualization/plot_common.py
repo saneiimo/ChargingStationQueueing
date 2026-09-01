@@ -32,7 +32,7 @@ def color_by_plug_time(evs: list[EV]) -> dict[int, str]:
     """
     Map EV id -> palette color ordered by service_start_time on the pile.
 
-    Colors are not restarted per dispenser.
+    Colors are not restarted per connector.
     """
     ordered = sorted(evs, key=lambda e: (e.service_start_time or 0.0, e.id))
     colors = viz_style.palette()

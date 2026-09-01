@@ -45,11 +45,11 @@ DEFAULT_METRICS: dict[str, Callable[[ChargingStationEnv], float]] = {
     "avg sys time": lambda e: e.engine.metrics.mean_sojourn(),
     "util_rho_sim": lambda e: e.engine.metrics.queueing_summary(
         e.engine.current_time,
-        n_servers=e.engine.station.n_piles * e.engine.station.n_dispensers,
+        n_servers=e.engine.station.n_piles * e.engine.station.n_connectors,
     )["rho_sim"],
     "util_rho_theory": lambda e: e.engine.metrics.queueing_summary(
         e.engine.current_time,
-        n_servers=e.engine.station.n_piles * e.engine.station.n_dispensers,
+        n_servers=e.engine.station.n_piles * e.engine.station.n_connectors,
     )["rho_theory"],
 }
 
@@ -374,7 +374,7 @@ if __name__ == "__main__":
 
     base = {
         "n_piles": 2,
-        "n_dispensers": 4,
+        "n_connectors": 4,
         "n_modules": 7,
         "p_module": 25,
         "queue_capacity": 10,
