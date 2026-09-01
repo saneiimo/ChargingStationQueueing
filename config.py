@@ -29,9 +29,9 @@ SOC_F_BOUNDS = [0.7, 0.9]
 # C-rate: peak request p_req_max = battery_capacity_kWh * C_RATE.
 C_RATE = 2 / HR2MIN
 # Episode length (minutes).
-MAX_TIME = 1440
+MAX_TIME = HR2MIN * 12
 
-# If True, piles assert dispenser/module consistency after redistributions.
+# If True, piles assert connector/module consistency after redistributions.
 CHECK_INVARIANTS = True
 
 # Gym reward pieces: cost of queue wait per (vehicle * minute), and per drop.

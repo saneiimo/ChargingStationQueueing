@@ -2,14 +2,14 @@
 Gymnasium env for learning pile assignment (typically head-of-line).
 
 The agent does not advance the DES clock. We auto-advance until either a
-decision is needed (queue nonempty and a free dispenser exists) or the episode
+decision is needed (queue nonempty and a free connector exists) or the episode
 ends. Actions are pile indices; call action_masks() to hide full piles.
 Heuristic baselines may also pass ``ev=`` into ``step`` to assign a chosen
 waiting vehicle (see ``policy.queue.base.QueuePolicy.decide``).
 
 Observation (all scaled roughly to [0, 1]):
   for each pile:
-    occupancy fraction, free-dispenser fraction, overload flag,
+    occupancy fraction, free-connector fraction, overload flag,
     total p_req / pile power, modules used / modules, mean SoC of plugged EVs
   head-of-line EV (or zeros if queue empty):
     battery / max, s_current, s_f, p_req / max power, energy_needed / max
@@ -27,6 +27,7 @@ import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
 
+from models.ev import EV
 from models.station import ChargingStation
 from metrics.metrics_tracker import MetricsTracker
 from simulation.event import EventQueue
@@ -38,7 +39,7 @@ from config import (
     HR2MIN,
     QUEUE_HOLDING_COST,
 )
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Sequence
 
 if TYPE_CHECKING:
     from policy.power.base import PowerPolicy
@@ -51,21 +52,37 @@ class ChargingStationEnv(gym.Env):
     def __init__(
         self,
         n_piles: int = 4,
-        n_dispensers: int = 2,
+        n_connectors: int = 2,
         n_modules: int = 5,
         p_module: float = 25.0,
         queue_capacity: int = 10,
-        mean_interarrival: float = 5.0,
+        mean_interarrival: float | None = 5.0,
         power_policy: PowerPolicy | None = None,
         queue_holding_cost: float = QUEUE_HOLDING_COST,
         drop_penalty: float = DROP_PENALTY,
+        max_time: float | None = None,
+        battery_cap_options: Sequence[float] | None = None,
+        arrivals: list[EV] | None = None,
     ):
         """
         Parameters
         ----------
         mean_interarrival :
             Mean gap between arrivals in minutes. Arrival rate
-            λ = 1 / mean_interarrival (customers per minute).
+            λ = 1 / mean_interarrival (customers per minute). Takes priority
+            over ``arrivals`` when both are given. Pass ``None`` to run only
+            off an externally-supplied ``arrivals`` list.
+        max_time :
+            Episode length (minutes). Defaults to ``config.MAX_TIME``.
+        battery_cap_options :
+            Battery capacities (kW*min, same units as
+            ``config.BATTERY_CAP_OPTIONS``) sampled when generating arrivals
+            internally. Defaults to ``config.BATTERY_CAP_OPTIONS``.
+        arrivals :
+            Pre-built EV arrival list (see
+            ``simulation.arrivals.generate_arrivals``), used only while
+            ``mean_interarrival`` is None. Installed once here; also
+            overridable per call via ``reset(options={"arrivals": [...]})``.
         """
         super().__init__()
 
@@ -73,27 +90,38 @@ class ChargingStationEnv(gym.Env):
             power_policy = ProportionalPower()
 
         self.n_piles = n_piles
-        self.n_dispensers = n_dispensers
+        self.n_connectors = n_connectors
         self.n_modules = n_modules
         self.p_module = p_module
         self.queue_capacity = queue_capacity
         self.mean_interarrival = mean_interarrival
         self.queue_holding_cost = queue_holding_cost
         self.drop_penalty = drop_penalty
-        self._max_battery = float(max(BATTERY_CAP_OPTIONS))
+        self.battery_cap_options = (
+            battery_cap_options if battery_cap_options is not None else BATTERY_CAP_OPTIONS
+        )
+        self._max_battery = float(max(self.battery_cap_options))
         self._max_power = float(n_modules * p_module)
 
         station = ChargingStation(
             n_piles=n_piles,
-            n_dispensers=n_dispensers,
+            n_connectors=n_connectors,
             n_modules=n_modules,
             p_module=p_module,
             queue_capacity=queue_capacity,
             power_policy=power_policy,
             mean_interarrival=mean_interarrival,
         )
-        metrics = MetricsTracker(n_piles=n_piles, n_dispensers=n_dispensers)
-        self.engine = SimulationEngine(station, metrics, EventQueue())
+        metrics = MetricsTracker(n_piles=n_piles, n_connectors=n_connectors)
+        self.engine = SimulationEngine(
+            station,
+            metrics,
+            EventQueue(),
+            max_time=max_time,
+            battery_cap_options=self.battery_cap_options,
+        )
+        if arrivals is not None:
+            self.engine.set_arrivals(arrivals)
 
         self.action_space = spaces.Discrete(n_piles)
 
@@ -104,7 +132,7 @@ class ChargingStationEnv(gym.Env):
         )
 
     def action_masks(self) -> np.ndarray:
-        """True where the pile still has a free dispenser."""
+        """True where the pile still has a free connector."""
         return np.array(
             [not pile.is_full for pile in self.engine.station.piles], dtype=np.bool_
         )
@@ -119,8 +147,8 @@ class ChargingStationEnv(gym.Env):
 
         for pile in piles:
             occ = len(pile.evs)
-            features.append(occ / pile.n_dispensers)  # occ fract
-            features.append(pile.free_dispensers / pile.n_dispensers)  # free-dispenser frac
+            features.append(occ / pile.n_connectors)  # occ fract
+            features.append(pile.free_connectors / pile.n_connectors)  # free-connector frac
             features.append(1.0 if pile.is_overloaded else 0.0)  # overload flag
             total_req = sum(ev.p_req for ev in pile.evs)
             features.append(
@@ -193,8 +221,15 @@ class ChargingStationEnv(gym.Env):
         )
 
     def reset(self, seed=None, options=None):
+        """
+        ``options`` may carry ``{"arrivals": [EV, ...]}`` to (re)install an
+        externally-supplied arrival list for this and future resets, used
+        only while ``mean_interarrival`` is None (see
+        ``simulation.arrivals.generate_arrivals``).
+        """
         super().reset(seed=seed)
-        self.engine.reset(seed)
+        arrivals = options.get("arrivals") if options else None
+        self.engine.reset(seed, arrivals=arrivals)
         # engine.reset already processed one event; keep going to a decision if needed.
         if self.engine.needs_assignment_decision() or self.engine.terminated:
             return self._get_obs(), self._info({"auto_steps": 0, "drops": 0})

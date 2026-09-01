@@ -3,7 +3,7 @@ Assign waiting EVs to piles by closest remaining-power match.
 
 At each assignment decision:
 
-1. For every pile with a free dispenser, compute leftover supply::
+1. For every pile with a free connector, compute leftover supply::
 
        remaining = pile.power_supp - sum(p_act of plugged EVs)
 
@@ -91,7 +91,7 @@ class ClosestPowerMatchQueuePolicy(QueuePolicy):
         """
         Pick (EV, pile_id) minimizing |remaining_power - p_req|.
 
-        Only piles with ``action_mask[i]`` True are considered (free dispenser).
+        Only piles with ``action_mask[i]`` True are considered (free connector).
         """
         evs = self._candidate_evs(station) if candidate_evs is None else candidate_evs
         if not evs:

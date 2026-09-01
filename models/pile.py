@@ -1,8 +1,8 @@
 """
-One charging pile: fixed dispensers and a shared pool of power modules.
+One charging pile: fixed connectors and a shared pool of power modules.
 
-A pile belongs to a ChargingStation. EVs plug into dispenser slots. Slots are
-fixed-length (None = free) so when EV A leaves, EV B keeps the same dispenser_id
+A pile belongs to a ChargingStation. EVs plug into connector slots. Slots are
+fixed-length (None = free) so when EV A leaves, EV B keeps the same connector_id
 and the matching entry in ev_modules stays aligned.
 
 Module counts themselves are written by a PowerPolicy (see policy/power/).
@@ -24,7 +24,7 @@ if TYPE_CHECKING:
 @dataclass
 class ChargingPile:
     id: int
-    n_dispensers: int  # Physical plugs on this pile
+    n_connectors: int  # Physical plugs on this pile
     num_modules: int  # Shared discrete power chunks
     p_module: float  # kW per module
     station: ChargingStation = None
@@ -32,55 +32,55 @@ class ChargingPile:
     moduleCheck_thresh: float = MODULE_CHECK_THRESH
 
     def __post_init__(self):
-        if self.num_modules < self.n_dispensers:
+        if self.num_modules < self.n_connectors:
             raise ValueError(
-                f"num_modules: {self.num_modules} is less than the number of dispensers: {self.n_dispensers}"
+                f"num_modules: {self.num_modules} is less than the number of connectors: {self.n_connectors}"
             )
         self.power_supp: float = self.num_modules * self.p_module
-        # Index i always means dispenser i — never compact this list on disconnect.
-        self.dispensers: List[EV | None] = [None] * self.n_dispensers
-        self.ev_modules: List[int] = [0] * self.n_dispensers
+        # Index i always means connector i — never compact this list on disconnect.
+        self.connectors: List[EV | None] = [None] * self.n_connectors
+        self.ev_modules: List[int] = [0] * self.n_connectors
 
     def reset(self):
         """Clear all plugs for a new episode."""
         for ev in self.evs:
             if ev.pile is self:
                 ev.pile = None
-            if ev.dispenser_id is not None:
-                ev.dispenser_id = None
+            if ev.connector_id is not None:
+                ev.connector_id = None
             if ev.pile_tracker is self:
                 ev.pile_tracker = None
 
-        self.dispensers = [None] * self.n_dispensers
-        self.ev_modules = [0] * self.n_dispensers
+        self.connectors = [None] * self.n_connectors
+        self.ev_modules = [0] * self.n_connectors
 
     @property
     def evs(self) -> List[EV]:
-        """Currently plugged EVs, ordered by dispenser index."""
-        return [ev for ev in self.dispensers if ev is not None]
+        """Currently plugged EVs, ordered by connector index."""
+        return [ev for ev in self.connectors if ev is not None]
 
     @property
     def is_full(self) -> bool:
-        return all(slot is not None for slot in self.dispensers)
+        return all(slot is not None for slot in self.connectors)
 
     @property
-    def free_dispensers(self) -> int:
-        return sum(1 for slot in self.dispensers if slot is None)
+    def free_connectors(self) -> int:
+        return sum(1 for slot in self.connectors if slot is None)
 
     def connect_ev(self, ev: EV):
-        """Plug EV into the first free dispenser and link both sides."""
+        """Plug EV into the first free connector and link both sides."""
         if ev.pile is not None:
             raise ValueError("EV already assigned to a pile.")
         if self.is_full:
             raise ValueError("Charging Pile is full.")
 
-        for i, slot in enumerate(self.dispensers):
+        for i, slot in enumerate(self.connectors):
             if slot is None:
-                self.dispensers[i] = ev
+                self.connectors[i] = ev
                 ev.pile = self
                 ev.pile_tracker = self
-                ev.dispenser_id = i
-                ev.dispenser_id_tracker = i  # kept after departure for plots
+                ev.connector_id = i
+                ev.connector_id_tracker = i  # kept after departure for plots
                 # Assignment happens between events; clock is already at decision time.
                 ev.service_start_time = self.current_time
                 return
@@ -89,7 +89,7 @@ class ChargingPile:
 
     def disconnect_ev(self, ev: EV):
         """
-        Unplug EV, free its dispenser/modules, and invalidate its pending events.
+        Unplug EV, free its connector/modules, and invalidate its pending events.
 
         Called after the engine has already projected energy over the last
         interval and committed ``s_current`` (typically to ``s_f``). Energy
@@ -100,10 +100,10 @@ class ChargingPile:
             raise ValueError("EV is not assigned to any pile.")
         if ev.pile != self:
             raise ValueError("EV is not assigned to this pile.")
-        if ev.dispenser_id is None or self.dispensers[ev.dispenser_id] is not ev:
-            raise ValueError("EV dispenser slot is inconsistent.")
+        if ev.connector_id is None or self.connectors[ev.connector_id] is not ev:
+            raise ValueError("EV connector slot is inconsistent.")
 
-        idx = ev.dispenser_id
+        idx = ev.connector_id
         depart_t = self.next_time
         last_allot = ev.charge_trace[-1][4] if ev.charge_trace else float(ev.p_act)
         # Trace-only: SoC is already at the departure value, so p_req may have
@@ -113,12 +113,12 @@ class ChargingPile:
         ev.p_act = min(ev.p_req, last_allot)
         ev.record_charge_sample(depart_t, p_allot=last_allot)
 
-        self.dispensers[idx] = None
+        self.connectors[idx] = None
         self.ev_modules[idx] = 0
         ev.invalidate_pending_events()
         ev.pile = None
-        ev.dispenser_id = None
-        # dispenser_id_tracker / pile_tracker kept for post-run visualization
+        ev.connector_id = None
+        # connector_id_tracker / pile_tracker kept for post-run visualization
         # Engine still has current_time < next_time while processing this departure.
         ev.departure_time = depart_t
 
@@ -136,7 +136,7 @@ class ChargingPile:
 
     @property
     def is_active(self) -> bool:
-        return any(slot is not None for slot in self.dispensers)
+        return any(slot is not None for slot in self.connectors)
 
     @property
     def modules_used(self) -> int:
@@ -162,11 +162,11 @@ class ChargingPile:
     @property
     def remaining_reqs(self) -> List[float]:
         """
-        How much requested power is still unmet at each dispenser, in kW.
-        Empty dispensers get -inf so argmax in the power policy skips them.
+        How much requested power is still unmet at each connector, in kW.
+        Empty connectors get -inf so argmax in the power policy skips them.
         """
         reqs: List[float] = []
-        for i, ev in enumerate(self.dispensers):
+        for i, ev in enumerate(self.connectors):
             if ev is None:
                 reqs.append(float("-inf"))
             else:
@@ -177,26 +177,26 @@ class ChargingPile:
         """Cheap sanity checks used when CHECK_INVARIANTS is on."""
         if not CHECK_INVARIANTS:
             return
-        if len(self.dispensers) != self.n_dispensers:
-            raise AssertionError("dispensers length mismatch")
-        if len(self.ev_modules) != self.n_dispensers:
+        if len(self.connectors) != self.n_connectors:
+            raise AssertionError("connectors length mismatch")
+        if len(self.ev_modules) != self.n_connectors:
             raise AssertionError("ev_modules length mismatch")
         if sum(self.ev_modules) > self.num_modules:
             raise AssertionError(
                 f"module over-allocation: {sum(self.ev_modules)} > {self.num_modules}"
             )
         seen = set()
-        for i, ev in enumerate(self.dispensers):
+        for i, ev in enumerate(self.connectors):
             if ev is None:
                 if self.ev_modules[i] != 0:
-                    raise AssertionError(f"empty dispenser {i} has modules")
+                    raise AssertionError(f"empty connector {i} has modules")
                 continue
-            if ev.dispenser_id != i:
+            if ev.connector_id != i:
                 raise AssertionError(
-                    f"EV {ev.id} dispenser_id {ev.dispenser_id} != slot {i}"
+                    f"EV {ev.id} connector_id {ev.connector_id} != slot {i}"
                 )
             if ev.pile is not self:
                 raise AssertionError(f"EV {ev.id} pile link broken")
             if i in seen:
-                raise AssertionError(f"duplicate dispenser index {i}")
+                raise AssertionError(f"duplicate connector index {i}")
             seen.add(i)

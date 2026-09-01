@@ -15,27 +15,40 @@ heuristic) to plug a waiting EV into a pile. ``ev=None`` means head-of-line.
 """
 
 from __future__ import annotations
+from typing import Sequence
 from models.station import ChargingStation
 from models.pile import ChargingPile
 from models.ev import EV
 from metrics.metrics_tracker import MetricsTracker
 from .event import EventQueue, Event, EventType
+from .arrivals import generate_arrivals, clone_arrivals
 import numpy as np
-from config import (
-    BATTERY_CAP_OPTIONS,
-    SOC_I_BOUNDS,
-    SOC_F_BOUNDS,
-    MAX_TIME,
-    CHECK_INVARIANTS,
-)
+from config import MAX_TIME, CHECK_INVARIANTS
 
 
 class SimulationEngine:
-    """Runs one episode of the charging station from t=0 to MAX_TIME."""
+    """Runs one episode of the charging station from t=0 to max_time."""
 
     def __init__(
-        self, station: ChargingStation, metrics: MetricsTracker, event_heap: EventQueue
+        self,
+        station: ChargingStation,
+        metrics: MetricsTracker,
+        event_heap: EventQueue,
+        max_time: float | None = None,
+        battery_cap_options: Sequence[float] | None = None,
     ):
+        """
+        Parameters
+        ----------
+        max_time :
+            Episode length (minutes). Defaults to ``config.MAX_TIME``.
+        battery_cap_options :
+            Battery capacities (kW*min, same units as
+            ``config.BATTERY_CAP_OPTIONS``) sampled from when generating
+            arrivals internally (``station.mean_interarrival`` set). Defaults
+            to ``config.BATTERY_CAP_OPTIONS``. Unused when arrivals are
+            supplied externally (see ``set_arrivals``).
+        """
 
         self.station = station
         self.metrics = metrics
@@ -43,11 +56,28 @@ class SimulationEngine:
         self.station.engine = self
 
         self.current_time = 0.0
-        self.max_time = MAX_TIME
+        self.max_time = float(max_time) if max_time is not None else MAX_TIME
+        self.battery_cap_options = battery_cap_options
+        self._external_arrivals: list[EV] | None = None
         self.terminated = False
 
-    def reset(self, seed=None):
-        """Clear state, sample all arrivals, and process the first event."""
+    def set_arrivals(self, arrivals: list[EV] | None) -> None:
+        """
+        Install a fixed external arrival list for future ``reset`` calls.
+
+        Only used while ``station.mean_interarrival`` is None -- when it is
+        set, the engine samples its own Poisson process on every ``reset``
+        instead (mean_interarrival takes priority over an installed list).
+        Pass ``None`` to clear a previously installed list.
+        """
+        self._external_arrivals = list(arrivals) if arrivals is not None else None
+
+    def reset(self, seed=None, arrivals: list[EV] | None = None):
+        """Clear state, sample/install all arrivals, and process the first event.
+
+        ``arrivals``, if given, is installed via ``set_arrivals`` before this
+        reset (and remains installed for subsequent resets too).
+        """
         self.rng = np.random.default_rng(seed)
 
         self.current_time: float = 0.0
@@ -60,6 +90,9 @@ class SimulationEngine:
         self.last_drops: int = 0
         self.last_event_type: EventType | None = None
 
+        if arrivals is not None:
+            self.set_arrivals(arrivals)
+
         self.station.reset()
         self.metrics.reset()
         self.event_heap.clear()
@@ -68,21 +101,33 @@ class SimulationEngine:
         return self.advance_time()
 
     def _generate_arrivals(self):
-        """Pre-sample the whole arrival process into the heap, plus SIM_OVER."""
-        # mean_interarrival is the Exp scale (minutes); λ = 1 / mean_interarrival.
-        mean_gap = self.station.mean_interarrival
-        arrivals = self.rng.exponential(
-            mean_gap, int(self.max_time / mean_gap * 5)
-        ).cumsum()
+        """Populate the event heap with ARRIVAL events, plus SIM_OVER.
 
-        arrivals = arrivals[arrivals <= self.max_time]
+        ``station.mean_interarrival`` takes priority: if set, arrivals are
+        sampled fresh (any installed external list is ignored). Otherwise an
+        external list must have been installed via ``set_arrivals`` /
+        ``reset(arrivals=...)``.
+        """
+        if self.station.mean_interarrival is not None:
+            evs = generate_arrivals(
+                mean_interarrival=self.station.mean_interarrival,
+                max_time=self.max_time,
+                rng=self.rng,
+                battery_cap_options=self.battery_cap_options,
+            )
+        elif self._external_arrivals is not None:
+            # Clone so a list reused across several resets always starts each
+            # EV fresh, the way freshly-sampled arrivals do.
+            evs = clone_arrivals(self._external_arrivals)
+        else:
+            raise ValueError(
+                "No arrival process: set station.mean_interarrival, or "
+                "install an external list via engine.set_arrivals(...) / "
+                "reset(arrivals=...)."
+            )
 
-        for i, t in enumerate(arrivals):
-            c_b = self.rng.choice(BATTERY_CAP_OPTIONS)
-            s_i = self.rng.uniform(*SOC_I_BOUNDS)
-            s_f = self.rng.uniform(*SOC_F_BOUNDS)
-            ev = EV(id=i, c_b=c_b, s_i=s_i, s_f=s_f, arrival_time=t)
-            self.event_heap.push(Event(t, EventType.ARRIVAL, obj=ev))
+        for ev in evs:
+            self.event_heap.push(Event(ev.arrival_time, EventType.ARRIVAL, obj=ev))
 
         self.event_heap.push(Event(self.max_time, EventType.SIM_OVER))
 
@@ -221,7 +266,7 @@ class SimulationEngine:
         return self.terminated
 
     def needs_assignment_decision(self) -> bool:
-        """True when someone is waiting and at least one dispenser is free."""
+        """True when someone is waiting and at least one connector is free."""
         if self.terminated:
             return False
         if not self.station.queue:

@@ -44,10 +44,10 @@ class EV:
     service_start_time: float | None = None
     pile: ChargingPile | None = None  # Set while plugged in; cleared on disconnect
     pile_tracker: ChargingPile | None = None  # Last pile used (kept after departure)
-    dispenser_id: int | None = (
+    connector_id: int | None = (
         None  # Fixed slot index on the pile (cleared on disconnect)
     )
-    dispenser_id_tracker: int | None = (
+    connector_id_tracker: int | None = (
         None  # Same slot, kept after departure (for plots)
     )
     energy_received: float = 0  # Integrated from deltaE_power
@@ -125,9 +125,9 @@ class EV:
 
     @property
     def n_modules(self) -> int | None:
-        if self.pile is None or self.dispenser_id is None:
+        if self.pile is None or self.connector_id is None:
             return None
-        return self.pile.ev_modules[self.dispenser_id]
+        return self.pile.ev_modules[self.connector_id]
 
     @property
     def p_req(self) -> float:

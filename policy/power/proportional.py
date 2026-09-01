@@ -34,7 +34,7 @@ class ProportionalPower(PowerPolicy):
         ev: EV | None = None,
     ) -> list[tuple[EV, float]]:
         if not pile.evs:
-            pile.ev_modules = [0] * pile.n_dispensers
+            pile.ev_modules = [0] * pile.n_connectors
             return []
 
         if ev is not None and pile.is_overloaded:
@@ -46,12 +46,12 @@ class ProportionalPower(PowerPolicy):
 
         assignments = []
         for connected in pile.evs:
-            power = pile.ev_modules[connected.dispenser_id] * pile.p_module
+            power = pile.ev_modules[connected.connector_id] * pile.p_module
             assignments.append((connected, power))
         return assignments
 
     def _clear_modules(self, pile: ChargingPile) -> None:
-        pile.ev_modules = [0] * pile.n_dispensers
+        pile.ev_modules = [0] * pile.n_connectors
 
     def _distribute(self, pile: ChargingPile) -> None:
         """Full rebuild of module counts from current requests."""
@@ -59,7 +59,7 @@ class ProportionalPower(PowerPolicy):
 
         if pile.is_overloaded:
             # Overloaded: demand exceeds the module pool.
-            # Guarantee one module per plugged EV (safe: num_modules >= n_dispensers >= n_evs),
+            # Guarantee one module per plugged EV (safe: num_modules >= n_connectors >= n_evs),
             # then greedily hand remaining modules to the largest unmet p_req.
             total_req = sum(ev.p_req for ev in pile.evs)
             if total_req <= 0:
@@ -67,20 +67,20 @@ class ProportionalPower(PowerPolicy):
                     f"Overloaded pile {pile.id} has total_req={total_req} <= 0"
                 )
             for connected in pile.evs:
-                pile.ev_modules[connected.dispenser_id] = 1
+                pile.ev_modules[connected.connector_id] = 1
             self._micro_distribute(pile)  # fills up to num_modules
         else:
             # Not overloaded: each EV can take its isolated ceil(p_req / p_module).
             # Epsilon guards against floating-point noise pushing a p_req that's
             # essentially a module multiple into the next ceil bucket.
             for connected in pile.evs:
-                pile.ev_modules[connected.dispenser_id] = ceil(
+                pile.ev_modules[connected.connector_id] = ceil(
                     connected.p_req / pile.p_module - 1e-9
                 )
 
     def _micro_distribute(self, pile: ChargingPile, ev: EV | None = None) -> None:
         """
-        Give any free modules to the dispenser with the largest remaining request.
+        Give any free modules to the connector with the largest remaining request.
         Optional `ev`: drop one of that EV's modules first (underutilization path).
         """
         if not pile.evs:
@@ -88,10 +88,10 @@ class ProportionalPower(PowerPolicy):
             return
 
         if ev is not None:
-            if ev.dispenser_id is None or pile.dispensers[ev.dispenser_id] is not ev:
+            if ev.connector_id is None or pile.connectors[ev.connector_id] is not ev:
                 raise ValueError("CHARGE_CHANGE EV is not on this pile")
-            if pile.ev_modules[ev.dispenser_id] > 0:
-                pile.ev_modules[ev.dispenser_id] -= 1
+            if pile.ev_modules[ev.connector_id] > 0:
+                pile.ev_modules[ev.connector_id] -= 1
 
         while sum(pile.ev_modules) < pile.num_modules:
             reqs = pile.remaining_reqs

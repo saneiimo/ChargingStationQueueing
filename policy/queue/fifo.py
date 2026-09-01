@@ -1,5 +1,5 @@
 """
-FIFO customer order; join the pile with the most free dispensers.
+FIFO customer order; join the pile with the most free connectors.
 
 Leaves waiting order unchanged (head-of-line). Pile routing and optional
 ``max_wait`` override live on ``QueuePolicy``.
@@ -10,7 +10,7 @@ from .base import QueuePolicy
 
 
 class FIFOQueuePolicy(QueuePolicy):
-    """HOL service; default free-dispenser pile choice."""
+    """HOL service; default free-connector pile choice."""
 
-    # _select_ev defaults to queue[0]; select_pile defaults to most free dispensers.
+    # _select_ev defaults to queue[0]; select_pile defaults to most free connectors.
     pass

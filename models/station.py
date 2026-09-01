@@ -29,30 +29,35 @@ class ChargingStation:
     def __init__(
         self,
         n_piles: int,
-        n_dispensers: int,
+        n_connectors: int,
         n_modules: int,
         p_module: float,
         queue_capacity: int,
         power_policy: PowerPolicy,
-        mean_interarrival: float,
+        mean_interarrival: float | None = None,
     ):
 
         self.n_piles = n_piles
-        self.n_dispensers = n_dispensers
+        self.n_connectors = n_connectors
         self.n_modules = n_modules
         self.p_module = p_module
         self.queue_capacity = queue_capacity
         self.power_policy = power_policy
         self.piles = [
-            ChargingPile(i, n_dispensers, n_modules, p_module, self) for i in range(n_piles)
+            ChargingPile(i, n_connectors, n_modules, p_module, self) for i in range(n_piles)
         ]
         # Mean inter-arrival time (minutes). Arrival rate λ = 1 / mean_interarrival.
         # Count in an interval of length t is Poisson(λ t); gaps are Exp(mean).
-        if mean_interarrival <= 0:
+        # None means the engine expects an externally-supplied arrival list
+        # instead of sampling its own Poisson process (see SimulationEngine
+        # .set_arrivals / simulation.arrivals.generate_arrivals).
+        if mean_interarrival is not None and mean_interarrival <= 0:
             raise ValueError(
                 f"mean_interarrival must be positive, got {mean_interarrival}"
             )
-        self.mean_interarrival = float(mean_interarrival)
+        self.mean_interarrival = (
+            float(mean_interarrival) if mean_interarrival is not None else None
+        )
         self.queue = deque()
         # Wired by SimulationEngine.__init__.
         self.engine: SimulationEngine | None = None
@@ -60,6 +65,11 @@ class ChargingStation:
     @property
     def arrival_rate(self) -> float:
         """Arrival rate λ (customers per minute) = 1 / mean_interarrival."""
+        if self.mean_interarrival is None:
+            raise ValueError(
+                "arrival_rate is undefined: mean_interarrival is None "
+                "(this station uses an externally-supplied arrival list)."
+            )
         return 1.0 / self.mean_interarrival
 
     # --------------------------------------------------

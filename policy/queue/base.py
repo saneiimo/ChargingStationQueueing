@@ -7,7 +7,7 @@ Assignment has two parts:
    on the base class serves overdue customers first (longest wait wins).
    Otherwise subclasses implement ``_select_ev``.
 2. **Which pile to use** — ``select_pile(obs, mask, rng)``. Default: join the
-   pile with the most free dispensers (random tie-break). Subclasses may override.
+   pile with the most free connectors (random tie-break). Subclasses may override.
 
 Heuristics should call ``decide(...)`` then pass both results into the env/engine:
 
@@ -29,7 +29,7 @@ if TYPE_CHECKING:
 
 
 class QueuePolicy(ABC):
-    """Shared max-wait override + default free-dispenser pile routing."""
+    """Shared max-wait override + default free-connector pile routing."""
 
     FEATURES_PER_PILE = 6
 
@@ -75,7 +75,7 @@ class QueuePolicy(ABC):
         """
         Choose a pile index allowed by ``action_mask``.
 
-        Default: most free dispensers (obs free_frac), random among ties.
+        Default: most free connectors (obs free_frac), random among ties.
         ``station`` is accepted for API symmetry / future pile rules.
         """
         del station  # unused by the default rule

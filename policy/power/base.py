@@ -2,7 +2,7 @@
 Interface for how a pile splits its power modules among plugged EVs.
 
 The SimulationEngine calls ``update_power`` after plug-in, departure, or a
-``CHARGE_CHANGE``. Implementations write ``pile.ev_modules[dispenser_id]`` and
+``CHARGE_CHANGE``. Implementations write ``pile.ev_modules[connector_id]`` and
 return ``(EV, allotted_kW)`` pairs so the engine can update each EV's ``p_act``.
 
 ``CHARGE_CHANGE`` (underuse reallocation) is **opt-in**. Set

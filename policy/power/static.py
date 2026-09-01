@@ -58,7 +58,7 @@ class StaticPower(PowerPolicy):
         del ev
 
         if not pile.evs:
-            pile.ev_modules = [0] * pile.n_dispensers
+            pile.ev_modules = [0] * pile.n_connectors
             return []
 
         self._distribute(pile)
@@ -66,12 +66,12 @@ class StaticPower(PowerPolicy):
 
         assignments: list[tuple[EV, float]] = []
         for connected in pile.evs:
-            power = pile.ev_modules[connected.dispenser_id] * pile.p_module
+            power = pile.ev_modules[connected.connector_id] * pile.p_module
             assignments.append((connected, power))
         return assignments
 
     def _clear_modules(self, pile: ChargingPile) -> None:
-        pile.ev_modules = [0] * pile.n_dispensers
+        pile.ev_modules = [0] * pile.n_connectors
 
     def _distribute(self, pile: ChargingPile) -> None:
         """Assign equal base modules, then one leftover each by unmet rank."""
@@ -80,23 +80,23 @@ class StaticPower(PowerPolicy):
         if n == 0:
             return
 
-        # Safe: station requires num_modules >= n_dispensers >= n plugged EVs.
+        # Safe: station requires num_modules >= n_connectors >= n plugged EVs.
         base = pile.num_modules // n
         leftovers = pile.num_modules - base * n
         for connected in pile.evs:
-            pile.ev_modules[connected.dispenser_id] = base
+            pile.ev_modules[connected.connector_id] = base
 
         if leftovers == 0:
             return
 
         # Rank once by unmet request after the equal base (descending).
-        # Ties broken by dispenser_id so the assignment is deterministic.
+        # Ties broken by connector_id so the assignment is deterministic.
         ranked = sorted(
             pile.evs,
             key=lambda e: (
                 -(e.p_req - base * pile.p_module),
-                e.dispenser_id,
+                e.connector_id,
             ),
         )
         for connected in ranked[:leftovers]:
-            pile.ev_modules[connected.dispenser_id] += 1
+            pile.ev_modules[connected.connector_id] += 1
