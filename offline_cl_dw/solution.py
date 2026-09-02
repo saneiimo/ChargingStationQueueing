@@ -103,10 +103,33 @@ def extract_solution(
     """Build a ``DWSolution`` from an integer master result -- assigns
     connectors (10.1) and checks (not repairs) whole-module feasibility
     (10.2); see ``postprocess.rounded_module_routing`` if you need an
-    actual whole-module routing, not just the pass/fail check."""
+    actual whole-module routing, not just the pass/fail check. Prints a
+    warning (does not raise, does not repair) if the check fails -- see the
+    warning's own text for why ``UB`` stops being a valid upper bound on
+    the true (whole-module) optimum in that case, even though ``LB``
+    remains valid regardless."""
     h = delta / 60.0
     connectors = assign_connectors(chosen, station)
     failures = whole_module_failures(chosen, station)
+    if failures:
+        # (26) only enforces the *continuous*-module relaxation
+        # (Proposition 2), so the schedule UB was computed from may not be
+        # realisable with real, indivisible power modules at these
+        # pile-slots -- meaning it is not actually a feasible solution to
+        # the true (whole-module) problem, and UB is therefore not a valid
+        # upper bound on that problem's optimum until this is repaired
+        # (LB is unaffected: it lower-bounds the continuous relaxation,
+        # which is itself <= the true optimum, regardless of this check).
+        print(
+            f"WARNING: whole-module infeasible at {len(failures)} pile-slot(s) "
+            f"{failures[:5]}{', ...' if len(failures) > 5 else ''} -- UB's schedule "
+            "cannot actually be delivered with real, indivisible power modules there "
+            "(Proposition 2's continuous-module relaxation, not the true problem). "
+            "UB is NOT a valid upper bound on the true optimum until this is repaired "
+            "-- rerun with conservative_modules=True, or see "
+            "postprocess.rounded_module_routing / Section 10.2 for other repair "
+            "options. LB remains a valid lower bound regardless."
+        )
 
     rows: list[dict[str, object]] = []
     for v in vehicles:
