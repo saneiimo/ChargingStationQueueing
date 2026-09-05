@@ -109,6 +109,19 @@ class ChargingStation:
             return None
         return self.queue.popleft()
 
+    def clear_queue(self) -> list[EV]:
+        """
+        Remove and return every EV currently waiting, in queue order.
+
+        Only used by ``SimulationEngine``'s optional warm-up queue flush
+        (``flush_queue_at_warmup``) -- not part of normal DES operation.
+        Vehicles already plugged into a pile are untouched (this only ever
+        looks at ``self.queue``).
+        """
+        flushed = list(self.queue)
+        self.queue.clear()
+        return flushed
+
     def assign_ev(self, pile: ChargingPile, ev: EV | None = None):
         """
         Move a waiting EV onto ``pile``.

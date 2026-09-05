@@ -63,6 +63,9 @@ class ChargingStationEnv(gym.Env):
         max_time: float | None = None,
         battery_cap_options: Sequence[float] | None = None,
         arrivals: list[EV] | None = None,
+        delta_arr: float | None = None,
+        warmup_period: float | None = None,
+        flush_queue_at_warmup: bool = False,
     ):
         """
         Parameters
@@ -73,7 +76,10 @@ class ChargingStationEnv(gym.Env):
             over ``arrivals`` when both are given. Pass ``None`` to run only
             off an externally-supplied ``arrivals`` list.
         max_time :
-            Episode length (minutes). Defaults to ``config.MAX_TIME``.
+            Length of the *measured* phase (minutes) -- i.e. everything
+            after any warm-up period; defaults to ``config.MAX_TIME``. See
+            ``warmup_period`` below and ``SimulationEngine``'s own module
+            docstring, "Warm-up period", for how the two combine.
         battery_cap_options :
             Battery capacities (kW*min, same units as
             ``config.BATTERY_CAP_OPTIONS``) sampled when generating arrivals
@@ -83,6 +89,30 @@ class ChargingStationEnv(gym.Env):
             ``simulation.arrivals.generate_arrivals``), used only while
             ``mean_interarrival`` is None. Installed once here; also
             overridable per call via ``reset(options={"arrivals": [...]})``.
+        delta_arr :
+            Arrival-time grid in minutes. ``None`` keeps continuous times.
+            A positive ``d`` snaps every arrival (sampled or external) to the
+            nearest multiple of ``d``; see ``simulation.arrivals``.
+        warmup_period :
+            Minutes to run *before* the measured phase begins. ``None``
+            (the default) uses ``config.WARMUP_PERIOD`` -- ``0.0`` out of
+            the box, i.e. no warm-up, fully backward compatible -- same
+            "``None`` reads the config default" convention as ``max_time``.
+            The DES runs ``[0, warmup_period]`` first, then ``max_time``
+            more. Passed straight through to ``SimulationEngine`` -- see
+            its module docstring for the full mechanics (the WARMUP_END
+            sentinel event, the queued/in-service snapshot it always
+            records on ``self.engine.metrics``, and how post-warm-up-only
+            reporting works via ``metrics.validate.report_queueing_laws
+            (post_warmup_only=True)``). The *resolved* value (never
+            ``None``) is read back from ``self.engine.warmup_period`` after
+            construction -- ``self.warmup_period`` here just mirrors
+            whatever was passed in, same as ``self.mean_interarrival``/
+            ``self.delta_arr`` do.
+        flush_queue_at_warmup :
+            If True, empty the live queue at t=warmup_period (only the
+            queue -- EVs already plugged in are left alone; see
+            ``SimulationEngine``). No effect when ``warmup_period`` is 0.
         """
         super().__init__()
 
@@ -95,6 +125,9 @@ class ChargingStationEnv(gym.Env):
         self.p_module = p_module
         self.queue_capacity = queue_capacity
         self.mean_interarrival = mean_interarrival
+        self.delta_arr = delta_arr
+        self.warmup_period = warmup_period
+        self.flush_queue_at_warmup = flush_queue_at_warmup
         self.queue_holding_cost = queue_holding_cost
         self.drop_penalty = drop_penalty
         self.battery_cap_options = (
@@ -119,6 +152,9 @@ class ChargingStationEnv(gym.Env):
             EventQueue(),
             max_time=max_time,
             battery_cap_options=self.battery_cap_options,
+            delta_arr=delta_arr,
+            warmup_period=warmup_period,
+            flush_queue_at_warmup=flush_queue_at_warmup,
         )
         if arrivals is not None:
             self.engine.set_arrivals(arrivals)

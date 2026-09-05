@@ -1,13 +1,18 @@
 """
 Timed events for the discrete-event simulator.
 
-The engine keeps a min-heap of Event objects. ARRIVAL and SIM_OVER are always
-kept. DEPARTURE and CHARGE_CHANGE carry an event_id that must match the EV's
-current event_generation; otherwise they are stale (power was redistributed
-and a newer event replaced them) and get skipped.
+The engine keeps a min-heap of Event objects. ARRIVAL, SIM_OVER, and
+WARMUP_END are always kept. DEPARTURE and CHARGE_CHANGE carry an event_id
+that must match the EV's current event_generation; otherwise they are stale
+(power was redistributed and a newer event replaced them) and get skipped.
 
 CHARGE_CHANGE is scheduled only when the station's power policy sets
 ``supports_underuse_reallocation`` (Proportional yes, Static no).
+
+WARMUP_END fires once, at t = engine.warmup_period, only when a warm-up
+period was requested (warmup_period > 0). It carries no ``obj``/``event_id``
+(like SIM_OVER) -- it is not tied to any one EV. See
+``SimulationEngine._handle_warmup_end`` for what it does.
 """
 
 from __future__ import annotations
@@ -41,7 +46,8 @@ class EventType(Enum):
     DEPARTURE = 2  # EV reaches target SoC and leaves its connector
     # Opt-in via PowerPolicy.supports_underuse_reallocation (Prop yes, Static no).
     CHARGE_CHANGE = 3  # EV underuses a module; policy may free/redistribute it
-    SIM_OVER = 4  # Hard stop at MAX_TIME
+    SIM_OVER = 4  # Hard stop at engine.max_time (= warmup_period + measurement_horizon)
+    WARMUP_END = 5  # Boundary between the warm-up phase and the measured phase
 
 
 class EventQueue:

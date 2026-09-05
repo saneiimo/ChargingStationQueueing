@@ -24,12 +24,18 @@ BATTERY_CAP_OPTIONS = [50, 80, 120]
 # we need a unit conversion, as the simulation time is in minutes
 HR2MIN = 60
 BATTERY_CAP_OPTIONS = [cap * HR2MIN for cap in BATTERY_CAP_OPTIONS]
-SOC_I_BOUNDS = [0.1, 0.3]
+SOC_I_BOUNDS = [0.15, 0.35]
 SOC_F_BOUNDS = [0.7, 0.9]
 # C-rate: peak request p_req_max = battery_capacity_kWh * C_RATE.
 C_RATE = 2 / HR2MIN
-# Episode length (minutes).
+# Episode length (minutes) -- the *measured* phase; see WARMUP_PERIOD below.
 MAX_TIME = HR2MIN * 12
+
+# Warm-up length (minutes) run *before* the measured phase, default used by
+# SimulationEngine/ChargingStationEnv whenever warmup_period=None is passed
+# (their own default). 0.0 means "no warm-up" -- fully backward compatible.
+# See simulation/engine.py's own module docstring, "Warm-up period".
+WARMUP_PERIOD = 0.0
 
 # If True, piles assert connector/module consistency after redistributions.
 CHECK_INVARIANTS = True
