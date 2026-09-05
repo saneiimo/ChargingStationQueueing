@@ -57,9 +57,13 @@ class DWSolution:
     ``UB``'s) cost already converted to sojourn minutes -- mirrors
     ``offline_cl_opt.solution.ConnectorLaneSolution`` exactly (``delta*
     objective - sum_j a_j``) and equals ``per_vehicle["sojourn_min"].sum()``
-    /``.mean()``. ``total_sojourn_LB`` applies the same conversion to
-    ``LB`` instead, so it -- not ``LB`` itself -- is what should be
-    compared against a simulation's total sojourn.
+    /``.mean()``. ``total_sojourn_LB``/``mean_sojourn_LB`` apply the same
+    conversion to ``LB`` instead, so those -- not ``LB`` itself -- are what
+    should be compared against a simulation's total/mean sojourn. Both LB
+    conversions are themselves valid bounds: Section 6.4's
+    ``T_bar = (delta*z - sum_j a_j)/J`` is strictly increasing in ``z``, so
+    ``LB <= z*`` carries straight through to
+    ``mean_sojourn_LB <= optimal mean sojourn``.
 
     ``columns_purged`` is copied straight from ``ColGenResult.columns_purged``
     (Section 8.3) -- the cumulative count of non-basic columns swept out of
@@ -75,6 +79,7 @@ class DWSolution:
     total_sojourn_UB: float
     mean_sojourn_UB: float
     total_sojourn_LB: float
+    mean_sojourn_LB: float
     converged: bool
     iterations: int
     columns_purged: int
@@ -160,6 +165,7 @@ def extract_solution(
     total_sojourn_UB = delta * UB - total_arrival
     mean_sojourn_UB = total_sojourn_UB / n if n else 0.0
     total_sojourn_LB = delta * LB - total_arrival
+    mean_sojourn_LB = total_sojourn_LB / n if n else 0.0
 
     return DWSolution(
         LB=LB,
@@ -169,6 +175,7 @@ def extract_solution(
         total_sojourn_UB=total_sojourn_UB,
         mean_sojourn_UB=mean_sojourn_UB,
         total_sojourn_LB=total_sojourn_LB,
+        mean_sojourn_LB=mean_sojourn_LB,
         converged=converged,
         iterations=iterations,
         columns_purged=columns_purged,
