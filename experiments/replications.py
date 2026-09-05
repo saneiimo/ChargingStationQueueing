@@ -33,6 +33,13 @@ from policy.queue.base import QueuePolicy
 #   avg wait time     = mean queue wait W_q
 #   avg charge time   = mean service / plug-in time S
 #   avg sys time      = mean sojourn W = W_q + S
+#
+# All whole-run (since=0.0, i.e. including any warm-up period the scenario
+# configured -- see simulation/engine.py's own module docstring, "Warm-up
+# period"). DEFAULT_METRICS_POST_WARMUP below is the measured-phase-only
+# counterpart, same names, same order -- run_replications computes both
+# from the same episode (no extra simulation cost) and reports them as
+# separate columns.
 DEFAULT_METRICS: dict[str, Callable[[ChargingStationEnv], float]] = {
     "finished EVs": lambda e: float(len(e.engine.metrics.finished_evs)),
     "dropped EVs": lambda e: float(len(e.engine.metrics.dropped_evs)),
@@ -50,6 +57,44 @@ DEFAULT_METRICS: dict[str, Callable[[ChargingStationEnv], float]] = {
     "util_rho_theory": lambda e: e.engine.metrics.queueing_summary(
         e.engine.current_time,
         n_servers=e.engine.station.n_piles * e.engine.station.n_connectors,
+    )["rho_theory"],
+}
+
+# Same metric names, restricted to the measured phase only -- `since=
+# e.engine.warmup_period` is resolved per-env at call time (not baked in
+# here), so this one dict works across a whole policy-comparison grid even
+# if different scenarios in it configure different warm-up periods.
+# Identical values to DEFAULT_METRICS whenever a scenario's warmup_period
+# is 0 (the default), so this is purely additive -- see MetricsTracker's
+# own module docstring, "Warm-up period", for the cohort-filter (per-
+# customer stats: finished/dropped counts, waits, sojourns) vs.
+# time-window (station-level: L, Q, energy, utilization) distinction each
+# entry below follows.
+DEFAULT_METRICS_POST_WARMUP: dict[str, Callable[[ChargingStationEnv], float]] = {
+    "finished EVs": lambda e: float(
+        len(e.engine.metrics.finished_time_arrays(e.engine.warmup_period)[2])
+    ),
+    "dropped EVs": lambda e: float(
+        sum(1 for ev in e.engine.metrics.dropped_evs if ev.arrival_time >= e.engine.warmup_period)
+    ),
+    "total energy delivered (kWh)": lambda e: e.engine.metrics.total_energy(
+        e.engine.warmup_period
+    ),
+    "average L": lambda e: e.engine.metrics.average_L(e.engine.warmup_period),
+    "average Q": lambda e: e.engine.metrics.average_Q(e.engine.warmup_period),
+    "avg wait time": lambda e: e.engine.metrics.mean_wait(e.engine.warmup_period),
+    "max wait time": lambda e: e.engine.metrics.max_wait(e.engine.warmup_period),
+    "avg charge time": lambda e: e.engine.metrics.mean_service(e.engine.warmup_period),
+    "avg sys time": lambda e: e.engine.metrics.mean_sojourn(e.engine.warmup_period),
+    "util_rho_sim": lambda e: e.engine.metrics.queueing_summary(
+        e.engine.current_time,
+        n_servers=e.engine.station.n_piles * e.engine.station.n_connectors,
+        since=e.engine.warmup_period,
+    )["rho_sim"],
+    "util_rho_theory": lambda e: e.engine.metrics.queueing_summary(
+        e.engine.current_time,
+        n_servers=e.engine.station.n_piles * e.engine.station.n_connectors,
+        since=e.engine.warmup_period,
     )["rho_theory"],
 }
 
@@ -194,7 +239,13 @@ def run_replications(
     Returns
     -------
     DataFrame
-        Index ``0 .. n_reps-1``, columns ``seed`` plus each metric.
+        Index ``0 .. n_reps-1``, columns ``seed``, each metric (whole-run,
+        the original column names), and each metric again as
+        ``"{name} (measured)"`` (measured-phase-only, i.e. post-warm-up --
+        see ``DEFAULT_METRICS_POST_WARMUP``'s own docstring). Both windows
+        come from the same simulated episode, at no extra simulation cost;
+        identical values in both columns whenever ``scenario`` didn't set
+        ``warmup_period`` (the default).
     """
     metric_names = _resolve_metrics(metrics)
     scenario = dict(scenario)
@@ -217,6 +268,7 @@ def run_replications(
         row: dict[str, float] = {"seed": float(seed)}
         for name in metric_names:
             row[name] = DEFAULT_METRICS[name](env)
+            row[f"{name} (measured)"] = DEFAULT_METRICS_POST_WARMUP[name](env)
         rows.append(row)
 
     return pd.DataFrame(rows)
