@@ -124,6 +124,13 @@ def validate_episode(
 
     finished = list(metrics.finished_evs)
     dropped = list(metrics.dropped_evs)
+    # Warm-up queue flush (SimulationEngine.flush_queue_at_warmup): EVs
+    # discarded from the queue at the warm-up boundary. Empty unless a
+    # warm-up flush actually happened -- see metrics_tracker.py's module
+    # docstring, "Warm-up period". They remain in `arrived` too (they
+    # really did arrive), so the conservation check below needs this as an
+    # explicit fifth bucket, not folded into `dropped`.
+    flushed = list(metrics.flushed_evs)
     arrived = list(metrics.arrived_evs)
     queued = list(station.queue)
     plugged = [ev for pile in station.piles for ev in pile.evs]
@@ -132,7 +139,8 @@ def validate_episode(
         print(
             "\n=== Episode validation ===\n"
             f"  arrived={len(arrived)}, finished={len(finished)}, "
-            f"dropped={len(dropped)}, queued={len(queued)}, plugged={len(plugged)}"
+            f"dropped={len(dropped)}, flushed={len(flushed)}, "
+            f"queued={len(queued)}, plugged={len(plugged)}"
         )
 
     # --- Finished EV checks -------------------------------------------------
@@ -279,15 +287,49 @@ def validate_episode(
         verbose=verbose,
     )
 
+    # --- Flushed EV checks (warm-up queue flush) -----------------------------
+    # Same shape as the dropped-EV check above: a flushed EV was only ever
+    # waiting in the queue, never plugged in -- see
+    # SimulationEngine.flush_queue_at_warmup / metrics_tracker.py's module
+    # docstring, "Warm-up period". Trivially passes (no flushed EVs to
+    # check) whenever no warm-up flush happened.
+    flush_bad: list[str] = []
+    for ev in flushed:
+        if ev.service_start_time is not None or ev.charge_trace:
+            flush_bad.append(
+                f"EV {ev.id}: service_start={ev.service_start_time}, "
+                f"trace_len={len(ev.charge_trace)}"
+            )
+    _check(
+        report,
+        "Flushed: never got service_start_time / empty charge_trace",
+        not flush_bad,
+        (
+            f"ok for all flushed EVs"
+            if not flush_bad
+            else f"{len(flush_bad)} failures; e.g. {flush_bad[0]}"
+        ),
+        verbose=verbose,
+    )
+
     # --- Conservation of arrivals -------------------------------------------
-    rhs = len(finished) + len(dropped) + len(queued) + len(plugged)
+    # `flushed` is a fifth bucket, not a subset of `dropped`: a flushed EV
+    # remains in `arrived` (it really did arrive) but is no longer in
+    # `queued` once removed, so it must appear explicitly on the right-hand
+    # side or this invariant fails the moment a warm-up flush happens. With
+    # no warm-up flush, flushed=[] and this is identical to the original
+    # (pre-warm-up-feature) check.
+    rhs = len(finished) + len(dropped) + len(flushed) + len(queued) + len(plugged)
     lhs = len(arrived)
     cons_ok = lhs == rhs
     _check(
         report,
-        "arrived = finished + dropped + queued + plugged",
+        "arrived = finished + dropped + flushed + queued + plugged",
         cons_ok,
-        f"{lhs} vs {len(finished)}+{len(dropped)}+{len(queued)}+{len(plugged)}={rhs}",
+        (
+            f"{lhs} vs {len(finished)}+{len(dropped)}+{len(flushed)}+"
+            f"{len(queued)}+{len(plugged)}={rhs}"
+        ),
         verbose=verbose,
     )
 
@@ -303,6 +345,7 @@ def report_queueing_laws(
     env_or_engine: ChargingStationEnv | SimulationEngine,
     *,
     verbose: bool = False,
+    post_warmup_only: bool = False,
 ) -> dict[str, float]:
     """
     Print / return Little's law (system / queue) and connector utilization.
@@ -316,11 +359,19 @@ def report_queueing_laws(
         ``ChargingStationEnv`` or ``SimulationEngine``.
     verbose :
         If True, print the summary. If False, return the dict silently.
+    post_warmup_only :
+        If True, restrict the summary to the post-warm-up window
+        (``since=metrics.warmup_period`` -- see ``MetricsTracker``'s module
+        docstring, "Warm-up period"). ``0.0`` if no warm-up period was set,
+        in which case this flag has no effect. If False (default), report
+        over the whole run -- identical to this function's behaviour before
+        the warm-up feature existed.
 
     Returns
     -------
     dict
-        Same keys as ``MetricsTracker.queueing_summary``.
+        Same keys as ``MetricsTracker.queueing_summary`` (includes
+        ``since``, so the caller can always see which window was used).
 
     Raises
     ------
@@ -335,14 +386,18 @@ def report_queueing_laws(
     station = engine.station
     T = float(engine.current_time) if engine.current_time > 0 else 1.0
     c = station.n_piles * station.n_connectors
+    since = metrics.warmup_period if post_warmup_only else 0.0
 
     try:
-        out = metrics.queueing_summary(T, n_servers=c)
+        out = metrics.queueing_summary(T, n_servers=c, since=since)
     except MetricsError as exc:
         raise EpisodeValidationError(str(exc)) from exc
 
     if verbose:
-        print("\n=== Queueing laws ===")
+        window_label = (
+            f"post-warm-up, t>={since:g}" if since > 0 else "full run"
+        )
+        print(f"\n=== Queueing laws ({window_label}) ===")
         print(
             f"  T={out['T']:.1f} min, finished={int(out['n_finished'])}, "
             f"c={int(out['c'])} servers"
