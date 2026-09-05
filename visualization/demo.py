@@ -17,6 +17,7 @@ def run_fifo_episode(
     mean_interarrival: float = 5.0,
     seed: int = 42,
     policy_seed: int = 1,
+    delta_arr: float | None = None,
 ) -> ChargingStationEnv:
     """Roll out one full day under FIFO pile choice (records charge traces)."""
     env = ChargingStationEnv(
@@ -26,6 +27,7 @@ def run_fifo_episode(
         p_module=p_module,
         queue_capacity=queue_capacity,
         mean_interarrival=mean_interarrival,
+        delta_arr=delta_arr,
     )
     obs, _ = env.reset(seed=seed)
     rng = np.random.default_rng(policy_seed)

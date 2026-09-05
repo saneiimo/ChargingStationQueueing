@@ -599,6 +599,15 @@ def main(argv: list[str] | None = None) -> None:
         help="Mean inter-arrival time in minutes (arrival rate λ = 1 / this)",
     )
     parser.add_argument(
+        "--delta-arr",
+        type=float,
+        default=None,
+        help=(
+            "Snap arrivals to the nearest multiple of this many minutes "
+            "(omit for continuous Poisson times)"
+        ),
+    )
+    parser.add_argument(
         "--save",
         type=str,
         default=None,
@@ -660,6 +669,7 @@ def main(argv: list[str] | None = None) -> None:
         p_module=args.p_module,
         mean_interarrival=args.mean_interarrival,
         seed=args.seed,
+        delta_arr=args.delta_arr,
     )
     print(
         f"Done: t={env.engine.current_time:.1f}, "

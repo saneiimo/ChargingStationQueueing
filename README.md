@@ -11,18 +11,19 @@ Read the code in this order the first time through:
 1. `config.py` — shared constants (taper threshold, module check, episode length, rewards).
 2. `models/` — physical objects: station, piles, EVs.
 3. `simulation/event.py` — timed events on a min-heap.
-4. `simulation/engine.py` — the clock: advance time, project SoC, process events.
-5. `policy/power/` — how a pile splits its power modules among plugged EVs.
-6. `policy/queue/` — baseline rules for choosing a pile (e.g. FIFO / join-shortest).
-7. `metrics/` — L, Q, energy, utilization collected while the engine runs.
-8. `env/charging_env.py` — Gym API: agent only acts at assignment decision points.
-9. `main.py` — short script that rolls out the FIFO baseline.
-10. Notebooks at the repo root (run with the project root as the working
+4. `simulation/arrivals.py` — Poisson sampling and optional `delta_arr` time grid.
+5. `simulation/engine.py` — the clock: advance time, project SoC, process events.
+6. `policy/power/` — how a pile splits its power modules among plugged EVs.
+7. `policy/queue/` — baseline rules for choosing a pile (e.g. FIFO / join-shortest).
+8. `metrics/` — L, Q, energy, utilization collected while the engine runs.
+9. `env/charging_env.py` — Gym API: agent only acts at assignment decision points.
+10. `main.py` — short script that rolls out the FIFO baseline.
+11. Notebooks at the repo root (run with the project root as the working
     directory / kernel cwd so package imports resolve):
     - `simulate_episode.ipynb` — one DES episode + validation / power plots
     - `compare_policies.ipynb` — Monte Carlo replications across queue/power policies
     - `offline_opt.ipynb` — clairvoyant MILP / relaxation bounds on a toy instance
-11. `offline_opt/` — offline (clairvoyant) lower-bound MILP for total sojourn
+12. `offline_opt/` — offline (clairvoyant) lower-bound MILP for total sojourn
     time, solved with gurobipy. Given full knowledge of arrivals up front, its
     optimum lower-bounds every causal queue/power policy's cost on the same
     instance — the benchmark to compare FIFO / heuristics / RL against. See
@@ -66,6 +67,14 @@ Read the code in this order the first time through:
 - An **EV** arrives, waits in queue, gets assigned to one pile, charges until its
   target SoC, then leaves. Charging power follows a constant-then-taper curve.
 
+Arrival times are a Poisson process (exponential gaps). Pass
+`delta_arr=None` (the default) to keep those continuous times. Set
+`delta_arr=d` on `generate_arrivals`, `ChargingStationEnv`, or
+`SimulationEngine` to snap each arrival to the **nearest multiple of `d`
+minutes** (`round(t / d) * d`). For example at `t = 3.69`: `d=1` → 4,
+`d=2` → 4, `d=3` → 3, `d=5` → 5.0. The same snap is applied to an
+externally supplied arrival list.
+
 Power on a pile is **redistributed** when someone plugs in, leaves, or starts
 under-using a module (`CHARGE_CHANGE`). That logic lives in `policy/power/`, not
 in the RL agent. The agent only chooses the pile for the head-of-line EV.
@@ -80,6 +89,7 @@ python -m pytest tests/ -s -v
 
 # Individual suites
 python -m pytest tests/test_simulation_env.py -s -v
+python -m pytest tests/test_arrivals.py -s -v
 python -m pytest tests/test_queueing_laws.py -s -v
 python tests/test_simulation_env.py
 python tests/test_queueing_laws.py
@@ -89,6 +99,7 @@ In a notebook:
 
 ```python
 !python -m pytest tests/test_simulation_env.py -s -v
+!python -m pytest tests/test_arrivals.py -s -v
 !python -m pytest tests/test_queueing_laws.py -s -v
 ```
 
