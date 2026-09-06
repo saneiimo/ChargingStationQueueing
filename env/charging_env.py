@@ -65,7 +65,7 @@ class ChargingStationEnv(gym.Env):
         arrivals: list[EV] | None = None,
         delta_arr: float | None = None,
         warmup_period: float | None = None,
-        flush_queue_at_warmup: bool = False,
+        flush_queue_at_warmup: bool | None = None,
     ):
         """
         Parameters
@@ -112,7 +112,9 @@ class ChargingStationEnv(gym.Env):
         flush_queue_at_warmup :
             If True, empty the live queue at t=warmup_period (only the
             queue -- EVs already plugged in are left alone; see
-            ``SimulationEngine``). No effect when ``warmup_period`` is 0.
+            ``SimulationEngine``). ``None`` (the default) uses
+            ``config.FLUSH_QUEUE_AT_WARMUP`` (``False`` out of the box).
+            No effect when ``warmup_period`` is 0.
         """
         super().__init__()
 

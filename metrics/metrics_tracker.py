@@ -87,6 +87,7 @@ depending on what kind of statistic it is:
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import numpy as np
@@ -557,9 +558,32 @@ class MetricsTracker:
     # Offline: finished-EV time samples
     # ------------------------------------------------------------------
 
+    def cohort_ev_ids(self, *, queued: bool = False, boundary: bool = False) -> set[int]:
+        """
+        Ids of the boundary cohorts, for use as ``include_ids`` below.
+
+        ``queued`` adds ``queued_at_warmup_end`` (waiting at the boundary),
+        ``boundary`` adds ``in_service_at_warmup_end`` (already plugged in
+        at it). Both arrived *before* ``warmup_period``, so the ordinary
+        ``since=warmup_period`` filter excludes them -- these are exactly
+        the ids you pass to add them back. Mirrors
+        ``offline_cl_opt.boundary.Cohort``'s QUEUED / BOUNDARY, so the
+        simulation and the optimizer can be made to report over the same
+        vehicle set.
+        """
+        ids: set[int] = set()
+        if queued:
+            ids.update(ev.id for ev in self.queued_at_warmup_end)
+        if boundary:
+            ids.update(snap.ev_id for snap in self.in_service_at_warmup_end)
+        return ids
+
     def finished_time_arrays(
         self,
         since: float = 0.0,
+        *,
+        include_ids: set[int] | None = None,
+        truncate_included: bool = True,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Per-finished-EV wait, service, and sojourn times (minutes).
@@ -576,12 +600,28 @@ class MetricsTracker:
         if they finish after it; see the module docstring). Default
         ``0.0`` includes everyone, matching the original behaviour exactly.
 
+        ``include_ids`` : additionally keep these EVs even though they
+        arrived before ``since`` -- build it with ``cohort_ev_ids`` to fold
+        the boundary queue and/or the already-charging vehicles back into a
+        measured-window report.
+
+        ``truncate_included`` : measure the added EVs' times from ``since``
+        rather than from their real arrival, i.e. count only the part of
+        their stay that falls inside the measured window. On by default
+        because that is what makes the figures comparable with the offline
+        models, which place these vehicles at ``a=0`` and so measure them
+        from the boundary too (see ``offline_cl_opt.boundary``). Set
+        ``False`` for their true end-to-end times, which are the right
+        thing for a "how long did this driver actually wait" question but
+        *not* comparable against an optimizer's mean sojourn.
+
         Raises
         ------
         MetricsError
             If any finished EV is missing ``service_start_time`` or has a
             non-finite ``departure_time`` (logical bug: finished implies served).
         """
+        include_ids = include_ids or set()
         waits: list[float] = []
         services: list[float] = []
         sojourns: list[float] = []
@@ -593,11 +633,15 @@ class MetricsTracker:
                     f"service_start_time={ev.service_start_time}, "
                     f"departure_time={ev.departure_time}. Check!"
                 )
-            if ev.arrival_time < since:
+            added = ev.arrival_time < since and ev.id in include_ids
+            if ev.arrival_time < since and not added:
                 continue
-            waits.append(ev.service_start_time - ev.arrival_time)
-            services.append(ev.departure_time - ev.service_start_time)
-            sojourns.append(ev.departure_time - ev.arrival_time)
+            # Clock each added EV from the window start, not its real
+            # arrival, so its numbers mean the same thing the optimizer's do.
+            origin = since if (added and truncate_included) else ev.arrival_time
+            waits.append(max(0.0, ev.service_start_time - origin))
+            services.append(ev.departure_time - max(ev.service_start_time, origin))
+            sojourns.append(ev.departure_time - origin)
 
         return (
             np.asarray(waits, dtype=float),
@@ -605,40 +649,220 @@ class MetricsTracker:
             np.asarray(sojourns, dtype=float),
         )
 
-    def mean_wait(self, since: float = 0.0) -> float:
+    def sojourn_by_cohort(
+        self, since: float = 0.0, *, truncate_included: bool = True
+    ) -> dict[str, dict[str, float]]:
+        """
+        Total/mean sojourn over the same three nested cohorts the offline
+        models report (``offline_cl_opt.boundary.COHORT_LEVELS``):
+        ``"measurement"`` (arrived after ``since``), ``"measurement_queued"``
+        (plus those queued at the boundary) and ``"all"`` (plus those
+        already charging at it). Each value is ``{"n", "total_sojourn",
+        "mean_sojourn"}``.
+
+        Pass ``since=metrics.warmup_period`` to get the measured-window
+        figures directly comparable with ``ConnectorLaneSolution.by_cohort``
+        / ``DWSolution.by_cohort`` on the same run.
+        """
+        levels = (
+            ("measurement", {"queued": False, "boundary": False}),
+            ("measurement_queued", {"queued": True, "boundary": False}),
+            ("all", {"queued": True, "boundary": True}),
+        )
+        out: dict[str, dict[str, float]] = {}
+        for name, flags in levels:
+            _, _, sojourns = self.finished_time_arrays(
+                since,
+                include_ids=self.cohort_ev_ids(**flags),  # type: ignore[arg-type]
+                truncate_included=truncate_included,
+            )
+            out[name] = {
+                "n": float(sojourns.size),
+                "total_sojourn": float(np.sum(sojourns)) if sojourns.size else 0.0,
+                "mean_sojourn": float(np.mean(sojourns)) if sojourns.size else 0.0,
+            }
+        return out
+
+    def grid_sojourn_by_cohort(
+        self, delta: float, since: float = 0.0
+    ) -> dict[str, dict[str, float]]:
+        """
+        This run's own schedule replayed on a ``delta`` slot grid, reported
+        over the same three nested cohorts as ``sojourn_by_cohort``.
+
+        Why this exists. The DES is continuous-time: a connector passes to
+        the next vehicle the *instant* the previous one finishes. The
+        offline models put every plug-in and departure on a slot boundary
+        (assumption A1), so each handover costs the successor up to
+        ``delta`` minutes. Comparing an optimum against the raw
+        continuous-time mean is therefore apples-to-oranges -- that mean is
+        not achievable by any grid schedule. This replays the *same*
+        schedule on the grid, which is the like-for-like number.
+
+        Method. Group finished vehicles by the physical lane they used
+        (pile *and* connector -- a connector index alone is ambiguous once
+        there is more than one pile), walk each lane's handover chain in
+        service order, and give every vehicle ``ceil(service_minutes /
+        delta)`` slots, starting no earlier than both its own release slot
+        and its predecessor's discretized departure. Only the part of a
+        stay inside the window counts, so a vehicle already charging at
+        ``since`` is not charged for its warm-up time -- the same
+        convention the offline models use when they place such a vehicle at
+        ``a=0``.
+
+        Note this rounds each *stay* up once. Rounding a stay's two
+        endpoints up independently instead would compress it (an 18.21
+        minute stay squeezed into 18 slots) and produce departure times no
+        policy can actually achieve -- which the offline model rejects via
+        its earliest-departure bound (24).
+
+        Caveats. Like ``sojourn_by_cohort`` this covers finished vehicles
+        only. And it replays *occupancy*, not power: it assumes each
+        vehicle still needs the same charging time after being shifted onto
+        the grid. Shifting changes which vehicles overlap, hence how the
+        pile's modules are shared, so the result is a close reconstruction
+        rather than a guaranteed-feasible schedule for the offline model.
+
+        Returns, per cohort level, ``{"n", "total_sojourn", "mean_sojourn",
+        "total_departure_slots"}``. The last is ``sum_j D_j`` in the offline
+        objective's own slot units, directly comparable with
+        ``ConnectorLaneSolution.objective`` when the objective covers the
+        matching cohorts.
+        """
+        if delta <= 0:
+            raise ValueError(f"delta must be positive, got {delta}")
+
+        # Vehicles that actually held a lane inside the window.
+        active = [
+            ev
+            for ev in self.finished_evs
+            if ev.service_start_time is not None
+            and np.isfinite(ev.departure_time)
+            and ev.departure_time > since
+            and ev.pile_tracker is not None
+            and ev.connector_id_tracker is not None
+        ]
+
+        lanes: dict[tuple[int, int], list["EV"]] = {}
+        for ev in active:
+            lanes.setdefault(
+                (ev.pile_tracker.id, ev.connector_id_tracker), []  # type: ignore[union-attr]
+            ).append(ev)
+
+        departure_slot: dict[int, int] = {}
+        for group in lanes.values():
+            group.sort(key=lambda e: e.service_start_time)  # type: ignore[arg-type,return-value]
+            lane_free = 0
+            for ev in group:
+                a_rel = max(0.0, ev.arrival_time - since)
+                served_from = max(float(ev.service_start_time), since)  # type: ignore[arg-type]
+                need = math.ceil(round((ev.departure_time - served_from) / delta, 9))
+                start = max(math.ceil(round(a_rel / delta, 9)), lane_free)
+                departure_slot[ev.id] = lane_free = start + max(need, 1)
+
+        by_id = {ev.id: ev for ev in active}
+        levels = (
+            ("measurement", {"queued": False, "boundary": False}),
+            ("measurement_queued", {"queued": True, "boundary": False}),
+            ("all", {"queued": True, "boundary": True}),
+        )
+        out: dict[str, dict[str, float]] = {}
+        for name, flags in levels:
+            keep = self.cohort_ev_ids(**flags)  # type: ignore[arg-type]
+            ids = [
+                j
+                for j in departure_slot
+                if by_id[j].arrival_time >= since or j in keep
+            ]
+            sojourns = [
+                delta * departure_slot[j] - max(0.0, by_id[j].arrival_time - since)
+                for j in ids
+            ]
+            out[name] = {
+                "n": float(len(ids)),
+                "total_sojourn": float(sum(sojourns)),
+                "mean_sojourn": float(sum(sojourns) / len(sojourns)) if sojourns else 0.0,
+                "total_departure_slots": float(sum(departure_slot[j] for j in ids)),
+            }
+        return out
+
+    def mean_wait(
+        self,
+        since: float = 0.0,
+        *,
+        include_ids: set[int] | None = None,
+        truncate_included: bool = True,
+    ) -> float:
         """Mean queue wait W_q among finished EVs (0 if none). See
-        ``finished_time_arrays`` for the ``since`` cohort convention."""
-        waits, _, _ = self.finished_time_arrays(since)
+        ``finished_time_arrays`` for the ``since`` cohort convention and the
+        ``include_ids``/``truncate_included`` keywords forwarded here."""
+        waits, _, _ = self.finished_time_arrays(
+            since, include_ids=include_ids, truncate_included=truncate_included
+        )
         return float(np.mean(waits)) if waits.size else 0.0
 
-    def max_wait(self, since: float = 0.0) -> float:
+    def max_wait(
+        self,
+        since: float = 0.0,
+        *,
+        include_ids: set[int] | None = None,
+        truncate_included: bool = True,
+    ) -> float:
         """Maximum queue wait W_q among finished EVs (0 if none)."""
-        waits, _, _ = self.finished_time_arrays(since)
+        waits, _, _ = self.finished_time_arrays(
+            since, include_ids=include_ids, truncate_included=truncate_included
+        )
         return float(np.max(waits)) if waits.size else 0.0
 
-    def mean_service(self, since: float = 0.0) -> float:
+    def mean_service(
+        self,
+        since: float = 0.0,
+        *,
+        include_ids: set[int] | None = None,
+        truncate_included: bool = True,
+    ) -> float:
         """
         Mean service / charge time S among finished EVs (0 if none).
 
         S = departure_time - service_start_time (minutes plugged in).
         Replication tables report this as ``avg charge time``.
         """
-        _, services, _ = self.finished_time_arrays(since)
+        _, services, _ = self.finished_time_arrays(
+            since, include_ids=include_ids, truncate_included=truncate_included
+        )
         return float(np.mean(services)) if services.size else 0.0
 
-    def mean_sojourn(self, since: float = 0.0) -> float:
-        """Mean sojourn W among finished EVs (0 if none)."""
-        _, _, sojourns = self.finished_time_arrays(since)
+    def mean_sojourn(
+        self,
+        since: float = 0.0,
+        *,
+        include_ids: set[int] | None = None,
+        truncate_included: bool = True,
+    ) -> float:
+        """Mean sojourn W among finished EVs (0 if none). Pass
+        ``include_ids=metrics.cohort_ev_ids(queued=True, boundary=True)`` to
+        fold the boundary cohorts in -- see ``finished_time_arrays``."""
+        _, _, sojourns = self.finished_time_arrays(
+            since, include_ids=include_ids, truncate_included=truncate_included
+        )
         return float(np.mean(sojourns)) if sojourns.size else 0.0
 
-    def service_squared_cv(self, since: float = 0.0) -> float:
+    def service_squared_cv(
+        self,
+        since: float = 0.0,
+        *,
+        include_ids: set[int] | None = None,
+        truncate_included: bool = True,
+    ) -> float:
         """
         Squared coefficient of variation of service times, c_s^2 = Var(S)/E[S]^2.
 
         Uses sample variance (ddof=1). Returns NaN if fewer than two finished EVs
         or E[S] = 0.
         """
-        _, services, _ = self.finished_time_arrays(since)
+        _, services, _ = self.finished_time_arrays(
+            since, include_ids=include_ids, truncate_included=truncate_included
+        )
         if services.size < 2:
             return float("nan")
         S = float(np.mean(services))
@@ -656,6 +880,8 @@ class MetricsTracker:
         *,
         n_servers: int | None = None,
         since: float = 0.0,
+        include_ids: set[int] | None = None,
+        truncate_included: bool = True,
     ) -> dict[str, float]:
         """
         Little's law (system and queue) and utilization for the episode.
@@ -682,6 +908,16 @@ class MetricsTracker:
             statistics (``W``, ``W_q``, ``S``, ``n_finished``, ``E_avg``)
             are filtered to ``arrival_time >= since``. Default ``0.0`` is
             the whole run, matching the original behaviour exactly.
+        include_ids, truncate_included :
+            Forwarded to ``finished_time_arrays`` -- use
+            ``cohort_ev_ids(queued=..., boundary=...)`` to fold the
+            boundary cohorts back into the per-customer statistics.
+            Note these affect only the customer averages (``W``, ``W_q``,
+            ``S``, ``n_finished`` and hence ``lambda_eff``/``L_theory``/
+            ``Q_theory``); the time-average ``L_sim``/``Q_sim``/``rho_sim``
+            come from the online occupancy history and already count every
+            vehicle physically present in the window, whichever cohort it
+            belongs to.
 
         Returns
         -------
@@ -697,7 +933,9 @@ class MetricsTracker:
         window = float(sim_time) - since
         T = window if window > 0 else 1.0
 
-        waits, services, sojourns = self.finished_time_arrays(since)
+        waits, services, sojourns = self.finished_time_arrays(
+            since, include_ids=include_ids, truncate_included=truncate_included
+        )
         n_finished = int(sojourns.size)
         lambda_eff = n_finished / T
         W = float(np.mean(sojourns)) if sojourns.size else 0.0

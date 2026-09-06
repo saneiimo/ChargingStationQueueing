@@ -51,7 +51,7 @@ from metrics.metrics_tracker import InServiceAtBoundary, MetricsTracker
 from .event import EventQueue, Event, EventType
 from .arrivals import generate_arrivals, clone_arrivals, snap_arrivals, validate_delta_arr
 import numpy as np
-from config import MAX_TIME, WARMUP_PERIOD, CHECK_INVARIANTS
+from config import MAX_TIME, WARMUP_PERIOD, FLUSH_QUEUE_AT_WARMUP, CHECK_INVARIANTS
 
 
 class SimulationEngine:
@@ -66,7 +66,7 @@ class SimulationEngine:
         battery_cap_options: Sequence[float] | None = None,
         delta_arr: float | None = None,
         warmup_period: float | None = None,
-        flush_queue_at_warmup: bool = False,
+        flush_queue_at_warmup: bool | None = None,
     ):
         """
         Parameters
@@ -102,11 +102,14 @@ class SimulationEngine:
         flush_queue_at_warmup :
             If True, empty the live queue at the instant ``t=warmup_period``
             (only the queue -- EVs already plugged in are left alone).
-            Flushed EVs are recorded in ``metrics.flushed_evs`` and excluded
-            from every reported statistic, but remain in
-            ``metrics.arrived_evs`` (historical fact: they did arrive) --
-            see ``MetricsTracker``'s module docstring. No effect when
-            ``warmup_period`` is ``0`` (there is no boundary to flush at).
+            ``None`` (the default) uses ``config.FLUSH_QUEUE_AT_WARMUP``
+            (``False`` out of the box) -- same "``None`` reads the config
+            default" convention as ``warmup_period``/``max_time``. Flushed
+            EVs are recorded in ``metrics.flushed_evs`` and excluded from
+            every reported statistic, but remain in ``metrics.arrived_evs``
+            (historical fact: they did arrive) -- see ``MetricsTracker``'s
+            module docstring. No effect when ``warmup_period`` is ``0``
+            (there is no boundary to flush at).
         """
 
         self.station = station
@@ -124,7 +127,11 @@ class SimulationEngine:
                 f"(passed {warmup_period!r}; config.WARMUP_PERIOD={WARMUP_PERIOD})"
             )
         self.warmup_period = resolved_warmup_period
-        self.flush_queue_at_warmup = bool(flush_queue_at_warmup)
+        self.flush_queue_at_warmup = (
+            bool(flush_queue_at_warmup)
+            if flush_queue_at_warmup is not None
+            else FLUSH_QUEUE_AT_WARMUP
+        )
         # measurement_horizon: what `max_time` meant before warm-up existed
         # (length of the measured phase). max_time: reused as the *total*
         # episode horizon -- see the module docstring for why.

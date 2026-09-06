@@ -37,6 +37,11 @@ MAX_TIME = HR2MIN * 12
 # See simulation/engine.py's own module docstring, "Warm-up period".
 WARMUP_PERIOD = 0.0
 
+# Default for SimulationEngine/ChargingStationEnv's flush_queue_at_warmup
+# whenever flush_queue_at_warmup=None is passed (their own default) --
+# same "None reads this constant" convention as WARMUP_PERIOD/MAX_TIME.
+FLUSH_QUEUE_AT_WARMUP = False
+
 # If True, piles assert connector/module consistency after redistributions.
 CHECK_INVARIANTS = True
 
