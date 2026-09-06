@@ -22,6 +22,21 @@ Typical usage::
 
 from __future__ import annotations
 
+from .boundary import (
+    COHORTS_ALL,
+    COHORTS_MEASUREMENT,
+    COHORTS_MEASUREMENT_QUEUED,
+    BoundaryMode,
+    BoundaryVehicle,
+    Cohort,
+    MeasurementInstance,
+    assert_whole_module_feasible,
+    boundary_vehicles_from_in_service,
+    build_measurement_instance,
+    cohort_totals,
+    realized_slot_power,
+    vehicles_from_boundary,
+)
 from .instance import StationSpec, VehicleData, vehicles_from_evs
 from .model import ConnectorLaneModel, build_cl_model, solve_cl_model
 from .solution import ConnectorLaneSolution, extract_solution
@@ -46,6 +61,19 @@ __all__ = [
     "StationSpec",
     "VehicleData",
     "vehicles_from_evs",
+    "BoundaryMode",
+    "BoundaryVehicle",
+    "Cohort",
+    "COHORTS_MEASUREMENT",
+    "COHORTS_MEASUREMENT_QUEUED",
+    "COHORTS_ALL",
+    "MeasurementInstance",
+    "build_measurement_instance",
+    "vehicles_from_boundary",
+    "boundary_vehicles_from_in_service",
+    "realized_slot_power",
+    "assert_whole_module_feasible",
+    "cohort_totals",
     "ConnectorLaneModel",
     "build_cl_model",
     "solve_cl_model",

@@ -84,6 +84,48 @@ created (Section 5.2's note), which also makes the convention "u_{j,-1}=0"
 (Section 5.2) exact without a real k=-1 variable, and likewise
 ``x_{j,k_j} = 0`` (17) is never materialised as a variable -- see the
 per-vehicle loop below.
+
+Boundary conditions (vehicles already in the station at t=0)
+--------------------------------------------------------------
+``boundary_vehicles`` (see ``boundary.py``) lets ``vehicles`` include EVs
+that were already queued or already plugged in when the modeled horizon
+began (e.g. from a simulation's own warm-up boundary snapshot -- see
+``boundary.py``'s own module docstring). Queued-but-not-yet-plugged
+vehicles need no special handling at all (they're ordinary vehicles with
+``a=0``, added via ``boundary.vehicles_from_boundary``). In-service
+(already plugged in, mid-charge) vehicles are the ones this model
+actually treats specially, and only in two small, surgical ways -- almost
+everything about them (sequencing, module capacity, the objective) falls
+out of the *existing* per-vehicle machinery unchanged, once their id
+appears in ``vehicles``/``boundary_vehicles`` with ``a=0``:
+
+  1. Right after the decision variables are created, every boundary
+     vehicle's ``u``/``y``/``p`` bounds are pinned (``BoundaryMode.FIXED``:
+     its whole known trajectory; ``BoundaryMode.OPTIMIZE``: only
+     ``u_{j,0}=1`` and its lane ``y_{j,pile,connector}=1`` -- everything
+     else about it stays a free decision).
+  2. In the Groups D+E loop, a ``FIXED`` vehicle's (17)-(19)/(24) rows are
+     skipped entirely (nothing to decide or verify -- its trajectory is
+     exogenous ground truth, not re-checked against an energy target,
+     which also sidesteps the departure-slot floor-truncation possibly
+     landing a hair short of full W_j). An ``OPTIMIZE`` vehicle's energy
+     recursion (17) starts from its own ``initial_energy_kwh`` instead of
+     0 -- ``x_jk`` keeps meaning "energy delivered since arrival" exactly
+     as for any other vehicle, just seeded at a nonzero value reflecting
+     the head start it already has; R_j/W_j (defined off the vehicle's
+     real original ``s_i``) need no change at all for this to stay
+     correct. (24) is skipped for both modes: the standard ``E_j``
+     (``earliest_departures``) assumes starting from ``s_i`` and would be
+     an invalid (too-large) lower bound for a vehicle that already has a
+     head start.
+
+Caution: ``break_symmetry`` forces piles/connectors to be used in
+ascending-vehicle-id order (Section 10) -- a boundary vehicle's pinned
+lane has no reason to already respect that ordering, so combining
+``break_symmetry=True`` with ``boundary_vehicles`` risks infeasibility;
+leave ``break_symmetry=False`` whenever boundary vehicles are present
+(same caution ``offline_cl_dw.apply_mip_start`` already documents for the
+same underlying reason).
 """
 
 from __future__ import annotations
@@ -95,6 +137,7 @@ from itertools import combinations
 import gurobipy as gp
 from gurobipy import GRB
 
+from .boundary import COHORTS_ALL, BoundaryMode, BoundaryVehicle, Cohort
 from .instance import StationSpec, VehicleData
 
 
@@ -163,6 +206,15 @@ class ConnectorLaneModel:
     break_symmetry: bool
     bound_departures: bool
     tie_break: bool
+    # vehicle_id -> BoundaryVehicle for every already-in-service vehicle at
+    # t=0 (see boundary.py); {} if none. Kept for post-hoc inspection --
+    # build_cl_model itself only reads this once, while pinning bounds.
+    boundary_vehicles: dict[int, BoundaryVehicle]
+    # vehicle_id -> Cohort (missing ids are MEASUREMENT), and the cohorts
+    # the objective was actually summed over -- both echoed back so
+    # extract_solution can report per-cohort sojourn without being told again.
+    cohorts: dict[int, Cohort]
+    objective_cohorts: frozenset[Cohort]
     module_pool_cap: int  # RHS actually used in (15); N unless overridden
     lanes: list[tuple[int, int]]  # (pile, connector) pairs
     u: gp.tupledict
@@ -197,6 +249,9 @@ def build_cl_model(
     break_symmetry: bool = False,
     bound_departures: bool = True,
     tie_break: bool = False,
+    boundary_vehicles: dict[int, BoundaryVehicle] | None = None,
+    cohorts: dict[int, Cohort] | None = None,
+    objective_cohorts: frozenset[Cohort] | None = None,
     model_name: str = "connector_lane_offline",
 ) -> ConnectorLaneModel:
     """
@@ -272,6 +327,34 @@ def build_cl_model(
         phases); off by default. When True, read the primary objective via
         ``extract_solution`` (not ``cl_model.model.ObjVal`` directly -- see
         that function's own docstring for why).
+    cohorts :
+        ``{vehicle_id: Cohort}`` tagging each vehicle as having arrived in
+        the measured window, been queued at the boundary, or been already
+        plugged in at it (``boundary.Cohort``). Any id absent from the map
+        is treated as ``MEASUREMENT``, so omitting this entirely keeps the
+        old behaviour (every vehicle in the objective).
+    objective_cohorts :
+        Which cohorts the objective (1) is summed over; ``None`` means all
+        of them. Vehicles outside the selection still appear in the model
+        in full -- they occupy connectors, draw modules and constrain
+        everyone else -- their ``D_j`` simply carries no objective weight.
+        ``boundary.COHORTS_MEASUREMENT`` / ``COHORTS_MEASUREMENT_QUEUED`` /
+        ``COHORTS_ALL`` are the three nested selections worth using.
+        Excluding ``BOUNDARY`` is the usual choice when boundary vehicles
+        are ``FIXED``: their ``D_j`` is pinned, so including it only adds a
+        constant to the objective and dilutes the reported mean sojourn
+        with a number the optimizer never chose. Note ``solution.
+        extract_solution`` reports sojourn for all three cohort levels
+        regardless of what was optimised here.
+    boundary_vehicles :
+        ``{vehicle_id: BoundaryVehicle}`` for any vehicle in ``vehicles``
+        that was already plugged in (mid-charge) when the modeled horizon
+        began -- see ``boundary.py`` and this module's own docstring,
+        "Boundary conditions", for the full mechanics and the
+        ``break_symmetry`` caution. ``None`` (default) or ``{}``: no
+        boundary vehicles, i.e. the modeled horizon starts with an empty
+        system (matching a simulation with no warm-up, or one where the
+        warm-up-era queue/in-service vehicles are deliberately ignored).
     """
     if delta <= 0:
         raise ValueError(f"delta must be positive, got {delta}")
@@ -379,6 +462,34 @@ def build_cl_model(
         ub={(v.id, k): v.W for v in vehicles for k in range(releases[v.id] + 1, K + 1)},
         name="x",
     )
+
+    # ============================================================
+    # Boundary conditions -- pin u/y/p for vehicles already plugged in at
+    # t=0 (see the module docstring, "Boundary conditions"). Everything
+    # else about them (sequencing (11)-(12), module capacity (14)-(16),
+    # the objective) needs no special handling: it already falls out of
+    # the ordinary constraints below once these bounds are fixed.
+    # ============================================================
+    boundary_vehicles = boundary_vehicles or {}
+    for bid, bv in boundary_vehicles.items():
+        j, k0 = bid, releases[bid]
+        # Lane is never a decision for an in-service vehicle: pin its own
+        # (pile, connector) to 1 and every other lane to 0 (redundant with
+        # (10) once one lane is pinned, but cheap and removes any ambiguity).
+        for (mm, cc) in lanes:
+            pinned = 1.0 if (mm, cc) == (bv.pile, bv.connector) else 0.0
+            y[j, mm, cc].lb = y[j, mm, cc].ub = pinned
+
+        if bv.mode is BoundaryMode.FIXED:
+            # No control: pin the entire already-known trajectory.
+            for k in range(k0, K):
+                occupied = k < bv.departure_slot
+                u[j, k].lb = u[j, k].ub = 1.0 if occupied else 0.0
+                p[j, k].lb = p[j, k].ub = bv.power.get(k, 0.0) if occupied else 0.0
+        else:
+            # Optimizer keeps control of power/departure; only "already
+            # occupying its connector right now" is a fact, not a choice.
+            u[j, k0].lb = u[j, k0].ub = 1.0
 
     # ============================================================
     # Group A -- occupancy timeline: (2) implicit, (3)-(9).
@@ -516,9 +627,26 @@ def build_cl_model(
     # ============================================================
     for v in vehicles:
         j, k0 = v.id, releases[v.id]
+        bv = boundary_vehicles.get(j)
+
+        # FIXED-mode boundary vehicles have nothing to decide or verify:
+        # their whole trajectory is already pinned above, so (17)-(19)/(24)
+        # would only risk a spurious infeasibility (e.g. the departure-slot
+        # floor-truncation in boundary.py landing a hair short of the full
+        # W_j -- see this module's own docstring, "Boundary conditions").
+        # Skip Groups D+E entirely for them.
+        if bv is not None and bv.mode is BoundaryMode.FIXED:
+            continue
+
         tau_d = v.tau_delta_hours(delta)
+        # x_{j,k0} convention: 0 for an ordinary freshly-arriving vehicle,
+        # but an OPTIMIZE-mode boundary vehicle already has some energy
+        # (relative to its own s_i) before t=0 -- see boundary.py's own
+        # initial_energy_kwh docstring. x keeps meaning "energy delivered
+        # since arrival" either way; only this seed value changes.
+        x0 = bv.initial_energy_kwh if bv is not None else 0.0
         for k in range(k0, K):
-            x_prev = x[j, k] if k > k0 else 0.0  # convention x_{j,k_j}=0 (17)
+            x_prev = x[j, k] if k > k0 else x0  # convention x_{j,k_j}=0 (17), or x0 for a boundary vehicle
             # (17): energy recursion -- an equality chain, two variable
             # terms per row (three once k>k0, since x_prev is then itself a
             # variable), never a growing sum.
@@ -553,8 +681,11 @@ def build_cl_model(
         # occupied slots, the fewest any departing trajectory could have
         # needed (from E_j, Section 9.1; independent of *when* it starts,
         # since the taper depends on delivered energy, not wall-clock
-        # time).
-        if bound_departures:
+        # time). Skipped for boundary vehicles: the standard E_j assumes
+        # starting from s_i, an invalid (too-large) lower bound for a
+        # vehicle that already has a head start -- see this module's own
+        # docstring, "Boundary conditions".
+        if bound_departures and bv is None:
             n_min = E[j] - k0
             v_j = gp.quicksum(eta[j, k] for k in range(k0, K))
             m.addConstr(
@@ -562,8 +693,25 @@ def build_cl_model(
                 name=f"C24_departure_lower_bound[{j}]",
             )
 
-    # --- (1): objective -- minimize sum_j D_j -----------------------------------
-    primary_obj = gp.quicksum(D[v.id] for v in vehicles)
+    # --- (1): objective -- minimize sum_j D_j over the selected cohorts ---------
+    # Vehicles outside objective_cohorts stay fully modelled (they still hold
+    # connectors and draw modules); only their D_j is dropped from the sum --
+    # see the objective_cohorts parameter docstring.
+    cohorts = cohorts or {}
+    objective_cohorts = objective_cohorts if objective_cohorts is not None else COHORTS_ALL
+    objective_ids = [
+        v.id
+        for v in vehicles
+        if cohorts.get(v.id, Cohort.MEASUREMENT) in objective_cohorts
+    ]
+    if not objective_ids:
+        raise ValueError(
+            "objective_cohorts selects no vehicle at all -- the objective would be "
+            f"empty. Selected {sorted(c.value for c in objective_cohorts)}, but the "
+            f"{len(vehicles)} vehicles present cover "
+            f"{sorted({cohorts.get(v.id, Cohort.MEASUREMENT).value for v in vehicles})}."
+        )
+    primary_obj = gp.quicksum(D[j] for j in objective_ids)
 
     if tie_break:
         # Optional secondary objective, purely to break ties among solutions
@@ -619,6 +767,9 @@ def build_cl_model(
         break_symmetry=break_symmetry,
         bound_departures=bound_departures,
         tie_break=tie_break,
+        boundary_vehicles=boundary_vehicles,
+        cohorts=cohorts,
+        objective_cohorts=objective_cohorts,
         module_pool_cap=cap,
         lanes=lanes,
         u=u,

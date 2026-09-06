@@ -10,6 +10,7 @@ from dataclasses import dataclass
 import pandas as pd
 from gurobipy import GRB
 
+from .boundary import Cohort, cohort_totals
 from .model import ConnectorLaneModel
 
 _STATUS_NAMES = {
@@ -21,19 +22,37 @@ _STATUS_NAMES = {
 
 @dataclass
 class ConnectorLaneSolution:
-    """Solved-instance summary: aggregate cost plus a per-vehicle timeline."""
+    """
+    Solved-instance summary: aggregate cost plus a per-vehicle timeline.
+
+    ``total_sojourn``/``mean_sojourn`` cover exactly the vehicles the
+    objective was summed over (``ConnectorLaneModel.objective_cohorts``),
+    so they always match the objective they came from.
+
+    ``by_cohort`` reports the same two figures for all three nested cohort
+    levels regardless of what was optimised -- keys ``"measurement"``
+    (arrived in the measured window), ``"measurement_queued"`` (plus those
+    queued at the boundary) and ``"all"`` (plus those already plugged in),
+    each mapping to ``{"n", "total_sojourn", "mean_sojourn"}``. These come
+    from summing per-vehicle sojourns rather than from a partial objective,
+    since ``delta*Z - sum_j a_j`` is only valid when both sums range over
+    the same vehicle set.
+    """
 
     status: str
-    objective: float  # sum_j D_j, in slot units (eq. 1)
-    total_sojourn: float  # minutes; delta*objective - sum_j a_j (matches per_vehicle["sojourn_min"].sum())
-    mean_sojourn: float  # total_sojourn / n_vehicles, minutes
+    objective: float  # sum_j D_j over objective_cohorts, in slot units (eq. 1)
+    total_sojourn: float  # minutes, over objective_cohorts only
+    mean_sojourn: float  # total_sojourn / n_optimized, minutes
     mip_gap: float
     runtime: float
-    n_vehicles: int
+    n_vehicles: int  # every vehicle in the model, optimized or not
+    n_optimized: int  # those inside objective_cohorts
     delta: float
     K: int
-    per_vehicle: pd.DataFrame  # vehicle_id, arrival, served, pile, connector,
-    # start_slot, departure_slot, sojourn_min, energy_kwh, energy_required_kwh
+    by_cohort: dict[str, dict[str, float]]
+    per_vehicle: pd.DataFrame  # vehicle_id, cohort, boundary_mode, in_objective,
+    # arrival, served, pile, connector, start_slot, departure_slot, sojourn_min,
+    # energy_kwh, energy_delivered_before_kwh, energy_required_kwh
 
 
 def extract_solution(cl_model: ConnectorLaneModel) -> ConnectorLaneSolution:
@@ -86,9 +105,17 @@ def extract_solution(cl_model: ConnectorLaneModel) -> ConnectorLaneSolution:
 
         energy_kwh = h * sum(cl_model.p[j, k].X for k in range(k0, K))
 
+        # A boundary vehicle's plan only covers the modeled window, so its
+        # in-window energy is reported alongside what it already had at t=0
+        # -- otherwise the row reads as a shortfall against energy_required.
+        bv = cl_model.boundary_vehicles.get(j)
+        cohort = cl_model.cohorts.get(j, Cohort.MEASUREMENT)
         rows.append(
             {
                 "vehicle_id": j,
+                "cohort": cohort.value,
+                "boundary_mode": bv.mode.value if bv is not None else None,
+                "in_objective": cohort in cl_model.objective_cohorts,
                 "arrival": v.a,
                 "served": served,
                 "pile": pile,
@@ -97,12 +124,15 @@ def extract_solution(cl_model: ConnectorLaneModel) -> ConnectorLaneSolution:
                 "departure_slot": D_val,
                 "sojourn_min": delta * D_val - v.a,
                 "energy_kwh": energy_kwh,
+                "energy_delivered_before_kwh": bv.initial_energy_kwh if bv is not None else 0.0,
                 "energy_required_kwh": v.W,
             }
         )
 
     per_vehicle = pd.DataFrame(rows).sort_values("vehicle_id").reset_index(drop=True)
-    n = len(per_vehicle)
+    by_cohort = cohort_totals(rows, cl_model.cohorts)
+    optimized = [r for r in rows if r["in_objective"]]
+    n = len(optimized)
 
     if cl_model.tie_break:
         m.Params.ObjNumber = 0
@@ -112,7 +142,11 @@ def extract_solution(cl_model: ConnectorLaneModel) -> ConnectorLaneSolution:
         objective = float(m.ObjVal)
         mip_gap = float(m.MIPGap) if m.IsMIP else 0.0
 
-    total_arrival = sum(v.a for v in cl_model.vehicles.values())
+    # delta*Z - sum_j a_j is only valid when both sums range over the SAME
+    # vehicles, so the arrival sum is restricted to the objective's own
+    # cohorts -- mixing the two sets here would silently corrupt both the
+    # total and the mean.
+    total_arrival = sum(float(r["arrival"]) for r in optimized)  # type: ignore[arg-type]
     total_sojourn = delta * objective - total_arrival
     mean_sojourn = total_sojourn / n if n else 0.0
 
@@ -123,8 +157,10 @@ def extract_solution(cl_model: ConnectorLaneModel) -> ConnectorLaneSolution:
         mean_sojourn=mean_sojourn,
         mip_gap=mip_gap,
         runtime=float(m.Runtime),
-        n_vehicles=n,
+        n_vehicles=len(rows),
+        n_optimized=n,
         delta=delta,
         K=K,
+        by_cohort=by_cohort,
         per_vehicle=per_vehicle,
     )
