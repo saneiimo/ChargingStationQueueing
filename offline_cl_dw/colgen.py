@@ -58,6 +58,37 @@ purged column is never gone for good: the pricer always searches the full
 per-vehicle plan space, not the historical pool, so it can always come back
 later if it becomes attractive again -- ``purge_columns`` clears the purged
 plan's own dedup key precisely so that re-addition isn't silently refused.
+
+Boundary conditions (vehicles already in the station at t=0)
+--------------------------------------------------------------
+``boundary_vehicles`` (see ``offline_cl_opt.boundary`` -- shared with the
+compact model, whose own docstring, "Boundary conditions", has the full
+mathematical argument for why each piece below is enough) lets ``vehicles``
+include EVs already plugged in (mid-charge) when the modeled horizon
+began. Two modes, handled entirely in this module's setup (before the main
+loop even starts) plus ``pricer.build_pricer``'s own ``initial_energy``/
+``force_occupied_at_start``:
+
+* ``FIXED`` (no optimizer control): its whole trajectory is already known
+  -- ``preprocess.fixed_plan`` builds the one Plan matching it exactly,
+  seeded as this vehicle's *only* column (no null plan, no pricer built
+  for it at all -- there is nothing left to search for or price).
+* ``OPTIMIZE`` (optimizer controls power/departure, never the lane): a
+  pricer is built for its one already-fixed pile only (not all M), with
+  ``force_occupied_at_start=True`` and ``initial_energy=bv.
+  initial_energy_kwh``; its earliest-departure valid inequality is passed
+  as ``0`` (the standard ``E_j`` assumes starting from ``s_i`` and would
+  be invalid here). It gets no null plan either -- a vehicle already
+  mid-charge cannot be "never served" -- so ``preprocess.
+  boundary_seed_plan`` seeds its first feasible column instead, playing
+  the same "guarantee RMP feasibility from iteration one" role the null
+  plan plays for ordinary vehicles (see ``master.build_master``'s own
+  relaxed validation: "at least one column per vehicle", not specifically
+  a null one).
+
+Everything else (the master's rows, the objective, purging, dual
+smoothing) needs no boundary-specific handling: a boundary vehicle's
+columns are ordinary ``Plan`` objects like any other's.
 """
 
 from __future__ import annotations
@@ -67,12 +98,18 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
+from offline_cl_opt.boundary import (
+    COHORTS_ALL,
+    BoundaryMode,
+    BoundaryVehicle,
+    Cohort,
+)
 from offline_cl_opt.instance import StationSpec, VehicleData
 
 from .columns import Plan
 from .master import RestrictedMaster, add_column, build_master, purge_columns, solve_lp
 from .pricer import VehiclePricer, _release_slot, build_pricer, price
-from .preprocess import earliest_departures, seed_columns
+from .preprocess import boundary_seed_plan, earliest_departures, fixed_plan, seed_columns
 
 
 @dataclass
@@ -88,6 +125,9 @@ class ColGenResult:
     converged: bool  # True iff an exact pricing pass found no improving column
     earliest_departure_sum: float  # sum_j E_j -- a cheap sanity floor on the optimum
     columns_purged: int  # cumulative count removed by purge_columns (Section 8.3), 0 if disabled
+    boundary_vehicles: dict[int, BoundaryVehicle]  # echoed back, {} if none were passed in
+    cohorts: dict[int, Cohort]  # echoed back; missing ids are MEASUREMENT
+    objective_cohorts: frozenset[Cohort]  # what the objective was summed over
 
 
 def _log(progress: bool, message: str) -> None:
@@ -105,14 +145,23 @@ def _plan_reduced_cost(
     pi: dict[tuple[int, int], float],
     mu: dict[tuple[int, int], float],
     pile: int,
+    in_objective: bool = True,
 ) -> float:
     """Evaluate ``D_omega - sum(pi*alpha) - sum(mu*beta)`` (28) for a
     concrete plan directly off its own (start, departure, power), against
     whichever duals are passed in -- used both to price on the true duals
-    directly and to re-check a smoothed-dual plan against the true ones."""
+    directly and to re-check a smoothed-dual plan against the true ones.
+
+    ``in_objective=False`` drops the ``D_omega`` term, matching both
+    ``master.add_column``'s coefficient and ``pricer.price``'s objective
+    for a vehicle outside the objective (see ``master.build_master``'s
+    ``objective_ids``); getting this out of step with them would make
+    every reduced cost -- and the Lagrangian bound built from them --
+    inconsistent with the master they are supposed to describe."""
+    departure = float(plan.departure) if in_objective else 0.0
     if plan.is_null:
-        return float(plan.departure)
-    total = float(plan.departure)
+        return departure
+    total = departure
     for k in plan.occupied_slots():
         total -= pi.get((pile, k), 0.0)
         total -= mu.get((pile, k), 0.0) * plan.power.get(k, 0.0)
@@ -126,6 +175,9 @@ def run_column_generation(
     horizon_minutes: float,
     *,
     extra_seed_columns: dict[int, list[Plan]] | None = None,
+    boundary_vehicles: dict[int, BoundaryVehicle] | None = None,
+    cohorts: dict[int, Cohort] | None = None,
+    objective_cohorts: frozenset[Cohort] | None = None,
     conservative_modules: bool = False,
     gamma: float = 0.5,
     eps_rc: float = 1e-6,
@@ -161,7 +213,24 @@ def run_column_generation(
         own defaults (null plan + per-pile greedy solo plan for every
         vehicle) -- e.g. from ``preprocess.columns_from_evs`` on a real
         simulation. Merged in before the loop starts; better seeds mean
-        fewer iterations, never a different answer.
+        fewer iterations, never a different answer. Ignored for any
+        vehicle in ``boundary_vehicles`` (they get their own seeding --
+        see below).
+    boundary_vehicles :
+        ``{vehicle_id: BoundaryVehicle}`` for any vehicle in ``vehicles``
+        already plugged in (mid-charge) when the modeled horizon began --
+        see ``offline_cl_opt.boundary`` and this module's own docstring,
+        "Boundary conditions", for the full mechanics. ``None`` (default)
+        or ``{}``: no boundary vehicles, i.e. the modeled horizon starts
+        with an empty system.
+    cohorts, objective_cohorts :
+        Which vehicles the objective is minimised over -- identical in
+        meaning to ``offline_cl_opt.model.build_cl_model``'s parameters of
+        the same names, and forwarded to ``master.build_master`` as
+        ``objective_ids``. A vehicle outside the selection keeps every
+        capacity term it had (rows (25)/(26)) but its columns are priced at
+        0, and its pricer drops the ``D_j`` term to match, so reduced costs
+        and the Lagrangian bound stay consistent with the master.
     conservative_modules :
         See ``master.build_master``.
     gamma :
@@ -244,24 +313,104 @@ def run_column_generation(
     """
     K = _horizon_slots(delta, horizon_minutes)
     vehicle_ids = [v.id for v in vehicles]
+    boundary_vehicles = boundary_vehicles or {}
+    by_id = {v.id: v for v in vehicles}
+
+    # Objective membership, resolved once and used identically by the
+    # master's column coefficients, each pricer's objective, and every
+    # reduced-cost evaluation below -- see the cohorts parameter doc.
+    cohorts = cohorts or {}
+    objective_cohorts = objective_cohorts if objective_cohorts is not None else COHORTS_ALL
+    objective_ids = {
+        v.id for v in vehicles if cohorts.get(v.id, Cohort.MEASUREMENT) in objective_cohorts
+    }
+    if not objective_ids:
+        raise ValueError(
+            "objective_cohorts selects no vehicle at all -- the objective would be empty. "
+            f"Selected {sorted(c.value for c in objective_cohorts)}, but the "
+            f"{len(vehicles)} vehicles present cover "
+            f"{sorted({cohorts.get(v.id, Cohort.MEASUREMENT).value for v in vehicles})}."
+        )
+
     E = earliest_departures(vehicles, station, delta, horizon_minutes)
+    # Boundary conditions: the standard E_j assumes starting from s_i and
+    # would be an invalid (too-large) lower bound for a vehicle that
+    # already has a head start -- see this module's own docstring,
+    # "Boundary conditions", and pricer.build_pricer's earliest_departure
+    # parameter doc. Zeroing it here (rather than a separate code path)
+    # makes the eventual `D_lin >= 0` constraint trivially true, i.e. no
+    # constraint at all.
+    for j in boundary_vehicles:
+        E[j] = 0
     e_sum = float(sum(E.values()))
 
-    seeds = seed_columns(vehicles, station, delta, K)
+    # Seeding: ordinary vehicles get the standard null + per-pile greedy
+    # solo pool. Boundary vehicles get none of that -- see the module
+    # docstring, "Boundary conditions" -- FIXED-mode ones get their single
+    # known-trajectory Plan (preprocess.fixed_plan); OPTIMIZE-mode ones get
+    # one guaranteed-feasible starting column confined to their own pile
+    # (preprocess.boundary_seed_plan), since a vehicle already mid-charge
+    # can never be "never served".
+    ordinary_vehicles = [v for v in vehicles if v.id not in boundary_vehicles]
+    seeds: dict[int, list[Plan]] = (
+        seed_columns(ordinary_vehicles, station, delta, K) if ordinary_vehicles else {}
+    )
+    # FIXED-mode boundary vehicles get no pricer built below (there is
+    # nothing to search: one column, already known) -- their own plan and
+    # pile are kept here so the Lagrangian bound (32) can still include a
+    # closed-form zeta_j for them each round (see _price_round below),
+    # instead of the min() over an empty per-vehicle zeta dict that would
+    # otherwise result.
+    fixed_boundary: dict[int, tuple[Plan, int]] = {}
+    for j, bv in boundary_vehicles.items():
+        v = by_id[j]
+        if bv.mode is BoundaryMode.FIXED:
+            plan = fixed_plan(bv)
+            seeds[j] = [plan]
+            fixed_boundary[j] = (plan, bv.pile)
+        else:
+            seeds[j] = [boundary_seed_plan(v, bv, station, delta, K)]
     if extra_seed_columns:
         for j, plans in extra_seed_columns.items():
+            if j in boundary_vehicles:
+                continue  # boundary vehicles use only their own seeding above
             seeds.setdefault(j, [])
             seeds[j].extend(p for p in plans if not p.is_null)  # null already seeded
 
     k_lo = min(_release_slot(v.a, delta) for v in vehicles)
     rm = build_master(
-        vehicle_ids, station, delta, K, k_lo, seeds, conservative_modules=conservative_modules
+        vehicle_ids,
+        station,
+        delta,
+        K,
+        k_lo,
+        seeds,
+        objective_ids=objective_ids,
+        conservative_modules=conservative_modules,
     )
 
     pricers: dict[tuple[int, int], VehiclePricer] = {}
     for v in vehicles:
-        for mm in range(station.n_piles):
-            pricers[v.id, mm] = build_pricer(v, mm, station, delta, K, E[v.id])
+        bv = boundary_vehicles.get(v.id)
+        if bv is not None and bv.mode is BoundaryMode.FIXED:
+            # No decision to price: the whole trajectory is already known
+            # and was seeded as this vehicle's only column above.
+            continue
+        # An OPTIMIZE-mode boundary vehicle's lane is fixed -- only build
+        # its one real pile's pricer, not all M (see the module docstring).
+        piles = [bv.pile] if bv is not None else range(station.n_piles)
+        for mm in piles:
+            pricers[v.id, mm] = build_pricer(
+                v,
+                mm,
+                station,
+                delta,
+                K,
+                E[v.id],
+                initial_energy=bv.initial_energy_kwh if bv is not None else 0.0,
+                force_occupied_at_start=bv is not None,
+                in_objective=v.id in objective_ids,
+            )
 
     # Dual smoothing centre (33), zero-initialised; only meaningful once
     # gamma>0 and it's actually been set (see "use_smoothing" below --
@@ -312,10 +461,26 @@ def run_column_generation(
                     rc = z - lp.sigma[j]
                     zeta[j][mm] = z
                 else:
-                    true_z = _plan_reduced_cost(plan, pi=lp.pi, mu=lp.mu, pile=mm)
+                    true_z = _plan_reduced_cost(
+                        plan, pi=lp.pi, mu=lp.mu, pile=mm, in_objective=j in objective_ids
+                    )
                     rc = true_z - lp.sigma[j]
                 if not plan.is_null and rc < -eps_rc:
                     candidates.append((rc, j, plan))
+            if exact:
+                # FIXED-mode boundary vehicles have no pricer (nothing to
+                # search), but (32) still needs a zeta_j for them: their
+                # one-and-only column's own reduced cost, closed-form, no
+                # MILP -- see fixed_boundary's own comment above. Never a
+                # candidate (already seeded, would just be a duplicate).
+                for j, (plan, mm) in fixed_boundary.items():
+                    zeta[j][mm] = _plan_reduced_cost(
+                        plan,
+                        pi=price_pi,
+                        mu=price_mu,
+                        pile=mm,
+                        in_objective=j in objective_ids,
+                    )
             return candidates, zeta
 
         while it < max_iterations:
@@ -423,4 +588,7 @@ def run_column_generation(
         converged=converged,
         earliest_departure_sum=e_sum,
         columns_purged=total_purged,
+        boundary_vehicles=boundary_vehicles,
+        cohorts=cohorts,
+        objective_cohorts=objective_cohorts,
     )

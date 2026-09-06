@@ -16,6 +16,7 @@ from __future__ import annotations
 import heapq
 import math
 
+from offline_cl_opt.boundary import BoundaryMode, BoundaryVehicle
 from offline_cl_opt.instance import StationSpec, VehicleData
 
 from .columns import Plan
@@ -118,13 +119,25 @@ def validate_schedule(
     K: int,
     *,
     best_lower_bound: float | None = None,
+    boundary_vehicles: dict[int, BoundaryVehicle] | None = None,
 ) -> None:
     """
     Section 10.3's checklist, run as assertions. Raises ``AssertionError``
     with a specific message on the first violation found; call this before
     trusting a price-and-branch result the way you would for any solver
     output, not only while debugging this package.
+
+    ``boundary_vehicles``: the same mapping passed to
+    ``colgen.run_column_generation`` (see ``offline_cl_opt.boundary``).
+    Their energy-completion check (below) is relaxed to account for energy
+    already delivered before t=0, which ``plan.power`` never reflects: a
+    FIXED-mode vehicle's trajectory is exogenous and skipped entirely (it
+    is never re-verified against an energy target -- see
+    ``offline_cl_opt.boundary._discretize_trace_power``'s own docstring),
+    an OPTIMIZE-mode one's check adds back ``initial_energy_kwh`` before
+    comparing to ``v.W``.
     """
+    boundary_vehicles = boundary_vehicles or {}
     h = delta / 60.0
     objective = 0.0
     occupancy: dict[tuple[int, int], list[int]] = {}  # (pile, k) -> [vehicle_id, ...]
@@ -142,23 +155,45 @@ def validate_schedule(
         )
         assert plan.start < plan.departure <= K, f"Vehicle {j} has a degenerate interval."
 
+        bv = boundary_vehicles.get(j)
         energy = h * sum(plan.power.values())
-        if plan.departure < K:
-            assert abs(energy - v.W) < 1e-4, (
-                f"Vehicle {j} departs at slot {plan.departure} < K={K} with {energy:.4f} kWh "
-                f"delivered, not its full W_j={v.W:.4f} -- constraint (19)/completion at "
-                "departure was violated by whichever plan was selected."
+        if plan.departure < K and (bv is None or bv.mode is BoundaryMode.OPTIMIZE):
+            # FIXED-mode boundary vehicles are skipped: their plan.power is
+            # only the post-t=0 tail of a trajectory the model never chose,
+            # so it need not sum to W_j on its own. OPTIMIZE-mode ones add
+            # back the energy they already had at t=0 before comparing.
+            already = bv.initial_energy_kwh if bv is not None else 0.0
+            assert abs(energy + already - v.W) < 1e-4, (
+                f"Vehicle {j} departs at slot {plan.departure} < K={K} with "
+                f"{energy + already:.4f} kWh delivered (of which {already:.4f} pre-t=0), "
+                f"not its full W_j={v.W:.4f} -- constraint (19)/completion at departure was "
+                "violated by whichever plan was selected."
             )
         p_bar = min(v.p_max, station.n_modules * station.p_module)
         tau_d = v.tau_delta_hours(delta)
-        cum = 0.0
+        # The taper cap the model enforced is tau_d*p + x_prev <= R with
+        # x_prev seeded at the vehicle's head start, so the accumulator has
+        # to start there too -- starting at 0 would check something strictly
+        # weaker than the model guaranteed and quietly stop catching real
+        # (18) violations.
+        cum = bv.initial_energy_kwh if bv is not None else 0.0
+        # FIXED-mode vehicles are exempt: build_cl_model skips Groups D+E
+        # for them entirely, so (18) is not something their pinned,
+        # exogenous trajectory was ever required to satisfy -- asserting it
+        # here would fail on a trajectory the model never claimed to
+        # constrain. Their power is instead checked against pile capacity,
+        # which IS enforced, by boundary.assert_whole_module_feasible.
+        check_physics = bv is None or bv.mode is BoundaryMode.OPTIMIZE
         for k in plan.occupied_slots():
             p_val = plan.power.get(k, 0.0)
-            assert p_val <= p_bar + 1e-6, f"Vehicle {j}, slot {k}: p={p_val:.3f} > P_bar={p_bar:.3f}."
-            assert tau_d * p_val + cum <= v.R + 1e-4, (
-                f"Vehicle {j}, slot {k}: taper cap (18) violated "
-                f"({tau_d * p_val + cum:.4f} > R_j={v.R:.4f})."
-            )
+            if check_physics:
+                assert p_val <= p_bar + 1e-6, (
+                    f"Vehicle {j}, slot {k}: p={p_val:.3f} > P_bar={p_bar:.3f}."
+                )
+                assert tau_d * p_val + cum <= v.R + 1e-4, (
+                    f"Vehicle {j}, slot {k}: taper cap (18) violated "
+                    f"({tau_d * p_val + cum:.4f} > R_j={v.R:.4f})."
+                )
             cum += h * p_val
             occupancy.setdefault((plan.pile, k), []).append(j)  # type: ignore[index]
             power_by_pile_slot[plan.pile, k] = power_by_pile_slot.get((plan.pile, k), 0.0) + p_val  # type: ignore[index]

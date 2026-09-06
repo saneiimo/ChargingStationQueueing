@@ -11,6 +11,12 @@ from dataclasses import dataclass
 
 import pandas as pd
 
+from offline_cl_opt.boundary import (
+    COHORTS_ALL,
+    BoundaryVehicle,
+    Cohort,
+    cohort_totals,
+)
 from offline_cl_opt.instance import StationSpec, VehicleData
 
 from .colgen import ColGenResult, run_column_generation
@@ -70,6 +76,15 @@ class DWSolution:
     the master over the run, ``0`` if ``purge_every=None`` disabled it. Purely
     informational: purging never changes ``LB``/``UB``, only how much work
     reaching them cost.
+
+    ``LB``/``UB`` and every sojourn figure derived from them cover exactly
+    the vehicles the objective was summed over
+    (``ColGenResult.objective_cohorts``). ``by_cohort`` additionally
+    reports total/mean sojourn of the *schedule* for all three nested
+    cohort levels -- ``"measurement"``, ``"measurement_queued"``, ``"all"``
+    -- regardless of what was optimised. There is no per-cohort ``LB``:
+    the lower bound is a single scalar certifying the objective as a
+    whole, so it cannot be split across cohorts after the fact.
     """
 
     LB: float
@@ -83,12 +98,15 @@ class DWSolution:
     converged: bool
     iterations: int
     columns_purged: int
-    n_vehicles: int
+    n_vehicles: int  # every vehicle in the model, optimized or not
+    n_optimized: int  # those inside objective_cohorts
     delta: float
     K: int
     whole_module_feasible: bool
-    per_vehicle: pd.DataFrame  # vehicle_id, arrival, served, pile, connector,
-    # start_slot, departure_slot, sojourn_min, energy_kwh, energy_required_kwh
+    by_cohort: dict[str, dict[str, float]]
+    per_vehicle: pd.DataFrame  # vehicle_id, cohort, boundary_mode, in_objective,
+    # arrival, served, pile, connector, start_slot, departure_slot, sojourn_min,
+    # energy_kwh, energy_delivered_before_kwh, energy_required_kwh
 
 
 def extract_solution(
@@ -104,6 +122,9 @@ def extract_solution(
     converged: bool,
     iterations: int,
     columns_purged: int = 0,
+    boundary_vehicles: dict[int, BoundaryVehicle] | None = None,
+    cohorts: dict[int, Cohort] | None = None,
+    objective_cohorts: frozenset[Cohort] | None = None,
 ) -> DWSolution:
     """Build a ``DWSolution`` from an integer master result -- assigns
     connectors (10.1) and checks (not repairs) whole-module feasibility
@@ -136,6 +157,12 @@ def extract_solution(
             "options. LB remains a valid lower bound regardless."
         )
 
+    boundary_vehicles = boundary_vehicles or {}
+    cohorts = cohorts or {}
+    objective_cohorts = (
+        objective_cohorts if objective_cohorts is not None else COHORTS_ALL
+    )
+
     rows: list[dict[str, object]] = []
     for v in vehicles:
         plan = chosen[v.id]
@@ -144,9 +171,17 @@ def extract_solution(
         start_slot = (
             float(plan.start) if served and plan.start is not None else float(K)
         )
+        # A boundary vehicle's plan only covers the modeled window, so its
+        # in-window energy is reported next to what it already had at t=0 --
+        # otherwise the row reads as a shortfall against energy_required.
+        bv = boundary_vehicles.get(v.id)
+        cohort = cohorts.get(v.id, Cohort.MEASUREMENT)
         rows.append(
             {
                 "vehicle_id": v.id,
+                "cohort": cohort.value,
+                "boundary_mode": bv.mode.value if bv is not None else None,
+                "in_objective": cohort in objective_cohorts,
                 "arrival": v.a,
                 "served": served,
                 "pile": plan.pile,
@@ -155,13 +190,19 @@ def extract_solution(
                 "departure_slot": float(plan.departure),
                 "sojourn_min": delta * plan.departure - v.a,
                 "energy_kwh": energy_kwh,
+                "energy_delivered_before_kwh": bv.initial_energy_kwh if bv is not None else 0.0,
                 "energy_required_kwh": v.W,
             }
         )
     per_vehicle = pd.DataFrame(rows).sort_values("vehicle_id").reset_index(drop=True)
+    by_cohort = cohort_totals(rows, cohorts)
 
-    n = len(vehicles)
-    total_arrival = sum(v.a for v in vehicles)
+    # LB/UB bound the objective, which ranges over objective_cohorts only, so
+    # the arrival sum converting them to minutes must range over exactly the
+    # same vehicles -- mixing the two sets silently corrupts both figures.
+    optimized = [r for r in rows if r["in_objective"]]
+    n = len(optimized)
+    total_arrival = sum(float(r["arrival"]) for r in optimized)  # type: ignore[arg-type]
     total_sojourn_UB = delta * UB - total_arrival
     mean_sojourn_UB = total_sojourn_UB / n if n else 0.0
     total_sojourn_LB = delta * LB - total_arrival
@@ -180,9 +221,11 @@ def extract_solution(
         iterations=iterations,
         columns_purged=columns_purged,
         n_vehicles=len(vehicles),
+        n_optimized=n,
         delta=delta,
         K=K,
         whole_module_feasible=not failures,
+        by_cohort=by_cohort,
         per_vehicle=per_vehicle,
     )
 
@@ -194,6 +237,9 @@ def solve_by_decomposition(
     horizon_minutes: float,
     *,
     extra_seed_columns: dict[int, list[Plan]] | None = None,
+    boundary_vehicles: dict[int, BoundaryVehicle] | None = None,
+    cohorts: dict[int, Cohort] | None = None,
+    objective_cohorts: frozenset[Cohort] | None = None,
     conservative_modules: bool = False,
     gamma: float = 0.5,
     eps_rc: float = 1e-6,
@@ -220,6 +266,10 @@ def solve_by_decomposition(
     (``z_rmp_history``/``lower_bound_history``) or want to add more
     columns and re-run price-and-branch yourself (e.g. after inspecting a
     wide gap).
+
+    ``boundary_vehicles``: forwarded as-is to ``run_column_generation`` and
+    ``postprocess.validate_schedule`` -- see ``colgen.run_column_generation``'s
+    own docstring, "Boundary conditions", for what it does.
 
     See ``colgen.run_column_generation`` for the meaning of ``gamma``,
     ``eps_rc``, ``gap_tolerance``, ``max_iterations``,
@@ -266,6 +316,9 @@ def solve_by_decomposition(
         delta,
         horizon_minutes,
         extra_seed_columns=extra_seed_columns,
+        boundary_vehicles=boundary_vehicles,
+        cohorts=cohorts,
+        objective_cohorts=objective_cohorts,
         conservative_modules=conservative_modules,
         gamma=gamma,
         eps_rc=eps_rc,
@@ -300,6 +353,9 @@ def solve_by_decomposition(
         converged=cg.converged,
         iterations=cg.iterations,
         columns_purged=cg.columns_purged,
+        boundary_vehicles=cg.boundary_vehicles,
+        cohorts=cg.cohorts,
+        objective_cohorts=cg.objective_cohorts,
     )
 
     if validate:
@@ -310,6 +366,7 @@ def solve_by_decomposition(
             delta,
             K,
             best_lower_bound=cg.best_lower_bound,
+            boundary_vehicles=boundary_vehicles,
         )
 
     return solution, cg

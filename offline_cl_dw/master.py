@@ -48,6 +48,11 @@ class RestrictedMaster:
     connector_cap: dict[tuple[int, int], gp.Constr]  # (pile, k) -> row (25)
     module_cap: dict[tuple[int, int], gp.Constr]  # (pile, k) -> row (26)
     convexity: dict[int, gp.Constr]  # vehicle_id -> row (27)
+    # Vehicles whose D_omega carries objective weight. Everyone else's
+    # columns are added with coefficient 0: they still occupy connectors
+    # and draw modules via rows (25)/(26), they just don't pay for their
+    # own departure -- see build_master's objective_ids parameter.
+    objective_ids: set[int] = field(default_factory=set)
     columns: dict[int, list[tuple[Plan, gp.Var]]] = field(default_factory=dict)  # vehicle_id -> [(plan, lambda_var)]
     # Section 8.3's deduplication key set, per vehicle -- see _column_key
     # and add_column. Regenerating an existing column is a symptom of dual
@@ -88,13 +93,28 @@ def build_master(
     k_lo: int,
     initial_columns: dict[int, list[Plan]],
     *,
+    objective_ids: set[int] | None = None,
     conservative_modules: bool = False,
     model_name: str = "connector_lane_dw_master",
 ) -> RestrictedMaster:
     """
     Build the restricted master LP with ``initial_columns`` (must include
-    the null plan for every vehicle -- see ``preprocess.seed_columns``,
-    which guarantees this) and no others; column generation adds the rest.
+    at least one column per vehicle, so the convexity row (27) has
+    something to be feasible with from iteration one -- see
+    ``preprocess.seed_columns`` for ordinary vehicles, which always
+    includes the null plan, and ``preprocess.boundary_seed_plan``/
+    ``fixed_plan`` for boundary vehicles, which never get a null plan --
+    see ``colgen.run_column_generation``'s own docstring, "Boundary
+    conditions") and no others; column generation adds the rest.
+
+    ``objective_ids``: vehicles whose ``D_omega`` carries objective weight
+    (``None`` = all of them, the original behaviour). Mirrors
+    ``offline_cl_opt.model.build_cl_model``'s ``objective_cohorts``: a
+    vehicle left out is still fully present in rows (25)/(26) -- it holds
+    its connector and draws its modules -- its columns are just priced at
+    0, so the optimum never pays for its departure. Used to keep FIXED
+    boundary vehicles, whose ``D_j`` is a pinned constant, out of the
+    quantity being minimised.
 
     ``conservative_modules``: use ``(N-C+1)*Delta`` instead of ``N*Delta``
     as the RHS of every module-capacity row (26), matching the "What
@@ -139,6 +159,7 @@ def build_master(
         connector_cap=connector_cap,
         module_cap=module_cap,
         convexity=convexity,
+        objective_ids=set(vehicle_ids) if objective_ids is None else set(objective_ids),
         columns={j: [] for j in vehicle_ids},
         seen_keys={j: set() for j in vehicle_ids},
     )
@@ -147,11 +168,12 @@ def build_master(
         for plan in plans:
             add_column(rm, plan)
 
-    missing = [j for j in vehicle_ids if not any(p.is_null for p, _ in rm.columns.get(j, []))]
+    missing = [j for j in vehicle_ids if not rm.columns.get(j)]
     if missing:
         raise ValueError(
-            f"initial_columns must include the null plan for every vehicle -- missing for "
-            f"{missing}. Use preprocess.seed_columns to build a valid starting set."
+            f"initial_columns must include at least one column for every vehicle -- missing "
+            f"for {missing}. Use preprocess.seed_columns for ordinary vehicles (guarantees the "
+            "null plan) and preprocess.boundary_seed_plan/fixed_plan for boundary vehicles."
         )
 
     m.update()
@@ -189,7 +211,10 @@ def add_column(rm: RestrictedMaster, plan: Plan) -> gp.Var | None:
                 p_val = plan.power.get(k, 0.0)
                 if p_val > 1e-9:
                     col.addTerms(p_val, rm.module_cap[pile, k])  # (26)
-    var = rm.model.addVar(lb=0.0, obj=float(plan.departure), column=col, name=f"lambda[{j}]")
+    # Objective coefficient is this plan's own D_omega -- or 0 for a vehicle
+    # outside the objective, which still contributes its capacity terms above.
+    obj_coeff = float(plan.departure) if j in rm.objective_ids else 0.0
+    var = rm.model.addVar(lb=0.0, obj=obj_coeff, column=col, name=f"lambda[{j}]")
     rm.columns.setdefault(j, []).append((plan, var))
     return var
 

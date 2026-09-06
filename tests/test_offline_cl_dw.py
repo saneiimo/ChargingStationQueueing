@@ -127,7 +127,7 @@ def test_single_vehicle_converges_and_delivers_exact_energy():
         [v], station, delta=1.0, horizon_minutes=60.0, gap_tolerance=1e-4, progress=False
     )
     assert solution.gap == pytest.approx(0.0, abs=1e-3)
-    assert solution.lower_bound == pytest.approx(solution.upper_bound, abs=1e-3)
+    assert solution.LB == pytest.approx(solution.UB, abs=1e-3)
     row = solution.per_vehicle.iloc[0]
     assert row["served"]
     assert row["energy_kwh"] == pytest.approx(v.W, abs=1e-4)
@@ -164,17 +164,17 @@ def test_bracket_contains_known_compact_model_optimum():
     )
 
     print(
-        f"\nDW bracket=[{solution.lower_bound:.3f}, {solution.upper_bound:.3f}], "
+        f"\nDW bracket=[{solution.LB:.3f}, {solution.UB:.3f}], "
         f"compact model true optimum={true_optimum:.3f}"
     )
     # (32)/Section 5's own inequality chain: the DW lower bound is a
     # relaxation (continuous modules) of the compact model, so it can only
     # be <= the compact model's true (whole-module) optimum.
-    assert solution.lower_bound <= true_optimum + 1e-4
+    assert solution.LB <= true_optimum + 1e-4
     # price-and-branch's result is a genuine feasible schedule for the
     # compact model too (whole-module feasible, by construction or repair),
     # so it can only be >= the true optimum.
-    assert solution.upper_bound >= true_optimum - 1e-4
+    assert solution.UB >= true_optimum - 1e-4
     assert solution.whole_module_feasible
 
 
@@ -197,7 +197,7 @@ def test_validate_schedule_passes_on_price_and_branch_result():
         station,
         delta,
         solution.K,
-        best_lower_bound=solution.lower_bound,
+        best_lower_bound=solution.LB,
     )
     assert not whole_module_failures(integer_result_chosen, station)
 

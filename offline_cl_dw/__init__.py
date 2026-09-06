@@ -45,7 +45,13 @@ from .master import (
     solve_lp,
 )
 from .postprocess import assign_connectors, rounded_module_routing, validate_schedule, whole_module_failures
-from .preprocess import columns_from_evs, earliest_departures, seed_columns
+from .preprocess import (
+    boundary_seed_plan,
+    columns_from_evs,
+    earliest_departures,
+    fixed_plan,
+    seed_columns,
+)
 from .pricer import VehiclePricer, build_pricer, price
 from .solution import DWSolution, extract_solution, solve_by_decomposition
 from .warm_start import apply_mip_start, refine_plan, refine_solution, refinement_ratio
@@ -67,6 +73,8 @@ __all__ = [
     "earliest_departures",
     "seed_columns",
     "columns_from_evs",
+    "boundary_seed_plan",
+    "fixed_plan",
     "ColGenResult",
     "run_column_generation",
     "assign_connectors",

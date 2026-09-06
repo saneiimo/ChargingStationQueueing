@@ -21,6 +21,11 @@ Inputs the algorithm needs -- Section 8 of ``dantzig_wolfe_decomposition.html``.
     already-run simulation (FCFS or otherwise), matching the
     ``warm_start_evs`` pattern ``offline_cl_opt.adaptive`` already uses for
     the same purpose in the compact model.
+  - ``boundary_seed_plan``/``fixed_plan``: seeding for boundary vehicles
+    (``offline_cl_opt.boundary.BoundaryVehicle``, see that module's own
+    docstring and ``offline_cl_dw.colgen``'s "Boundary conditions") --
+    these never get the ordinary null-plan-based seeding above, since a
+    vehicle already queued/plugged in cannot be "never served".
 """
 
 from __future__ import annotations
@@ -28,6 +33,7 @@ from __future__ import annotations
 import math
 from typing import TYPE_CHECKING
 
+from offline_cl_opt.boundary import BoundaryMode, BoundaryVehicle
 from offline_cl_opt.instance import StationSpec, VehicleData
 from offline_cl_opt.model import earliest_departures  # noqa: F401  (re-exported)
 
@@ -38,7 +44,15 @@ if TYPE_CHECKING:
     from models.ev import EV
 
 
-def _greedy_solo_plan(v: VehicleData, pile: int, station: StationSpec, delta: float, K: int) -> Plan:
+def _greedy_solo_plan(
+    v: VehicleData,
+    pile: int,
+    station: StationSpec,
+    delta: float,
+    K: int,
+    *,
+    initial_energy: float = 0.0,
+) -> Plan:
     """
     The "charge at the acceptance limit from k_j" plan for vehicle ``v`` on
     ``pile`` -- almost the same discrete trajectory ``earliest_departures``
@@ -56,6 +70,12 @@ def _greedy_solo_plan(v: VehicleData, pile: int, station: StationSpec, delta: fl
     driver isn't charging to 100%) -- a genuine, if small, violation of
     ``x_jk <= W_j``. A third cap, ``(W_j-x)/h`` -- "don't deliver more this
     slot than what's left to reach exactly W_j" -- fixes it.
+
+    ``initial_energy``: 0.0 for an ordinary vehicle; for an OPTIMIZE-mode
+    boundary vehicle (see ``boundary_seed_plan`` below) this seeds ``x``
+    from how much it already has instead of 0 -- same "x keeps meaning
+    energy delivered since arrival" convention as
+    ``offline_cl_opt.model``/``pricer.build_pricer``.
     """
     h = delta / 60.0
     N, Delta = station.n_modules, station.p_module
@@ -64,7 +84,7 @@ def _greedy_solo_plan(v: VehicleData, pile: int, station: StationSpec, delta: fl
     k0 = _release_slot(v.a, delta)
 
     power: dict[int, float] = {}
-    x = 0.0
+    x = initial_energy
     k = k0
     while k < K and x < v.W - 1e-9:
         step_power = min(p_bar, (v.R - x) / tau_d, (v.W - x) / h)
@@ -75,6 +95,75 @@ def _greedy_solo_plan(v: VehicleData, pile: int, station: StationSpec, delta: fl
     if not power:
         return null_plan(v.id, K)
     return Plan(vehicle_id=v.id, pile=pile, start=k0, departure=departure, power=power)
+
+
+def boundary_seed_plan(
+    v: VehicleData, bv: BoundaryVehicle, station: StationSpec, delta: float, K: int
+) -> Plan:
+    """
+    A guaranteed-feasible starting column for an OPTIMIZE-mode boundary
+    vehicle (``offline_cl_opt.boundary.BoundaryVehicle``).
+
+    These vehicles get no null plan (a vehicle already mid-charge cannot be
+    "never served" -- see ``run_column_generation``'s own docstring,
+    "Boundary conditions"), so the master needs *some* feasible column for
+    them from iteration one, the role the null plan plays for everyone
+    else. Unlike an ordinary vehicle's seed, though, that column is not
+    optional: convexity forces it to lambda=1, so it lands in the capacity
+    rows (25)/(26) whether it fits or not.
+
+    That is why the simulation's own realized trajectory
+    (``BoundaryVehicle.seed_power``) is preferred over the greedy fallback.
+    A greedy solo plan is built as if the vehicle owned the whole pile
+    (``_greedy_solo_plan``'s ``p_bar = min(p_max, N*Delta)``), so two
+    boundary vehicles sharing a pile seed two columns that each demand the
+    full pool -- and with no null plan to fall back on, the restricted
+    master is infeasible before column generation starts. The realized
+    trajectories cannot do that: they actually coexisted, so they satisfy
+    the capacity rows jointly by construction.
+
+    The realized profile is also feasible for this vehicle's *own*
+    subproblem, which (unlike a FIXED vehicle's) really does enforce
+    (17)-(19): its energy-equivalent power satisfies the discrete taper
+    (18) automatically (see ``boundary.realized_slot_power``), and its
+    departure slot rounds *up*, so cumulative energy reaches exactly
+    ``W_j`` and the departure rule (19) holds -- flooring, as FIXED does,
+    would truncate energy and make the column infeasible here.
+
+    Falls back to the greedy construction only when no realized profile was
+    recorded (e.g. a hand-built ``BoundaryVehicle``), which is safe for a
+    single boundary vehicle per pile but not in general.
+    """
+    assert bv.mode is BoundaryMode.OPTIMIZE
+    if bv.seed_power and bv.seed_departure_slot > 0:
+        return Plan(
+            vehicle_id=bv.vehicle_id,
+            pile=bv.pile,
+            start=0,
+            departure=min(K, bv.seed_departure_slot),
+            power=dict(bv.seed_power),
+        )
+    return _greedy_solo_plan(
+        v, bv.pile, station, delta, K, initial_energy=bv.initial_energy_kwh
+    )
+
+
+def fixed_plan(bv: BoundaryVehicle) -> Plan:
+    """
+    The single, mandatory column for a FIXED-mode boundary vehicle -- its
+    whole trajectory is already known (see
+    ``offline_cl_opt.boundary.boundary_vehicles_from_in_service``), so this
+    is its only valid plan; nothing else is ever seeded or priced for it
+    (see ``run_column_generation``'s own docstring, "Boundary conditions").
+    """
+    assert bv.mode is BoundaryMode.FIXED
+    return Plan(
+        vehicle_id=bv.vehicle_id,
+        pile=bv.pile,
+        start=0,
+        departure=bv.departure_slot,
+        power=dict(bv.power),
+    )
 
 
 def seed_columns(
