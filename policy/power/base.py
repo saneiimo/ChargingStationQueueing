@@ -28,7 +28,7 @@ class PowerPolicy(ABC):
 
     Display names for experiments are *not* stored on the instance. Pass a
     parallel ``power_names`` list (same idea as ``queue_names``) into
-    ``experiments.replications.labeled_policy_grid``.
+    ``experiments.policy_sweep.labeled_policy_grid``.
 
     Class attributes
     ----------------
