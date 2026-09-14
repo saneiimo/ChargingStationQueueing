@@ -20,11 +20,15 @@ Validates:
      schedule passes ``postprocess.validate_schedule`` in full.
   6. Deduplication (Section 8.3) actually prevents an identical column
      from being added twice.
+  7. ``solve_integer_ub=False`` (LB-only mode) returns the same certified
+     lower bound as a full run, with every schedule-derived figure nan.
 
 Run: python -m pytest tests/test_offline_cl_dw.py -s -v
 """
 
 from __future__ import annotations
+
+import math
 
 import pytest
 
@@ -132,6 +136,33 @@ def test_single_vehicle_converges_and_delivers_exact_energy():
     assert row["served"]
     assert row["energy_kwh"] == pytest.approx(v.W, abs=1e-4)
     assert row["energy_kwh"] <= v.W + 1e-6  # never *more* than requested
+
+
+def test_lb_only_skips_price_and_branch_but_keeps_the_lower_bound():
+    """``solve_integer_ub=False`` must produce the SAME certified LB as a
+    full run (it is column generation's output alone), while leaving every
+    schedule-derived figure nan -- no integer master was solved, so
+    claiming any upper bound would be claiming a schedule that does not
+    exist."""
+    station = StationSpec(n_piles=1, n_connectors=1, n_modules=8, p_module=25.0)
+    v = _toy_vehicle(0, 0.0, 50.0, 0.2, 0.8)
+    kwargs = dict(delta=1.0, horizon_minutes=60.0, gap_tolerance=1e-4, progress=False)
+
+    full, _ = solve_by_decomposition([v], station, **kwargs)
+    lb_only, _ = solve_by_decomposition(
+        [v], station, solve_integer_ub=False, **kwargs
+    )
+
+    assert lb_only.LB == pytest.approx(full.LB, abs=1e-9)
+    assert lb_only.total_sojourn_LB == pytest.approx(full.total_sojourn_LB, abs=1e-9)
+    for missing in (lb_only.UB, lb_only.gap, lb_only.total_sojourn_UB,
+                    lb_only.mean_sojourn_UB):
+        assert math.isnan(missing)
+    # Per-cohort n comes from the vehicle list, not the schedule, so it
+    # survives; the sojourns it would summarise do not.
+    assert lb_only.by_cohort["all"]["n"] == 1.0
+    assert math.isnan(lb_only.by_cohort["all"]["mean_sojourn"])
+    assert math.isnan(float(lb_only.per_vehicle.iloc[0]["sojourn_min"]))
 
 
 # ---------------------------------------------------------------------------

@@ -77,6 +77,12 @@ class DWSolution:
     informational: purging never changes ``LB``/``UB``, only how much work
     reaching them cost.
 
+    With ``solve_by_decomposition(..., solve_integer_ub=False)`` no integer
+    master is solved: ``UB``, ``gap`` and both ``*_UB`` sojourn figures are
+    ``nan``, ``per_vehicle`` has no schedule columns, and
+    ``whole_module_feasible`` is vacuously ``True`` (no schedule was
+    checked). Everything on the ``LB`` side stays valid.
+
     ``LB``/``UB`` and every sojourn figure derived from them cover exactly
     the vehicles the objective was summed over
     (``ColGenResult.objective_cohorts``). ``by_cohort`` additionally
@@ -110,7 +116,7 @@ class DWSolution:
 
 
 def extract_solution(
-    chosen: dict[int, Plan],
+    chosen: dict[int, Plan] | None,
     vehicles: list[VehicleData],
     station: StationSpec,
     delta: float,
@@ -133,10 +139,19 @@ def extract_solution(
     warning (does not raise, does not repair) if the check fails -- see the
     warning's own text for why ``UB`` stops being a valid upper bound on
     the true (whole-module) optimum in that case, even though ``LB``
-    remains valid regardless."""
+    remains valid regardless.
+
+    ``chosen=None`` builds an **LB-only** solution: no integer master was
+    solved, so no schedule exists. Every schedule-derived figure is
+    ``nan`` (pass ``UB=float("nan")`` to keep ``gap``/``*_UB`` consistent)
+    and ``per_vehicle`` keeps only the identity/cohort/arrival columns.
+    ``by_cohort`` still reports correct per-cohort ``n`` (it comes from the
+    vehicle list, not the schedule) with ``nan`` sojourns."""
     h = delta / 60.0
-    connectors = assign_connectors(chosen, station)
-    failures = whole_module_failures(chosen, station)
+    # No schedule to post-process in LB-only mode; the whole-module check is
+    # vacuous rather than passing, so nothing is reported as a failure.
+    connectors = assign_connectors(chosen, station) if chosen is not None else {}
+    failures = whole_module_failures(chosen, station) if chosen is not None else []
     if failures:
         # (26) only enforces the *continuous*-module relaxation
         # (Proposition 2), so the schedule UB was computed from may not be
@@ -163,14 +178,21 @@ def extract_solution(
         objective_cohorts if objective_cohorts is not None else COHORTS_ALL
     )
 
+    nan = float("nan")
     rows: list[dict[str, object]] = []
     for v in vehicles:
-        plan = chosen[v.id]
-        served = not plan.is_null
-        energy_kwh = h * sum(plan.power.values())
-        start_slot = (
-            float(plan.start) if served and plan.start is not None else float(K)
-        )
+        # LB-only mode (chosen is None): the identity / cohort / arrival
+        # fields are still meaningful, every schedule-derived one is nan.
+        plan = chosen[v.id] if chosen is not None else None
+        served = (not plan.is_null) if plan is not None else None
+        energy_kwh = h * sum(plan.power.values()) if plan is not None else nan
+        start_slot = departure_slot = sojourn_min = nan
+        if plan is not None:
+            start_slot = (
+                float(plan.start) if served and plan.start is not None else float(K)
+            )
+            departure_slot = float(plan.departure)
+            sojourn_min = delta * plan.departure - v.a
         # A boundary vehicle's plan only covers the modeled window, so its
         # in-window energy is reported next to what it already had at t=0 --
         # otherwise the row reads as a shortfall against energy_required.
@@ -184,11 +206,11 @@ def extract_solution(
                 "in_objective": cohort in objective_cohorts,
                 "arrival": v.a,
                 "served": served,
-                "pile": plan.pile,
+                "pile": plan.pile if plan is not None else None,
                 "connector": connectors.get(v.id) if served else None,
                 "start_slot": start_slot,
-                "departure_slot": float(plan.departure),
-                "sojourn_min": delta * plan.departure - v.a,
+                "departure_slot": departure_slot,
+                "sojourn_min": sojourn_min,
                 "energy_kwh": energy_kwh,
                 "energy_delivered_before_kwh": bv.initial_energy_kwh if bv is not None else 0.0,
                 "energy_required_kwh": v.W,
@@ -204,9 +226,10 @@ def extract_solution(
     n = len(optimized)
     total_arrival = sum(float(r["arrival"]) for r in optimized)  # type: ignore[arg-type]
     total_sojourn_UB = delta * UB - total_arrival
-    mean_sojourn_UB = total_sojourn_UB / n if n else 0.0
+    # nan on an empty objective (see offline_cl_opt.solution) -- never 0.0.
+    mean_sojourn_UB = total_sojourn_UB / n if n else float("nan")
     total_sojourn_LB = delta * LB - total_arrival
-    mean_sojourn_LB = total_sojourn_LB / n if n else 0.0
+    mean_sojourn_LB = total_sojourn_LB / n if n else float("nan")
 
     return DWSolution(
         LB=LB,
@@ -255,6 +278,7 @@ def solve_by_decomposition(
     purge_threshold: float = 10.0,
     integer_mip_gap: float | None = 1e-3,
     integer_time_limit: float | None = None,
+    solve_integer_ub: bool = True,
     validate: bool = True,
     progress: bool = False,
 ) -> tuple[DWSolution, ColGenResult]:
@@ -303,6 +327,16 @@ def solve_by_decomposition(
     ``DWSolution.columns_purged`` and, when ``progress=True``, printed
     inline whenever a sweep actually removes something.
 
+    ``solve_integer_ub``: set ``False`` to stop after column generation and
+    skip price-and-branch (Section 9.1) entirely -- useful when only the
+    certified lower bound is wanted and the integer master is the expensive
+    part. No schedule is produced, so ``UB``/``gap`` and every ``*_UB``
+    figure on the returned ``DWSolution`` are ``nan``, ``per_vehicle``
+    carries no schedule columns, ``by_cohort`` reports ``n`` with ``nan``
+    sojourns, and ``validate`` is skipped (there is nothing to validate).
+    ``LB`` and its ``*_LB`` sojourn conversions are unaffected -- they come
+    from column generation alone.
+
     ``validate``: run ``postprocess.validate_schedule``'s full assertion
     checklist (Section 10.3) on the result before returning. Leave this on
     unless you have a specific reason not to -- it is cheap relative to
@@ -335,20 +369,22 @@ def solve_by_decomposition(
         progress=progress,
     )
 
-    integer_result: IntegerResult = solve_integer(
-        cg.master, mip_gap=integer_mip_gap, time_limit=integer_time_limit
-    )
+    integer_result: IntegerResult | None = None
+    if solve_integer_ub:
+        integer_result = solve_integer(
+            cg.master, mip_gap=integer_mip_gap, time_limit=integer_time_limit
+        )
 
     K = math.ceil(round(horizon_minutes / delta, 9))
     z_rmp_final = cg.z_rmp_history[-1] if cg.z_rmp_history else float("nan")
     solution = extract_solution(
-        integer_result.chosen,
+        integer_result.chosen if integer_result is not None else None,
         vehicles,
         station,
         delta,
         K,
         LB=cg.best_lower_bound,
-        UB=integer_result.objective,
+        UB=integer_result.objective if integer_result is not None else float("nan"),
         rmp_gap=z_rmp_final - cg.best_lower_bound,
         converged=cg.converged,
         iterations=cg.iterations,
@@ -358,7 +394,7 @@ def solve_by_decomposition(
         objective_cohorts=cg.objective_cohorts,
     )
 
-    if validate:
+    if validate and integer_result is not None:
         validate_schedule(
             integer_result.chosen,
             {v.id: v for v in vehicles},

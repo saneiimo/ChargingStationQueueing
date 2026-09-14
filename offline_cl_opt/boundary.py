@@ -552,7 +552,9 @@ def cohort_totals(
         out[name] = {
             "n": float(len(vals)),
             "total_sojourn": float(sum(vals)),
-            "mean_sojourn": float(sum(vals) / len(vals)) if vals else 0.0,
+            # nan, not 0.0: a cohort with no vehicles has no mean sojourn, and
+            # 0.0 would read as perfect service rather than as no data.
+            "mean_sojourn": float(sum(vals) / len(vals)) if vals else float("nan"),
         }
     return out
 

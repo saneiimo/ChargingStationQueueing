@@ -148,7 +148,9 @@ def extract_solution(cl_model: ConnectorLaneModel) -> ConnectorLaneSolution:
     # total and the mean.
     total_arrival = sum(float(r["arrival"]) for r in optimized)  # type: ignore[arg-type]
     total_sojourn = delta * objective - total_arrival
-    mean_sojourn = total_sojourn / n if n else 0.0
+    # nan when the objective covers no vehicle at all -- 0.0 would read as
+    # a perfect mean sojourn rather than as an empty objective.
+    mean_sojourn = total_sojourn / n if n else float("nan")
 
     return ConnectorLaneSolution(
         status=_STATUS_NAMES.get(m.Status, str(m.Status)),
