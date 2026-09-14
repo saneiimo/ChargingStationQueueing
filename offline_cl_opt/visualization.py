@@ -417,11 +417,17 @@ def plot_pile_power_and_modules(
     t_axis = np.array([k * delta for k in ks_window])
 
     def connector_arrays(connector: int):
-        """Combined (p_act, p_req, module_power) on the shared t_axis, plus per-EV power segments."""
+        """
+        Combined (p_act, p_req, module_power) on the shared t_axis, for the
+        stacked "other connectors" bars and the pile-capacity reference
+        line, plus per-EV segments -- (vid, power, request, module,
+        active-mask) -- for everything that must be drawn as one line per
+        vehicle rather than one line per connector (see below).
+        """
         p_act_tot = np.zeros(t_axis.shape)
         p_req_tot = np.zeros(t_axis.shape)
         mod_tot = np.zeros(t_axis.shape)
-        segments: list[tuple[int, np.ndarray]] = []
+        segments: list[tuple[int, np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
         for vid, k_start, k_end in by_connector.get(connector, []):
             by_time = {
                 t: (p, req, mp) for t, p, req, mp in zip(*vehicle_slot_series(cm, vid))
@@ -429,15 +435,17 @@ def plot_pile_power_and_modules(
             seg_p = np.zeros(t_axis.shape)
             seg_req = np.zeros(t_axis.shape)
             seg_mod = np.zeros(t_axis.shape)
+            seg_active = np.zeros(t_axis.shape, dtype=bool)
             for wi, k in enumerate(ks_window):
                 if k_start <= k < k_end:
+                    seg_active[wi] = True
                     kt = k * delta
                     if kt in by_time:
                         seg_p[wi], seg_req[wi], seg_mod[wi] = by_time[kt]
             p_act_tot += seg_p
             p_req_tot += seg_req
             mod_tot += seg_mod
-            segments.append((vid, seg_p))
+            segments.append((vid, seg_p, seg_req, seg_mod, seg_active))
         return p_act_tot, p_req_tot, mod_tot, segments
 
     arrays_by_connector = {n: connector_arrays(n) for n in range(n_connectors)}
@@ -455,7 +463,7 @@ def plot_pile_power_and_modules(
 
     for connector in range(n_connectors):
         ax = axes[connector]
-        own_p, own_req, own_mod, own_segments = arrays_by_connector[connector]
+        own_p, _own_req, _own_mod, own_segments = arrays_by_connector[connector]
 
         if show_pile_capacity:
             ax.axhline(
@@ -485,7 +493,7 @@ def plot_pile_power_and_modules(
             ax.grid(True, axis="x", alpha=viz_style.GRID_ALPHA * 0.7, linewidth=viz_style.GRID_LINEWIDTH)
             continue
 
-        for vid, seg_p in own_segments:
+        for vid, seg_p, _seg_req, _seg_mod, _seg_active in own_segments:
             if not np.any(seg_p > 0):
                 continue
             any_bars = True
@@ -524,33 +532,53 @@ def plot_pile_power_and_modules(
                 )
                 running_bottom = running_bottom + other_p
 
-        if show_bms_request and t_axis.size:
-            ax.plot(
-                t_axis + bar_width / 2,
-                own_req,
-                ls="--",
-                lw=viz_style.LINEWIDTH_SIM,
-                color=viz_style.series_color("sim_bms"),
-                marker="o",
-                markersize=2.5,
-                zorder=4,
-            )
+        # BMS request and module capacity are drawn ONE LINE PER VEHICLE, not
+        # one line for the whole connector: own_req/own_mod sum every
+        # occupant's values onto the shared t_axis (fine for a bar, since
+        # each bar is its own artist), but a single ax.plot/ax.step over that
+        # combined array draws one continuous polyline through every point in
+        # order -- including straight through the zero gap between two
+        # vehicles, or, when one vehicle hands the connector to the next with
+        # no gap at all, directly from one vehicle's last value to the next
+        # vehicle's first, splicing two different vehicles' curves into one.
+        # Slicing out each vehicle's own contiguous active window (occupancy
+        # is always one contiguous stay, Proposition 2) and giving it its own
+        # plot call keeps every vehicle visually and programmatically distinct.
+        for vid, _seg_p, seg_req, seg_mod, seg_active in own_segments:
+            idx = np.flatnonzero(seg_active)
+            if idx.size == 0:
+                continue
+            t_v = t_axis[idx]
 
-        if show_modules and t_axis.size:
-            any_modules = True
-            # Same closing-point fix as _plot_one_vehicle -- a "post" step
-            # otherwise never draws the last slot's segment at all.
-            step_t = np.append(t_axis, t_axis[-1] + delta)
-            step_y = np.append(own_mod, own_mod[-1])
-            ax.step(
-                step_t,
-                step_y,
-                where="post",
-                ls="--",
-                lw=viz_style.LINEWIDTH_SIM * 0.9,
-                color=viz_style.series_color("modules"),
-                zorder=2,
-            )
+            if show_bms_request:
+                ax.plot(
+                    t_v + bar_width / 2,
+                    seg_req[idx],
+                    ls="--",
+                    lw=viz_style.LINEWIDTH_SIM,
+                    color=viz_style.series_color("sim_bms"),
+                    marker="o",
+                    markersize=2.5,
+                    zorder=4,
+                )
+
+            if show_modules:
+                any_modules = True
+                # Same closing-point fix as _plot_one_vehicle -- a "post"
+                # step otherwise never draws this vehicle's last slot at
+                # all -- now closed off at THIS vehicle's own end, not the
+                # connector's, so it never borrows the next occupant's value.
+                step_t = np.append(t_v, t_v[-1] + delta)
+                step_y = np.append(seg_mod[idx], seg_mod[idx][-1])
+                ax.step(
+                    step_t,
+                    step_y,
+                    where="post",
+                    ls="--",
+                    lw=viz_style.LINEWIDTH_SIM * 0.9,
+                    color=viz_style.series_color("modules"),
+                    zorder=2,
+                )
 
         ax.set_ylabel(f"Connector {connector}\nP (kW)")
         ax.set_xlim(t_lo, t_hi)
