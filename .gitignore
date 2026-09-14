@@ -11,6 +11,9 @@ data/
 *.csv
 *.parquet
 
+# Experiment sweep output (results.csv, per-trial JSON, run metadata)
+experiments/results/
+
 # Virtual environments only (do not list ENV/ — on Windows it also matches env/)
 .venv/
 venv/
