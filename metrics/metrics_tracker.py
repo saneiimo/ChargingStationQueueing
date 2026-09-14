@@ -284,6 +284,21 @@ class MetricsTracker:
         (``arrival_time >= warmup_period``), i.e. after
         ``queued_at_warmup_end``/``in_service_at_warmup_end`` were captured.
 
+        Vehicles already captured in the boundary snapshot are excluded, so
+        the three cohorts stay disjoint. That matters for the boundary
+        instant itself: an arrival landing exactly on ``warmup_period``
+        (which a gridded arrival stream makes routine -- see
+        ``simulation.arrivals``' ``delta_arr``, whose grid typically divides
+        ``warmup_period``) passes the ``>=`` test *and* can already be
+        queued or plugged in when the snapshot is taken. The snapshot is
+        authoritative about who was physically present at the boundary --
+        an EV already on a connector has a real lane the optimizer cannot
+        reassign -- so it wins, and this property yields the rest.
+        Without this, such an EV appears in two cohorts at once and
+        ``offline_cl_opt.boundary.build_measurement_instance`` emits it
+        twice, which surfaces as a bare
+        ``KeyError: 'Duplicate keys in Model.addVars()'``.
+
         Unlike those two (a point-in-time snapshot that cannot be
         reconstructed later -- once an EV leaves the live queue, it's
         gone), this needs no separate bookkeeping: ``arrived_evs`` already
@@ -301,7 +316,12 @@ class MetricsTracker:
         third case -- vehicles already mid-charge at the boundary -- see
         that class's own docstring.)
         """
-        return [ev for ev in self.arrived_evs if ev.arrival_time >= self.warmup_period]
+        at_boundary = self.cohort_ev_ids(queued=True, boundary=True)
+        return [
+            ev
+            for ev in self.arrived_evs
+            if ev.arrival_time >= self.warmup_period and ev.id not in at_boundary
+        ]
 
     def update_metrics(
         self, station: ChargingStation, delta_t: float, current_time: float
@@ -679,9 +699,219 @@ class MetricsTracker:
             out[name] = {
                 "n": float(sojourns.size),
                 "total_sojourn": float(np.sum(sojourns)) if sojourns.size else 0.0,
-                "mean_sojourn": float(np.mean(sojourns)) if sojourns.size else 0.0,
+                # nan, not 0.0: an empty cohort has no data, and a 0-minute mean
+                # sojourn would read as perfect service instead.
+                "mean_sojourn": (
+                    float(np.mean(sojourns)) if sojourns.size else float("nan")
+                ),
             }
         return out
+
+    # ---------------------------------------------------------------- #
+    # Arrived-inclusive (censored) reporting
+    #
+    # ``sojourn_by_cohort``/``grid_sojourn_by_cohort`` above condition on
+    # an outcome: they cover vehicles that FINISHED inside the run. The
+    # offline models cannot do that -- they report every vehicle they were
+    # given, censoring the unfinished at the horizon (D_j = K, Section
+    # 6.3). Comparing the two directly averages different populations, and
+    # the bias is one-directional: the simulation drops precisely the
+    # longest sojourns while the model keeps them at their censored value,
+    # so the optimizer looks worse than it is. The methods below are the
+    # matching view -- every arrived vehicle, unfinished ones censored at
+    # the window's end, exactly the convention the models use.
+    # ---------------------------------------------------------------- #
+
+    def censored_evs(
+        self,
+        since: float = 0.0,
+        *,
+        include_ids: set[int] | None = None,
+        exclude_ids: set[int] | None = None,
+    ) -> list["EV"]:
+        """
+        Vehicles in scope that arrived but never finished (still queued or
+        still charging when the run ended).
+
+        Dropped and flushed EVs are excluded: neither has any counterpart
+        in the offline instance (the models are handed only
+        ``arrived_post_warmup``, and have no "drop" decision at all), so
+        censoring them here would re-create the very population mismatch
+        this is meant to remove. ``exclude_ids`` drops anything else the
+        caller knows is absent from the model's instance -- in particular
+        the closing-edge arrivals whose release slot lands at or past K.
+        """
+        include_ids = include_ids or set()
+        exclude_ids = exclude_ids or set()
+        gone = {ev.id for ev in self.finished_evs}
+        gone |= {ev.id for ev in self.dropped_evs}
+        gone |= {ev.id for ev in self.flushed_evs}
+        return [
+            ev
+            for ev in self.arrived_evs
+            if ev.id not in gone
+            and ev.id not in exclude_ids
+            and (ev.arrival_time >= since or ev.id in include_ids)
+        ]
+
+    def arrived_sojourn_by_cohort(
+        self,
+        since: float = 0.0,
+        *,
+        censor_at: float,
+        truncate_included: bool = True,
+        exclude_ids: set[int] | None = None,
+    ) -> dict[str, dict[str, float]]:
+        """
+        ``sojourn_by_cohort`` over every arrived vehicle, not just the
+        finished ones: an unfinished vehicle contributes ``censor_at -
+        origin`` (its ``origin`` being the window start when it is a
+        truncated boundary/queued vehicle, else its own arrival), which is
+        the simulation-side twin of the models' ``delta*K - a_j``.
+
+        ``censor_at`` is the window's end on the *simulation's* clock (i.e.
+        ``warmup_period + max_time``); pass the same ``since`` you would
+        pass to ``sojourn_by_cohort``. The two conventions coincide exactly
+        when ``max_time`` is a whole number of slots -- otherwise the
+        models censor at ``delta*ceil(max_time/delta) >= max_time`` and run
+        marginally higher.
+
+        Adds ``n_censored`` to each cohort's dict alongside the usual
+        ``n``/``total_sojourn``/``mean_sojourn`` (here ``n`` counts every
+        arrived vehicle, censored included). ``mean_sojourn`` is ``nan``
+        for an empty cohort rather than ``0.0`` -- a zero mean sojourn
+        would read as perfect service instead of no data.
+        """
+        levels = (
+            ("measurement", {"queued": False, "boundary": False}),
+            ("measurement_queued", {"queued": True, "boundary": False}),
+            ("all", {"queued": True, "boundary": True}),
+        )
+        out: dict[str, dict[str, float]] = {}
+        for name, flags in levels:
+            keep = self.cohort_ev_ids(**flags)  # type: ignore[arg-type]
+            _, _, finished = self.finished_time_arrays(
+                since, include_ids=keep, truncate_included=truncate_included
+            )
+            sojourns = list(finished)
+            censored = self.censored_evs(
+                since, include_ids=keep, exclude_ids=exclude_ids
+            )
+            for ev in censored:
+                added = ev.arrival_time < since
+                origin = since if (added and truncate_included) else ev.arrival_time
+                sojourns.append(max(0.0, censor_at - origin))
+            out[name] = {
+                "n": float(len(sojourns)),
+                "n_censored": float(len(censored)),
+                "total_sojourn": float(sum(sojourns)),
+                "mean_sojourn": (
+                    float(sum(sojourns) / len(sojourns)) if sojourns else float("nan")
+                ),
+            }
+        return out
+
+    def arrived_grid_sojourn_by_cohort(
+        self,
+        delta: float,
+        since: float = 0.0,
+        *,
+        censor_at: float,
+        exclude_ids: set[int] | None = None,
+    ) -> dict[str, dict[str, float]]:
+        """
+        ``grid_sojourn_by_cohort`` over every arrived vehicle.
+
+        Unfinished vehicles are pinned to the horizon slot ``K =
+        ceil((censor_at - since)/delta)``, matching the models' censoring.
+        This never perturbs the finished vehicles' own slots: an unfinished
+        vehicle is always last on its lane (nobody can inherit its
+        connector until it leaves), and one that was never plugged in holds
+        no lane at all.
+        """
+        departure_slot, by_id = self._grid_departure_slots(delta, since)
+        K = math.ceil(round((censor_at - since) / delta, 9))
+
+        levels = (
+            ("measurement", {"queued": False, "boundary": False}),
+            ("measurement_queued", {"queued": True, "boundary": False}),
+            ("all", {"queued": True, "boundary": True}),
+        )
+        out: dict[str, dict[str, float]] = {}
+        for name, flags in levels:
+            keep = self.cohort_ev_ids(**flags)  # type: ignore[arg-type]
+            rows: list[tuple[int, float]] = []  # (departure_slot, a_rel)
+            for j, slot in departure_slot.items():
+                ev = by_id[j]
+                if ev.arrival_time >= since or j in keep:
+                    if not (exclude_ids and j in exclude_ids):
+                        rows.append((slot, max(0.0, ev.arrival_time - since)))
+            censored = self.censored_evs(
+                since, include_ids=keep, exclude_ids=exclude_ids
+            )
+            for ev in censored:
+                rows.append((K, max(0.0, ev.arrival_time - since)))
+
+            sojourns = [delta * slot - a_rel for slot, a_rel in rows]
+            out[name] = {
+                "n": float(len(rows)),
+                "n_censored": float(len(censored)),
+                "total_sojourn": float(sum(sojourns)),
+                "mean_sojourn": (
+                    float(sum(sojourns) / len(sojourns)) if sojourns else float("nan")
+                ),
+                "total_departure_slots": float(sum(slot for slot, _ in rows)),
+            }
+        return out
+
+    def _grid_departure_slots(
+        self, delta: float, since: float
+    ) -> tuple[dict[int, int], dict[int, "EV"]]:
+        """
+        Replay each lane's handover chain on the ``delta`` grid.
+
+        Shared by ``grid_sojourn_by_cohort`` and its arrived-inclusive
+        counterpart; see the former's docstring for the method and its
+        caveats. Covers finished vehicles only -- an unfinished one has no
+        ``departure_time`` to discretize, and is always chain-*terminal*
+        (nobody can inherit its connector until it leaves), so a caller
+        that wants those can append them at the horizon without disturbing
+        any slot computed here.
+
+        Returns ``(departure_slot_by_id, ev_by_id)``.
+        """
+        if delta <= 0:
+            raise ValueError(f"delta must be positive, got {delta}")
+
+        # Vehicles that actually held a lane inside the window.
+        active = [
+            ev
+            for ev in self.finished_evs
+            if ev.service_start_time is not None
+            and np.isfinite(ev.departure_time)
+            and ev.departure_time > since
+            and ev.pile_tracker is not None
+            and ev.connector_id_tracker is not None
+        ]
+
+        lanes: dict[tuple[int, int], list["EV"]] = {}
+        for ev in active:
+            lanes.setdefault(
+                (ev.pile_tracker.id, ev.connector_id_tracker), []  # type: ignore[union-attr]
+            ).append(ev)
+
+        departure_slot: dict[int, int] = {}
+        for group in lanes.values():
+            group.sort(key=lambda e: e.service_start_time)  # type: ignore[arg-type,return-value]
+            lane_free = 0
+            for ev in group:
+                a_rel = max(0.0, ev.arrival_time - since)
+                served_from = max(float(ev.service_start_time), since)  # type: ignore[arg-type]
+                need = math.ceil(round((ev.departure_time - served_from) / delta, 9))
+                start = max(math.ceil(round(a_rel / delta, 9)), lane_free)
+                departure_slot[ev.id] = lane_free = start + max(need, 1)
+
+        return departure_slot, {ev.id: ev for ev in active}
 
     def grid_sojourn_by_cohort(
         self, delta: float, since: float = 0.0
@@ -729,38 +959,7 @@ class MetricsTracker:
         ``ConnectorLaneSolution.objective`` when the objective covers the
         matching cohorts.
         """
-        if delta <= 0:
-            raise ValueError(f"delta must be positive, got {delta}")
-
-        # Vehicles that actually held a lane inside the window.
-        active = [
-            ev
-            for ev in self.finished_evs
-            if ev.service_start_time is not None
-            and np.isfinite(ev.departure_time)
-            and ev.departure_time > since
-            and ev.pile_tracker is not None
-            and ev.connector_id_tracker is not None
-        ]
-
-        lanes: dict[tuple[int, int], list["EV"]] = {}
-        for ev in active:
-            lanes.setdefault(
-                (ev.pile_tracker.id, ev.connector_id_tracker), []  # type: ignore[union-attr]
-            ).append(ev)
-
-        departure_slot: dict[int, int] = {}
-        for group in lanes.values():
-            group.sort(key=lambda e: e.service_start_time)  # type: ignore[arg-type,return-value]
-            lane_free = 0
-            for ev in group:
-                a_rel = max(0.0, ev.arrival_time - since)
-                served_from = max(float(ev.service_start_time), since)  # type: ignore[arg-type]
-                need = math.ceil(round((ev.departure_time - served_from) / delta, 9))
-                start = max(math.ceil(round(a_rel / delta, 9)), lane_free)
-                departure_slot[ev.id] = lane_free = start + max(need, 1)
-
-        by_id = {ev.id: ev for ev in active}
+        departure_slot, by_id = self._grid_departure_slots(delta, since)
         levels = (
             ("measurement", {"queued": False, "boundary": False}),
             ("measurement_queued", {"queued": True, "boundary": False}),
@@ -781,7 +980,9 @@ class MetricsTracker:
             out[name] = {
                 "n": float(len(ids)),
                 "total_sojourn": float(sum(sojourns)),
-                "mean_sojourn": float(sum(sojourns) / len(sojourns)) if sojourns else 0.0,
+                "mean_sojourn": (  # nan on an empty cohort -- see sojourn_by_cohort
+                    float(sum(sojourns) / len(sojourns)) if sojourns else float("nan")
+                ),
                 "total_departure_slots": float(sum(departure_slot[j] for j in ids)),
             }
         return out
