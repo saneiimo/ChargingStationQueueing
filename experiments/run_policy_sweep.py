@@ -55,7 +55,7 @@ from experiments.policy_sweep import (
     HR2MIN,
 )
 
-RUN_NAME = "power_sweep"
+RUN_NAME = "queue_sweep_PMatch"
 
 # Everything held constant across the sweep.
 BASE = PolicyConfig(
@@ -64,21 +64,21 @@ BASE = PolicyConfig(
     n_connectors=2,
     n_modules=6,
     p_module=25.0,
-    battery_cap_kwh=[75],
+    battery_cap_kwh=[50, 75, 100],
     queue_capacity=1000,
     # traffic
     warmup_period=6 * HR2MIN,  # long relative to max_time, to reach steady state
     max_time=24 * HR2MIN,  # measured window (minutes); None -> config.MAX_TIME
     delta_arr=None,  # None keeps continuous exponential arrival times
     # who races
-    queue_policies=("FIFO",),
-    power_policies=("Prop", "Constant"),
+    queue_policies=("FIFO", "PMatch"),  # "LSoCD", "PMatch"
+    power_policies=("Prop",),
     # max-wait override, as in compare_policies.ipynb: FIFO runs with none,
     # then every other queue policy gets FIFO's observed mean max wait x the
     # factor. Set `max_wait=<float>` instead for a fixed value applied to
     # everyone, or leave both unset to disable the override entirely.
-    max_wait_from=None,  # "FIFO"
-    max_wait_factor=0.75,
+    max_wait_from="FIFO",  # "FIFO"
+    max_wait_factor=0.65,  # 0.75
     # replication budget -- 30 paired replications per policy per config
     n_reps=30,
     seed0=1,
