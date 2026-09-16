@@ -669,6 +669,96 @@ class MetricsTracker:
             np.asarray(sojourns, dtype=float),
         )
 
+    def in_system_time_arrays(
+        self,
+        station: "ChargingStation",
+        now: float,
+        since: float = 0.0,
+        *,
+        include_ids: set[int] | None = None,
+        truncate_included: bool = True,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Like ``finished_time_arrays``, but also counting the vehicles still
+        in the system at ``now`` -- right-censored at that instant.
+
+        ``finished_time_arrays`` reports only completed stays, which
+        silently excludes exactly the vehicles having the worst time of it:
+        with a busy station, the ones still queued or still charging when
+        the run ends are disproportionately the slow ones, so a
+        finished-only mean is optimistic. This includes them, clocking each
+        unfinished vehicle up to ``now`` instead of to a departure it never
+        had.
+
+        **The result is a lower bound, not an estimate.** Every unfinished
+        vehicle contributes less than its eventual true value (it has not
+        left yet), so the mean sits below the true mean for the same
+        cohort. Read it as "at least this bad", and pair it with the
+        finished-only figure rather than replacing it: together they
+        bracket the truth. The gap between the two is driven by how many
+        vehicles are still in flight -- lengthen the run until that
+        fraction is small and the two converge.
+
+        What each unfinished vehicle contributes:
+
+        * still queued (never plugged in) -- wait and sojourn are both
+          censored at ``now``; **service is NaN**, not 0. Such a vehicle has
+          no charge time to censor, so it is excluded from service averages
+          rather than dragged into them as a structural zero -- counting it
+          as 0 would conflate "charged briefly" with "never charged" and
+          pull the mean sharply down.
+        * still plugged in -- its wait is *complete* and exact (it did
+          start service); only service and sojourn are censored.
+
+        So the returned arrays are aligned one row per vehicle, but the
+        service array may contain NaN. Average it with ``np.nanmean``.
+
+        Dropped vehicles are not included: they were turned away rather
+        than served, and are counted separately by the drop metrics. The
+        finished / queued / plugged sets are disjoint by construction (see
+        ``metrics.validate``'s ``arrived = finished + dropped + flushed +
+        queued + plugged`` identity), so nothing is double-counted.
+
+        ``since`` / ``include_ids`` / ``truncate_included`` mean exactly
+        what they do in ``finished_time_arrays``. ``now`` is normally
+        ``engine.current_time``.
+        """
+        waits, services, sojourns = self.finished_time_arrays(
+            since, include_ids=include_ids, truncate_included=truncate_included
+        )
+        include_ids = include_ids or set()
+        now = float(now)
+
+        still_here = list(station.queue) + [
+            ev for pile in station.piles for ev in pile.evs
+        ]
+        w: list[float] = []
+        s: list[float] = []
+        j: list[float] = []
+        for ev in still_here:
+            added = ev.arrival_time < since and ev.id in include_ids
+            if ev.arrival_time < since and not added:
+                continue
+            origin = since if (added and truncate_included) else ev.arrival_time
+            start = ev.service_start_time
+            if start is None:
+                # Still waiting: the wait is as long as the run allowed, and
+                # there is no charge time to censor -- NaN, not 0, so service
+                # averages skip it instead of being pulled down by it.
+                w.append(max(0.0, now - origin))
+                s.append(float("nan"))
+            else:
+                # Plugged in: the wait actually finished, the service did not.
+                w.append(max(0.0, start - origin))
+                s.append(max(0.0, now - max(start, origin)))
+            j.append(max(0.0, now - origin))
+
+        return (
+            np.concatenate([waits, np.asarray(w, dtype=float)]),
+            np.concatenate([services, np.asarray(s, dtype=float)]),
+            np.concatenate([sojourns, np.asarray(j, dtype=float)]),
+        )
+
     def sojourn_by_cohort(
         self, since: float = 0.0, *, truncate_included: bool = True
     ) -> dict[str, dict[str, float]]:
