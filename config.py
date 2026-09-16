@@ -18,7 +18,7 @@ MODULE_CHECK_THRESH = 0.2
 S_THRESH = 0.4
 
 # How we sample arriving EVs in the engine.
-BATTERY_CAP_OPTIONS = [50, 80, 120]
+BATTERY_CAP_OPTIONS = [50, 75, 100]
 # BATTERY_CAP_OPTIONS = [75.0]
 # Battery capacity are inputted as kWh, however for calculation
 # we need a unit conversion, as the simulation time is in minutes
