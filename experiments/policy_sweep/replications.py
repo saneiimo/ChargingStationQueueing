@@ -28,6 +28,33 @@ from policy.queue.fifo import FIFOQueuePolicy
 from policy.queue.base import QueuePolicy
 
 
+def _mean_or_zero(samples: np.ndarray) -> float:
+    """
+    Mean of ``samples``, ignoring NaN, or 0.0 when nothing is left.
+
+    NaN marks "not applicable" rather than missing data -- the service time
+    of a vehicle that never started charging (see
+    ``MetricsTracker.in_system_time_arrays``). Dropping those keeps a charge
+    time an average over vehicles that actually charged. The 0.0 fallback
+    matches the convention ``MetricsTracker.mean_wait`` / ``mean_sojourn``
+    already use for an empty episode.
+    """
+    if not samples.size:
+        return 0.0
+    usable = samples[~np.isnan(samples)]
+    return float(usable.mean()) if usable.size else 0.0
+
+
+def _max_or_zero(samples: np.ndarray) -> float:
+    """Maximum of ``samples``, ignoring NaN, or 0.0 when nothing is left --
+    the extremum counterpart of ``_mean_or_zero``, matching
+    ``MetricsTracker.max_wait``'s empty-episode convention."""
+    if not samples.size:
+        return 0.0
+    usable = samples[~np.isnan(samples)]
+    return float(usable.max()) if usable.size else 0.0
+
+
 # Display name -> extractor(env) after one finished episode.
 # Time metrics are minutes among finished EVs:
 #   avg wait time     = mean queue wait W_q
@@ -58,6 +85,36 @@ DEFAULT_METRICS: dict[str, Callable[[ChargingStationEnv], float]] = {
         e.engine.current_time,
         n_servers=e.engine.station.n_piles * e.engine.station.n_connectors,
     )["rho_theory"],
+    # The "(all)" family counts vehicles still in the system at the end of
+    # the run as well as the finished ones, right-censored at that instant
+    # -- see MetricsTracker.in_system_time_arrays. Each is a LOWER BOUND on
+    # its finished-only namesake's true value, because an unfinished vehicle
+    # contributes less than it eventually would. Report the pair, not just
+    # one: finished-only is optimistic (it drops the stragglers), "(all)" is
+    # pessimistically clipped, and the truth is between them.
+    "in-system EVs": lambda e: float(
+        len(e.engine.metrics.in_system_time_arrays(
+            e.engine.station, e.engine.current_time)[2])
+    ),
+    "avg wait time (all)": lambda e: _mean_or_zero(
+        e.engine.metrics.in_system_time_arrays(
+            e.engine.station, e.engine.current_time)[0]
+    ),
+    # The censoring bites hardest here: the longest wait in the station is
+    # very often a vehicle still sitting in the queue when the run ends, so
+    # the finished-only maximum can miss the worst case entirely.
+    "max wait time (all)": lambda e: _max_or_zero(
+        e.engine.metrics.in_system_time_arrays(
+            e.engine.station, e.engine.current_time)[0]
+    ),
+    "avg charge time (all)": lambda e: _mean_or_zero(
+        e.engine.metrics.in_system_time_arrays(
+            e.engine.station, e.engine.current_time)[1]
+    ),
+    "avg sys time (all)": lambda e: _mean_or_zero(
+        e.engine.metrics.in_system_time_arrays(
+            e.engine.station, e.engine.current_time)[2]
+    ),
 }
 
 # Same metric names, restricted to the measured phase only -- `since=
@@ -96,6 +153,30 @@ DEFAULT_METRICS_POST_WARMUP: dict[str, Callable[[ChargingStationEnv], float]] = 
         n_servers=e.engine.station.n_piles * e.engine.station.n_connectors,
         since=e.engine.warmup_period,
     )["rho_theory"],
+    # Measured-phase counterpart of the "(all)" family above. Note the
+    # censoring bites harder here: the measured window is shorter than the
+    # whole run, so a larger share of its arrivals are still in flight when
+    # the episode ends.
+    "in-system EVs": lambda e: float(
+        len(e.engine.metrics.in_system_time_arrays(
+            e.engine.station, e.engine.current_time, e.engine.warmup_period)[2])
+    ),
+    "avg wait time (all)": lambda e: _mean_or_zero(
+        e.engine.metrics.in_system_time_arrays(
+            e.engine.station, e.engine.current_time, e.engine.warmup_period)[0]
+    ),
+    "max wait time (all)": lambda e: _max_or_zero(
+        e.engine.metrics.in_system_time_arrays(
+            e.engine.station, e.engine.current_time, e.engine.warmup_period)[0]
+    ),
+    "avg charge time (all)": lambda e: _mean_or_zero(
+        e.engine.metrics.in_system_time_arrays(
+            e.engine.station, e.engine.current_time, e.engine.warmup_period)[1]
+    ),
+    "avg sys time (all)": lambda e: _mean_or_zero(
+        e.engine.metrics.in_system_time_arrays(
+            e.engine.station, e.engine.current_time, e.engine.warmup_period)[2]
+    ),
 }
 
 
