@@ -32,7 +32,9 @@ from typing import Any
 
 import numpy as np
 
+from config import C_RATE, S_THRESH
 from env.charging_env import ChargingStationEnv
+from models.ev import EV
 from offline_cl_dw import solve_by_decomposition
 from offline_cl_opt import (
     StationSpec,
@@ -45,7 +47,7 @@ from policy.power.proportional import ProportionalPower
 from policy.queue.fifo import FIFOQueuePolicy
 from simulation.arrivals import generate_arrivals
 
-from .config import TrialConfig
+from .config import HR2MIN, TrialConfig
 
 # Cohort levels, in the nesting order both packages report them.
 COHORT_NAMES = ("measurement", "measurement_queued", "all")
@@ -83,6 +85,10 @@ class TrialResult:
     config: TrialConfig
     counts: dict[str, Any] = field(default_factory=dict)
     instance: dict[str, Any] = field(default_factory=dict)
+    # Arrival specs the DES was actually fed (see ``arrival_specs``). Kept
+    # so a later notebook can rebuild the env without re-drawing the stream.
+    # Not copied into ``results.csv`` -- one row per EV would blow the table.
+    arrivals: list[dict[str, Any]] = field(default_factory=list)
     sim: dict[str, Any] | None = None
     grid: dict[str, Any] | None = None
     exact: dict[str, Any] | None = None
@@ -94,14 +100,114 @@ class TrialResult:
 # --------------------------------------------------------------------------- #
 
 
-def run_episode(cfg: TrialConfig) -> tuple[ChargingStationEnv, float]:
+def arrival_specs(evs: list[EV]) -> list[dict[str, Any]]:
+    """
+    JSON-ready copy of an arrival list, before any DES state is written.
+
+    These six fields are everything ``EV`` needs to start an episode
+    (``s_th`` / ``c_rate`` default to ``config.py`` when omitted, but they
+    are stored anyway so a later change of those defaults cannot silently
+    redraw the same trial). Runtime fields (SoC, pile, energy, traces) are
+    intentionally absent: the point is to rebuild, not to pickle the env.
+    """
+    return [
+        {
+            "id": int(ev.id),
+            "c_b": float(ev.c_b),
+            "s_i": float(ev.s_i),
+            "s_f": float(ev.s_f),
+            "arrival_time": float(ev.arrival_time),
+            "s_th": float(ev.s_th),
+            "c_rate": float(ev.c_rate),
+        }
+        for ev in evs
+    ]
+
+
+def evs_from_specs(specs: list[dict[str, Any]]) -> list[EV]:
+    """Fresh ``EV`` objects from an ``arrival_specs`` record."""
+    return [
+        EV(
+            id=int(row["id"]),
+            c_b=float(row["c_b"]),
+            s_i=float(row["s_i"]),
+            s_f=float(row["s_f"]),
+            arrival_time=float(row["arrival_time"]),
+            s_th=float(row.get("s_th", S_THRESH)),
+            c_rate=float(row.get("c_rate", C_RATE)),
+        )
+        for row in specs
+    ]
+
+
+def _battery_caps_kwmin(config: dict[str, Any]) -> list[float]:
+    """``TrialConfig.to_row()`` stores kWh as a comma string; accept either."""
+    raw = config["battery_cap_kwh"]
+    if isinstance(raw, str):
+        kwh = [float(part) for part in raw.split(",") if part.strip()]
+    else:
+        kwh = [float(part) for part in raw]
+    return [cap * HR2MIN for cap in kwh]
+
+
+def _resolved_delta_arr(config: dict[str, Any]) -> float | None:
+    """Match ``TrialConfig.resolved_delta_arr`` on a ``to_row()`` dict."""
+    delta_arr = config.get("delta_arr", "delta")
+    if delta_arr == "delta":
+        return float(config["delta"])
+    if delta_arr is None:
+        return None
+    return float(delta_arr)
+
+
+def _drive_fifo(env: ChargingStationEnv, policy_seed: int, obs) -> float:
+    """FIFO loop after ``env.reset``. Returns the loop's wall-clock seconds."""
+    rng = np.random.default_rng(policy_seed)
+    policy = FIFOQueuePolicy()
+    t0 = time.perf_counter()
+    done = bool(env.engine.terminated)
+    while not done:
+        mask = env.action_masks()
+        ev, pile_id = policy.decide(obs, mask, rng, env.engine.station)
+        obs, _, done, _, _ = env.step(pile_id, ev=ev)
+    return time.perf_counter() - t0
+
+
+def _make_env(config: dict[str, Any], evs: list[EV]) -> ChargingStationEnv:
+    """
+    The station ``run_episode`` builds: proportional power, external arrivals.
+
+    ``config`` is a ``TrialConfig.to_row()`` dict (or anything with the same
+    keys). ``mean_interarrival`` is forced to ``None`` so the saved list is
+    what the engine uses, not a fresh Poisson draw.
+    """
+    return ChargingStationEnv(
+        n_piles=int(config["n_piles"]),
+        n_connectors=int(config["n_connectors"]),
+        n_modules=int(config["n_modules"]),
+        p_module=float(config["p_module"]),
+        queue_capacity=int(config["queue_capacity"]),
+        power_policy=ProportionalPower(),
+        mean_interarrival=None,
+        arrivals=evs,
+        max_time=float(config["max_time"]),
+        battery_cap_options=_battery_caps_kwmin(config),
+        delta_arr=_resolved_delta_arr(config),
+        warmup_period=float(config["warmup_period"]),
+        flush_queue_at_warmup=bool(config.get("flush_queue_at_warmup", False)),
+    )
+
+
+def run_episode(cfg: TrialConfig) -> tuple[ChargingStationEnv, float, list[dict[str, Any]]]:
     """
     Run one FIFO / proportional-power episode over warm-up + measured phase.
 
     The arrival stream is drawn once, over ``cfg.draw_horizon`` (a one-shot
     draw, not resampled per phase), and handed to the env with
     ``mean_interarrival=None`` so the external list is what gets used.
-    Returns the finished env and the wall-clock runtime.
+    Returns ``(env, wall_clock_s, arrival_specs)``. The specs are taken from
+    the list *before* the episode mutates any EV, so ``replay_episode`` can
+    rebuild the same env from disk.
 
     Note that the draw horizon itself is part of the random stream -- see
     ``TrialConfig.arrival_horizon`` for why that matters when sweeping
@@ -114,34 +220,67 @@ def run_episode(cfg: TrialConfig) -> tuple[ChargingStationEnv, float]:
         battery_cap_options=cfg.battery_cap_options,
         delta_arr=cfg.resolved_delta_arr,
     )
-
-    env = ChargingStationEnv(
-        n_piles=cfg.n_piles,
-        n_connectors=cfg.n_connectors,
-        n_modules=cfg.n_modules,
-        p_module=cfg.p_module,
-        queue_capacity=cfg.queue_capacity,
-        power_policy=ProportionalPower(),
-        mean_interarrival=None,  # None -> use `arrivals`, not internal sampling
-        arrivals=evs,
-        max_time=cfg.max_time,
-        battery_cap_options=cfg.battery_cap_options,
-        delta_arr=cfg.resolved_delta_arr,
-        warmup_period=cfg.warmup_period,
-        flush_queue_at_warmup=cfg.flush_queue_at_warmup,
-    )
-
+    specs = arrival_specs(evs)
+    env = _make_env(cfg.to_row(), evs)
     obs, _ = env.reset(seed=cfg.seed)
-    rng = np.random.default_rng(cfg.policy_seed)
-    policy = FIFOQueuePolicy()
+    runtime = _drive_fifo(env, cfg.policy_seed, obs)
+    return env, runtime, specs
 
-    t0 = time.perf_counter()
-    done = False
-    while not done:
-        mask = env.action_masks()
-        ev, pile_id = policy.decide(obs, mask, rng, env.engine.station)
-        obs, _, done, _, _ = env.step(pile_id, ev=ev)
-    return env, time.perf_counter() - t0
+
+def replay_episode(
+    config: dict[str, Any], arrivals: list[dict[str, Any]]
+) -> ChargingStationEnv:
+    """
+    Rebuild and re-run the FIFO episode stored with one objective-sweep trial.
+
+    ``config`` is the ``config`` object in ``trials/trial_NNN.json``
+    (``TrialConfig.to_row()``). ``arrivals`` is the ``arrivals`` list in that
+    same file. The Gurobi / DW models are not stored and are not needed:
+    this only reconstructs the discrete-event episode.
+
+    ``policy_seed`` comes from ``config`` (default 12, matching
+    ``TrialConfig``). ``seed`` is passed to ``env.reset`` for the same
+    reason ``run_episode`` does; with an external arrival list it does not
+    redraw vehicles.
+    """
+    if not arrivals:
+        raise ValueError(
+            "This trial JSON has no 'arrivals' list. Re-run the sweep to "
+            "record the arrival specs needed to rebuild the env."
+        )
+    env = _make_env(config, evs_from_specs(arrivals))
+    obs, _ = env.reset(seed=int(config.get("seed", 0)))
+    _drive_fifo(env, int(config.get("policy_seed", 12)), obs)
+    return env
+
+
+def episode_utilization(
+    env: ChargingStationEnv, *, post_warmup: bool = False
+) -> dict[str, float]:
+    """
+    Theoretical and simulated connector utilization for a finished episode.
+
+    ``rho_sim`` is the time-average fraction of connectors that were
+    occupied. ``rho_theory`` is ``lambda_eff / (c * mu)`` with
+    ``lambda_eff = n_finished / T`` and ``mu = 1 / E[S]``, over the same
+    window. ``post_warmup=True`` restricts both to ``[warmup_period, T]``,
+    which is the measured phase the objective sweep reports sojourns on.
+    """
+    metrics = env.engine.metrics
+    sim_time = float(env.engine.current_time)
+    n_servers = env.engine.station.n_piles * env.engine.station.n_connectors
+    since = float(metrics.warmup_period) if post_warmup else 0.0
+    summary = metrics.queueing_summary(sim_time, n_servers=n_servers, since=since)
+    return {
+        "since": float(summary["since"]),
+        "T": float(summary["T"]),
+        "n_finished": float(summary["n_finished"]),
+        "lambda_eff": float(summary["lambda_eff"]),
+        "mean_service_min": float(summary["S"]),
+        "c": float(summary["c"]),
+        "rho_sim": float(summary["rho_sim"]),
+        "rho_theory": float(summary["rho_theory"]),
+    }
 
 
 def episode_counts(env: ChargingStationEnv) -> dict[str, Any]:
@@ -570,8 +709,8 @@ def run_trial(
     A solve that raises is recorded as ``{"error": ...}`` on its stage and
     the trial still returns, so one infeasible point cannot abort a sweep.
     """
-    env, sim_runtime = run_episode(cfg)
-    result = TrialResult(config=cfg, counts=episode_counts(env))
+    env, sim_runtime, arrivals = run_episode(cfg)
+    result = TrialResult(config=cfg, counts=episode_counts(env), arrivals=arrivals)
     # On counts (not just on the sim stage) so the episode's cost is recorded
     # even for a run_sim=False sweep, where the episode still had to happen.
     result.counts["sim_runtime_s"] = sim_runtime

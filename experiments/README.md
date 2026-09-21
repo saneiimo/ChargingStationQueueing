@@ -373,7 +373,11 @@ Written under `experiments/results/<run_name>/`:
 ```
 results.csv            one row per trial: every config knob AND every metric
                        as its own column, so a row is self-describing
-trials/trial_000.json  the same trial in full, nested
+trials/trial_000.json  the same trial in full, nested, plus `arrivals`:
+                       the EV specs (id, battery, SoCs, arrival time) the
+                       DES was fed. Enough to rebuild that episode with
+                       `replay_episode`; the env object and the Gurobi / DW
+                       models are not saved
 run_meta.json          the sweep definition, stage flags, timing
 ```
 

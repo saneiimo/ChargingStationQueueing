@@ -129,3 +129,46 @@ def test_boundary_vehicle_completion_counts_pre_window_energy():
     assert completed["measurement"]["n"] == 0.0
     assert arrived["measurement"]["n_censored"] == 1.0
     print("  PASS boundary completion adds pre-window energy back")
+
+
+def test_saved_arrivals_replay_the_same_utilization():
+    """The arrival specs written with a trial must rebuild the same episode.
+
+    ``results.csv`` does not store the env. ``arrivals`` on the trial record
+    plus ``TrialConfig.to_row()`` is the whole rebuild key: replaying them
+    under FIFO must match the original connector utilization.
+    """
+    from experiments.objective_sweep import TrialConfig
+    from experiments.objective_sweep.trial import (
+        episode_utilization,
+        replay_episode,
+        run_episode,
+    )
+
+    cfg = TrialConfig(
+        n_piles=1,
+        n_connectors=1,
+        n_modules=4,
+        p_module=25.0,
+        mean_interarrival=20.0,
+        max_time=40.0,
+        warmup_period=20.0,
+        seed=3,
+        policy_seed=1,
+        battery_cap_kwh=(50.0,),
+        delta_arr=None,
+        arrival_horizon=120.0,
+    )
+    env, _, specs = run_episode(cfg)
+    assert specs, "expected at least one saved arrival"
+    replayed = replay_episode(cfg.to_row(), specs)
+
+    original = episode_utilization(env, post_warmup=True)
+    again = episode_utilization(replayed, post_warmup=True)
+    assert again["rho_sim"] == pytest.approx(original["rho_sim"])
+    assert again["rho_theory"] == pytest.approx(original["rho_theory"])
+    assert again["n_finished"] == original["n_finished"]
+    print(
+        f"  PASS replay rho_sim={again['rho_sim']:.3f} "
+        f"rho_theory={again['rho_theory']:.3f}"
+    )

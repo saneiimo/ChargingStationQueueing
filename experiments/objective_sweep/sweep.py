@@ -8,7 +8,10 @@ Layout written under ``out_dir / run_name``::
                            self-describing (no header needed to know which
                            delta / mip_gap / gap_tolerance produced it)
     trials/trial_000.json  the same trial in full, nested, incl. anything
-                           that does not flatten well
+                           that does not flatten well. Also stores
+                           ``arrivals``: the EV specs needed to rebuild the
+                           DES episode (not the env object, and not the
+                           Gurobi / DW models)
     run_meta.json          the sweep definition, stage flags and timing
 
 ``results.csv`` is rewritten after every trial, so a sweep interrupted
@@ -102,6 +105,9 @@ def _trial_to_json(result: TrialResult, trial_id: int) -> dict[str, Any]:
         "grid": result.grid,
         "exact": result.exact,
         "dw": result.dw,
+        # Arrival specs only. Rebuilt via replay_episode; the env and the
+        # solved MILP / DW objects are not serialized.
+        "arrivals": result.arrivals,
     }
 
 
