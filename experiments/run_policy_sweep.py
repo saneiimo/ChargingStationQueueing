@@ -55,7 +55,7 @@ from experiments.policy_sweep import (
     HR2MIN,
 )
 
-RUN_NAME = "queue_sweep_PMatch"
+RUN_NAME = "queue_sweep_LSoCD"
 
 # Everything held constant across the sweep.
 BASE = PolicyConfig(
@@ -64,14 +64,14 @@ BASE = PolicyConfig(
     n_connectors=2,
     n_modules=6,
     p_module=25.0,
-    battery_cap_kwh=[50, 75, 100],
+    battery_cap_kwh=(75,),
     queue_capacity=1000,
     # traffic
     warmup_period=6 * HR2MIN,  # long relative to max_time, to reach steady state
     max_time=24 * HR2MIN,  # measured window (minutes); None -> config.MAX_TIME
     delta_arr=None,  # None keeps continuous exponential arrival times
     # who races
-    queue_policies=("FIFO", "PMatch"),  # "LSoCD", "PMatch"
+    queue_policies=("FIFO", "LSoCD"),  # "LSoCD", "PMatch"
     power_policies=("Prop",),
     # max-wait override, as in compare_policies.ipynb: FIFO runs with none,
     # then every other queue policy gets FIFO's observed mean max wait x the
@@ -84,6 +84,10 @@ BASE = PolicyConfig(
     seed0=1,
     confidence=0.95,
 )
+
+# From the repo root::
+
+#     .venv/Scripts/python.exe -m experiments.run_policy_sweep
 
 # The swept axes. The FIRST keyword varies slowest.
 SWEEP = dict(
