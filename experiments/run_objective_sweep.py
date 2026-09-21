@@ -101,13 +101,22 @@ SWEEP = dict(
 def main() -> None:
     # configs = config_grid(BASE, **SWEEP)
     combos = [
-        # (60.0 / 6, 2.0, "6veh"),
-        # (60.0 / 5, 2.0, "5veh"),
-        # (60.0 / 4, 2.0, "4veh"),
-        # (60.0 / 3, 2.0, "3veh"),
-        (60.0 / 2, 2.0, 1e-4, 1e-6, 1800.0, 1200.0, 2 * HR2MIN, "2veh"),
-        (60.0 / 1, 2.0, 1e-4, 1e-6, 1800.0, 1200.0, 2 * HR2MIN, "1veh"),
+        (60.0 / 6, 2.0, 1e-3, 0.1, 2 * 3600.0, 1800.0, 2 * HR2MIN, "6veh"),
+        (60.0 / 5.5, 2.0, 1e-3, 0.1, 2 * 3600.0, 1800.0, 2 * HR2MIN, "5.5veh"),
+        (60.0 / 5, 2.0, 1e-3, 0.1, 2 * 3600.0, 1800.0, 2 * HR2MIN, "5veh"),
+        (60.0 / 4.5, 2.0, 1e-3, 0.1, 1.5 * 3600.0, 1800.0, 2 * HR2MIN, "4.5veh"),
+        (60.0 / 4, 2.0, 1e-3, 0.1, 3600.0, 1800.0, 2 * HR2MIN, "4veh"),
+        (60.0 / 3.5, 2.0, 1e-4, None, 1800.0, 1200.0, 3 * HR2MIN, "3.5veh"),
+        (60.0 / 3, 2.0, 1e-4, None, 1800.0, 1200.0, 3 * HR2MIN, "3veh"),
+        (60.0 / 2.5, 1.0, 1e-4, None, 1800.0, 1200.0, 4 * HR2MIN, "2.5veh"),
+        (60.0 / 2, 1.0, 1e-4, None, 1800.0, 1200.0, 4 * HR2MIN, "2veh"),
+        (60.0 / 1.5, 1.0, 1e-4, None, 1800.0, 1200.0, 4 * HR2MIN, "1.5veh"),
+        (60.0 / 1, 1.0, 1e-4, None, 1800.0, 1200.0, 4 * HR2MIN, "1veh"),
     ]
+    # To do: try with gap_tolerance_target_min = .1 (or remove it)
+    # Set the time_limit for the first two to 2 hr.
+    # Add more trials (in .5 veh intervals)
+    # Try the case with 2piles
     RUN_NAME = "test"
     configs = [
         dataclasses.replace(
@@ -115,7 +124,7 @@ def main() -> None:
             mean_interarrival=ia,
             delta=d,
             mip_gap=mip_gap,
-            gap_tolerance=gap_tol,
+            gap_tolerance_target_min=gap_tol,
             time_limit=t_lim,
             dw_time_limit=dw_t_lim,
             max_time=mx_time,
