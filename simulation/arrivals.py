@@ -27,6 +27,42 @@ Examples at ``t = 3.69``:
 Ties at an exact halfway point follow Python 3 / NumPy banker's rounding
 (round half to even). After snapping, times outside ``[0, max_time]`` are
 dropped and the surviving list is re-sorted.
+
+One stream per source of randomness
+-----------------------------------
+``generate_arrivals`` splits the ``rng`` it is given into two independent
+child streams -- one for inter-arrival gaps, one for vehicle
+characteristics (battery capacity, arrival SoC, target SoC). This matters
+whenever a study sweeps an arrival-process knob.
+
+Drawing both from a single stream couples them: the gap draw is sized
+``int(max_time / mean_interarrival * 5)``, so changing *either* of those
+changes how many numbers are consumed before the attribute draws begin,
+and every vehicle comes out with different characteristics -- even the
+ones whose arrival times did not move. A sweep over ``mean_interarrival``
+then varies two things at once (how many cars arrive, *and* what kind of
+cars exist), and point-to-point differences cannot be attributed to load.
+
+With separate streams, vehicle *k*'s attributes depend only on ``k``, so a
+sweep changes the arrival process alone and the realised fleet is held
+fixed. This is ordinary common-random-numbers practice: give each
+stochastic source its own stream so perturbing one input cannot ripple
+into the others.
+
+The gaps keep using the ``rng`` that was passed in and only the
+characteristics move to a spawned child, so arrival times for a given seed
+are unchanged from before the split -- see ``_attribute_stream``.
+
+A rate sweep is coupled too, and for free: ``exponential(scale)`` is
+``scale * standard_exponential``, so the *k*-th gap simply rescales with
+the mean. Two runs at different ``mean_interarrival`` are one underlying
+realisation stretched or compressed in time, carrying the same fleet.
+
+The alignment is by arrival **index**, which is exact when only
+``mean_interarrival`` / ``max_time`` change. Changing ``delta_arr`` can
+snap a time across the ``max_time`` cut-off and add or drop an arrival,
+which shifts every later index by one; hold it fixed when you want the
+fleet held fixed.
 """
 
 from __future__ import annotations
@@ -37,6 +73,37 @@ import numpy as np
 
 from config import BATTERY_CAP_OPTIONS, SOC_I_BOUNDS, SOC_F_BOUNDS
 from models.ev import EV
+
+
+def _attribute_stream(rng: np.random.Generator) -> np.random.Generator:
+    """
+    A stream for vehicle characteristics, independent of ``rng`` itself.
+
+    ``rng`` stays the inter-arrival gap stream and this child serves the
+    battery/SoC draws. The asymmetry is deliberate rather than tidy: a child
+    spawned off the parent's seed sequence is independent of the parent's
+    own stream, so keeping gaps on the parent leaves every arrival time
+    bit-identical to what a given seed produced before the two sources were
+    separated. Only the characteristics move -- which is the whole point.
+    Spawning reads the seed sequence and does not consume the parent's
+    stream, so it is free to happen at any point.
+
+    Requires a generator carrying a seed sequence, which is what
+    ``np.random.default_rng(...)`` returns. A generator built around a bare
+    bit-generator state cannot be spawned from; that raises rather than
+    silently falling back to one shared stream, since the shared stream is
+    exactly the coupling this exists to remove.
+    """
+    try:
+        (attr_rng,) = rng.spawn(1)
+    except (AttributeError, TypeError) as exc:  # no seed sequence to spawn from
+        raise TypeError(
+            "generate_arrivals needs an rng it can spawn an independent child "
+            "stream from, to keep vehicle characteristics separate from the "
+            "inter-arrival gaps. Pass np.random.default_rng(seed) rather than "
+            "a Generator wrapped around a bare bit-generator state."
+        ) from exc
+    return attr_rng
 
 
 def validate_delta_arr(delta_arr: float | None) -> float | None:
@@ -122,6 +189,15 @@ def generate_arrivals(
     the same units as ``config.BATTERY_CAP_OPTIONS``, i.e. kW*min, already
     converted from kWh via ``HR2MIN``).
 
+    ``rng`` is split into two independent child streams -- gaps and vehicle
+    characteristics -- so that vehicle *k*'s battery/SoC depend only on
+    ``k``, never on how many gap draws preceded them. Two calls with the
+    same seed but different ``mean_interarrival`` (or ``max_time``)
+    therefore describe the *same fleet* arriving at a different rate,
+    rather than a freshly resampled one. See this module's docstring, "One
+    stream per source of randomness", for why that is worth having, and
+    ``_split_streams`` for the mechanics.
+
     ``delta_arr``
         ``None`` (default): keep the continuous exponential times.
         Positive ``d``: snap each time to the nearest multiple of ``d`` minutes
@@ -147,6 +223,9 @@ def generate_arrivals(
     if soc_f_bounds is None:
         soc_f_bounds = SOC_F_BOUNDS
 
+    # rng itself stays the gap stream; characteristics get their own child.
+    attr_rng = _attribute_stream(rng)
+
     gaps = rng.exponential(mean_interarrival, int(max_time / mean_interarrival * 5))
     arrival_times = gaps.cumsum()
     if d is None:
@@ -167,9 +246,12 @@ def generate_arrivals(
 
     evs: list[EV] = []
     for offset, t in enumerate(arrival_times):
-        c_b = rng.choice(battery_cap_options)
-        s_i = rng.uniform(lo_i, hi_i)
-        s_f = rng.uniform(lo_f, hi_f)
+        # attr_rng, not rng: three draws per vehicle off a stream nothing
+        # else touches, so vehicle k's characteristics depend only on k --
+        # see this module's docstring, "One stream per source of randomness".
+        c_b = attr_rng.choice(battery_cap_options)
+        s_i = attr_rng.uniform(lo_i, hi_i)
+        s_f = attr_rng.uniform(lo_f, hi_f)
         evs.append(
             EV(id=start_id + offset, c_b=c_b, s_i=s_i, s_f=s_f, arrival_time=float(t))
         )
