@@ -55,12 +55,12 @@ from experiments.policy_sweep import (
     HR2MIN,
 )
 
-RUN_NAME = "queue_sweep_LSoCD"
+RUN_NAME = "queue_sweep_LSoCD_3pile"
 
 # Everything held constant across the sweep.
 BASE = PolicyConfig(
     # station layout
-    n_piles=1,
+    n_piles=3,
     n_connectors=2,
     n_modules=6,
     p_module=25.0,
@@ -91,7 +91,7 @@ BASE = PolicyConfig(
 
 # The swept axes. The FIRST keyword varies slowest.
 SWEEP = dict(
-    mean_interarrival=[HR2MIN / (n_veh / 2) for n_veh in range(2, 13)],
+    mean_interarrival=[HR2MIN / (n_veh / 2 * BASE.n_piles) for n_veh in range(2, 13)],
 )
 
 # Other grids worth trying (uncomment one):
