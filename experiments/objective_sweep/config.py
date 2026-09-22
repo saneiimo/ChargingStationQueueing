@@ -52,22 +52,17 @@ class TrialConfig:
     policy_seed: int = 12  # queue-policy RNG
     # Oversampling factor for the one-shot arrival draw: the stream must cover
     # warm-up + measured phase with room to spare.
-    arrival_oversample: float = 1.5
-    # Fixed horizon (minutes) for the arrival draw, overriding
-    # (warmup_period + max_time) * arrival_oversample.
     #
-    # Set this whenever the sweep varies `max_time`, `warmup_period` or
-    # `arrival_oversample` and you want common random numbers across those
-    # trials. `simulation.arrivals.generate_arrivals` draws
-    # `int(max_time / mean_interarrival * 5)` inter-arrival gaps up front and
-    # only *then* draws each EV's battery/SoC, so a different draw horizon
-    # moves the RNG position where the attribute draws begin: every EV comes
-    # out with different characteristics, even the ones whose arrival times
-    # are unchanged. Trials would then differ by the whole realized
-    # population, not just the window length, and the sweep would attribute
-    # that variation to `max_time`. Pinning the horizon makes every trial
-    # with the same `seed`/`mean_interarrival` share one EV population.
-    arrival_horizon: float | None = None
+    # Nothing here needs to pin the draw horizon for the sake of common
+    # random numbers. `simulation.arrivals.generate_arrivals` gives gaps and
+    # vehicle characteristics their own streams (see that module's docstring,
+    # "One stream per source of randomness"), so vehicle k's battery/SoC
+    # depend only on k. Widening the horizon therefore only appends arrivals:
+    # every trial with the same `seed` already shares one EV population,
+    # whatever `max_time`, `warmup_period` or `mean_interarrival` are swept
+    # to. This replaces the old `arrival_horizon` knob, which existed solely
+    # to work around the two sources sharing a stream.
+    arrival_oversample: float = 1.5
 
     # --- discretization ----------------------------------------------------
     delta: float = 2.0  # slot length (minutes) for both offline models
@@ -138,9 +133,14 @@ class TrialConfig:
 
     @property
     def draw_horizon(self) -> float:
-        """Horizon the arrival stream is sampled over -- see ``arrival_horizon``."""
-        if self.arrival_horizon is not None:
-            return float(self.arrival_horizon)
+        """
+        Horizon the arrival stream is sampled over: warm-up plus measured
+        phase, with ``arrival_oversample`` headroom.
+
+        Free to vary across a sweep -- a wider horizon only appends later
+        arrivals, it never disturbs the ones already drawn or the vehicles
+        attached to them. See ``arrival_oversample``.
+        """
         return (self.warmup_period + self.max_time) * self.arrival_oversample
 
     @property

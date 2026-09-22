@@ -203,7 +203,6 @@ from experiments import TrialConfig, config_grid, run_sweep, comparison_table
 base = TrialConfig(
     n_piles=1, n_connectors=2, n_modules=6,
     warmup_period=360,
-    arrival_horizon=900,  # pinned: this sweep varies max_time -- see below
 )
 configs = config_grid(
     base,
@@ -223,28 +222,31 @@ needed to persist them. `objective_sweep_results.ipynb` (repo root) loads a
 finished run back and gives you the headline table, a plot against whichever
 knob you swept, and a way to drop into one trial's full JSON detail.
 
-### Sweeping `max_time`: pin the arrival draw
+### Common random numbers across a sweep
 
-`simulation.arrivals.generate_arrivals` draws
-`int(max_time / mean_interarrival * 5)` inter-arrival gaps up front and only
-*then* draws each EV's battery and SoC. So a different draw horizon moves the
-RNG position where the attribute draws begin, and **every EV comes out
-different — including the ones whose arrival times are unchanged.** Two trials
-differing only in `max_time` therefore see two different EV populations, and
-the sweep would credit that variation to `max_time`.
+Every trial sharing a `seed` sees the same EV population, on every axis —
+nothing needs pinning. `simulation.arrivals.generate_arrivals` splits its
+`rng` into two independent child streams, one for inter-arrival gaps and one
+for vehicle characteristics, so vehicle *k*'s battery and SoC depend only on
+*k*. Widening the draw horizon only appends later arrivals; it never disturbs
+the ones already drawn or the vehicles attached to them.
 
-Set `arrival_horizon` to a fixed value (comfortably above
-`warmup_period` + the largest `max_time` swept) whenever the sweep varies
-`max_time`, `warmup_period` or `arrival_oversample`:
+That holds across `mean_interarrival` too. Because `exponential(scale)` is
+`scale × standard_exponential`, the *k*-th gap simply rescales with the mean,
+so a rate sweep is one underlying arrival realisation stretched or compressed
+in time, carrying the same fleet. A sweep therefore varies the arrival process
+alone instead of also resampling the fleet underneath it, and point-to-point
+differences are attributable to the knob you turned.
 
-```python
-BASE = TrialConfig(warmup_period=6 * HR2MIN, arrival_horizon=15 * HR2MIN, ...)
-```
+The alignment is by arrival **index**. It is exact when `mean_interarrival`,
+`max_time`, `warmup_period` or `arrival_oversample` change. Changing
+`delta_arr` can snap an arrival across the `max_time` cut-off and add or drop
+one, shifting every later index by one — hold it fixed if you want the fleet
+held fixed.
 
-Then every trial with the same `seed` and `mean_interarrival` shares one EV
-population, and `max_time` changes only how much of the window is measured.
-(There is no such thing as common random numbers *across* different
-`mean_interarrival` values — a different arrival rate is a different stream.)
+> This replaces the old `arrival_horizon` knob, which existed only to work
+> around gaps and attributes sharing a single stream. It has been removed;
+> drop it from any config that still passes it.
 
 ### The window's two edges
 

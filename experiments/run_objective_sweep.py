@@ -31,7 +31,7 @@ from experiments.objective_sweep import (
 )
 
 BASE = TrialConfig(n_piles=1, n_connectors=2, n_modules=6,
-                   warmup_period=6*HR2MIN, arrival_horizon=15*HR2MIN)
+                   warmup_period=6*HR2MIN)
 configs = config_grid(BASE, mean_interarrival=[20.0, 30.0], delta=[2.0, 5.0])
 
 df = run_sweep(configs, "my_run")          # returns the DataFrame directly
@@ -63,12 +63,12 @@ BASE = TrialConfig(
     battery_cap_kwh=[75],
     warmup_period=6 * HR2MIN,  # long relative to max_time, to reach steady state
     max_time=2 * HR2MIN,
+    # Every trial with this seed sees the SAME EV population, whichever axis
+    # is swept: generate_arrivals draws inter-arrival gaps and vehicle
+    # characteristics from separate streams, so vehicle k's battery/SoC
+    # depend only on k. A mean_interarrival sweep therefore varies the
+    # arrival process alone, instead of also resampling the fleet under it.
     seed=41,
-    # Pin the arrival draw so every trial with this seed sees the SAME EV
-    # population -- without it, changing max_time (or warmup_period) silently
-    # redraws every EV's battery/SoC. See TrialConfig.arrival_horizon. Must
-    # comfortably exceed warmup_period + the largest max_time swept.
-    arrival_horizon=15 * HR2MIN,
     # Cap both solvers so one hard trial cannot run away with the sweep. A
     # limit that bites is recorded, not hidden: see exact_status/dw_status.
     time_limit=1800.0,
@@ -117,7 +117,7 @@ def main() -> None:
     # Set the time_limit for the first two to 2 hr.
     # Add more trials (in .5 veh intervals)
     # Try the case with 2piles
-    RUN_NAME = "test"
+    RUN_NAME = "1pile_75kwh"
     configs = [
         dataclasses.replace(
             BASE,

@@ -209,9 +209,11 @@ def run_episode(cfg: TrialConfig) -> tuple[ChargingStationEnv, float, list[dict[
     the list *before* the episode mutates any EV, so ``replay_episode`` can
     rebuild the same env from disk.
 
-    Note that the draw horizon itself is part of the random stream -- see
-    ``TrialConfig.arrival_horizon`` for why that matters when sweeping
-    ``max_time``.
+    The draw horizon is free to vary across a sweep: ``generate_arrivals``
+    draws gaps and vehicle characteristics from separate streams, so a wider
+    horizon only appends later arrivals and every trial sharing a ``seed``
+    sees the same fleet regardless of ``max_time`` / ``warmup_period`` /
+    ``mean_interarrival``. See ``simulation.arrivals``'s module docstring.
     """
     evs = generate_arrivals(
         mean_interarrival=cfg.mean_interarrival,

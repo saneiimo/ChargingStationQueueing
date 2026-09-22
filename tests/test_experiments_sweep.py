@@ -157,7 +157,6 @@ def test_saved_arrivals_replay_the_same_utilization():
         policy_seed=1,
         battery_cap_kwh=(50.0,),
         delta_arr=None,
-        arrival_horizon=120.0,
     )
     env, _, specs = run_episode(cfg)
     assert specs, "expected at least one saved arrival"
