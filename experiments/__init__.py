@@ -2,8 +2,9 @@
 Experiment drivers. Two sweeps, one shared core.
 
 * ``experiments.objective_sweep`` -- how far is a realized episode from the
-  true optimum? One episode per configuration, bounded by the exact MILP
-  and by Dantzig-Wolfe. Start at ``run_sweep``.
+  true optimum? One episode per configuration, bounded by the exact model
+  (as a compact MILP and/or by branch-and-price) and by Dantzig-Wolfe.
+  Start at ``run_sweep``.
 * ``experiments.policy_sweep`` -- which queue/power policy is better, and
   by how much? Monte-Carlo replications per configuration with common
   random numbers and paired confidence intervals. Start at
@@ -33,7 +34,9 @@ from .objective_sweep import (
     build_instance,
     comparison_table,
     episode_counts,
+    load_bound_history,
     load_results,
+    run_bp,
     run_dw,
     run_episode,
     run_exact,
@@ -71,9 +74,11 @@ __all__ = [
     "simulation_metrics",
     "build_instance",
     "run_exact",
+    "run_bp",
     "run_dw",
     "run_sweep",
     "load_results",
+    "load_bound_history",
     "comparison_table",
     # policy sweep
     "PolicyConfig",

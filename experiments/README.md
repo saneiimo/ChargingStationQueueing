@@ -9,8 +9,9 @@ experiments/
   core/                     shared: config_grid, RunStore (run dir + tables)
   objective_sweep/          how far is a realized episode from the optimum?
     config.py               TrialConfig
-    trial.py                one episode -> instance -> exact MILP + DW
-    sweep.py                run_sweep, comparison_table, load_results
+    trial.py                one episode -> instance -> exact MILP / branch-and-price + DW
+    sweep.py                run_sweep, comparison_table, load_results,
+                            load_bound_history
   policy_sweep/             which policy wins, and by how much?
     config.py               PolicyConfig + the policy name registries
     replications.py         run_replications / summarize_ci / compare_policies
@@ -23,7 +24,7 @@ experiments/
 | | objective sweep | policy sweep |
 |---|---|---|
 | question | how far from optimal is this run? | which policy is better? |
-| per config | 1 episode + 2 solves | `n_reps` episodes per policy |
+| per config | 1 episode + up to 3 solves | `n_reps` episodes per policy |
 | cost | seconds–minutes per trial (Gurobi) | milliseconds per episode |
 | statistics | none — one episode, bounded | paired CIs across common random numbers |
 | notebook | `objective_sweep_results.ipynb` | `policy_sweep_results.ipynb` |
@@ -120,15 +121,19 @@ for `dropped EVs`, higher for `finished EVs` and energy delivered.
 
 ### What a trial produces
 
-One trial = one `TrialConfig` = one simulated episode plus up to two solves.
-Four numbers for the same objective come out, each reported per cohort:
+One trial = one `TrialConfig` = one simulated episode plus up to three solves.
+Up to five numbers for the same objective come out, each reported per cohort:
 
 | source  | what it is | comparable? |
 |---------|-----------|-------------|
 | `sim`   | the DES's continuous-time sojourns, truncated at the warm-up boundary | not achievable by any grid schedule — see below |
 | `grid`  | that *same* FIFO schedule replayed on the `delta` slot grid | **yes** — the like-for-like target |
 | `exact` | the connector-lane MILP's incumbent (an upper bound on the optimum), plus the solver's own `best_bound` | yes |
-| `dw`    | Dantzig-Wolfe's certified **lower** bound on the optimum | yes |
+| `bp`    | the *same* model solved by branch-and-price (`offline_cl_PB`): best schedule plus a proven `best_bound`, equal when `bp_status == "OPTIMAL"` | yes |
+| `dw`    | Dantzig-Wolfe's certified **lower** bound on the optimum (continuous-module relaxation) | yes |
+
+On every row: `grid ≥ exact ≥ z* ≥ bp_best_bound` and `bp_objective ≥ z*`,
+where `z*` is the true optimum; `dw_LB ≤ z*` too.
 
 The offline models can only depart on slot boundaries (assumption A1), so
 each connector handover costs the successor up to `delta` minutes.
@@ -142,7 +147,7 @@ counts" is exactly where a naive comparison goes wrong:
 
 | group | who it covers | use it for |
 |-------|---------------|-----------|
-| `arrived` | every vehicle the models were given; unfinished ones censored at the horizon | **comparing sources** — all four cover the same set |
+| `arrived` | every vehicle the models were given; unfinished ones censored at the horizon | **comparing sources** — all of them cover the same set |
 | `completed` | only vehicles that received their full energy | reading realized service quality |
 
 Columns are `{source}_{group}_{cohort}_{stat}`, e.g.
@@ -159,7 +164,8 @@ make a *proven optimum* read as worse than feasible FIFO. `comparison_table`
 defaults to `group="arrived"` for this reason, and prints each source's `n`
 so any residual mismatch stays visible.
 
-Note `dw_LB` is always an `arrived`-group quantity (it bounds the objective
+Note `dw_LB` and `bp_best_bound` / `bp_mean_sojourn_LB` are always
+`arrived`-group quantities (each bounds the objective
 over `objective_cohorts` as a whole), so it is not a valid bound for the
 `completed` subset — comparing them will look like a bound violation
 without being one.
@@ -268,13 +274,21 @@ whose grid normally divides `warmup_period`):
 ### Which stages run
 
 ```python
-run_sweep(configs, run_sim=True, run_exact_model=False, run_dw_model=True)
+run_sweep(configs, run_sim=True, run_exact_model=False, run_bp_model=True, run_dw_model=True)
 ```
 
-The DES episode **always** runs, whatever `run_sim` says: both offline models
-are built from its realized arrival stream and its boundary snapshot, so
+| flag | default | stage | columns |
+|------|---------|-------|---------|
+| `run_sim` | `True` | sim/grid sojourn tables | `sim_*`, `grid_*` |
+| `run_exact_model` | `True` | exact model as a compact MILP (Gurobi) | `exact_*` |
+| `run_bp_model` | `False` | exact model by branch-and-price | `bp_*` |
+| `run_dw_model` | `True` | Dantzig-Wolfe lower bound | `dw_*` |
+
+The DES episode **always** runs, whatever `run_sim` says: every offline model
+is built from its realized arrival stream and its boundary snapshot, so
 there is no instance without it. `run_sim=False` skips only the sim/grid
-sojourn tables.
+sojourn tables. Stages run in the order exact → bp → dw, which is what lets
+branch-and-price start from the MILP's incumbent (see below).
 
 A solve that raises (an infeasibility, a failed assertion) is recorded as
 `{"error": ...}` on its stage and the sweep carries on.
@@ -291,6 +305,9 @@ run_sweep(configs, solver_progress=True)   # or run_trial(cfg, solver_progress=T
 
 * **Exact model** — Gurobi's native solve log (presolve, root relaxation,
   the branch-and-bound node table as the incumbent/bound improve).
+* **Branch-and-price** — `offline_cl_PB`'s own log: one line per node plus
+  incumbent / dive / restricted-integer-master events
+  (`[B&P  12.3s] node 4 (depth 2, ...): branched, LB=733.69, UB=746, ...`).
 * **DW** — column generation's own per-iteration line:
   `[colgen] iter 19: z_RMP=231.756, best_LB=145.967, gap=85.789, exact=True, candidates=5, columns_added=5, total_columns=98`
 
@@ -317,6 +334,61 @@ just carries no weight. Normally exclude `BOUNDARY` under `FIXED`, whose
 `D_j` is a constant; but under `OPTIMIZE`, excluding them means the optimizer
 has no incentive to finish them and will let them linger.
 
+### Branch-and-price: the exact model, a second way
+
+`run_bp_model=True` solves the same whole-module model as `exact` with
+`offline_cl_PB` (see its README). Two `TrialConfig` fields control it:
+
+* `bp_time_limit` (seconds, default 1800) — at the limit it stops with
+  `bp_status == "TIME_LIMIT"` and a still-valid bracket
+  `[bp_best_bound, bp_objective]`.
+* `bp_initial_schedule` — its starting incumbent: `"simulation"` (default:
+  this trial's FIFO episode rebuilt on the slot grid), `"exact"` (the MILP's
+  incumbent from the same trial; needs `run_exact_model=True`), `"both"` (the
+  better of the two), or `"none"`. B&P always also builds its own greedy
+  schedule. A seed is a complete schedule re-validated against the exact
+  model, never a bare number, so a seed that does not survive discretization
+  is dropped rather than turned into a false upper bound.
+
+Columns (`bp_` prefix):
+
+| column | meaning |
+|--------|---------|
+| `bp_status` | `OPTIMAL`, `TIME_LIMIT` (or `NODE_LIMIT`) |
+| `bp_objective` / `bp_best_bound` | best schedule's total sojourn (minutes) and the proven lower bound (equal when OPTIMAL) |
+| `bp_gap` / `bp_rel_gap` | `objective - best_bound`, and that over `objective` (i.e. relative to total sojourn) |
+| `bp_root_lower_bound` | the root node's bound (whole-module DW bound) |
+| `bp_mean_sojourn` / `bp_mean_sojourn_LB` | objective / bound in minutes, over `objective_cohorts` |
+| `bp_nodes`, `bp_columns` | tree nodes solved, columns generated |
+| `bp_seed_source`, `bp_seed_objective` | which seed was used and its value |
+| `bp_incumbent_source` | where the final schedule came from (seed, node LP, dive, restricted integer master) |
+| `bp_compact_check_max_violation` | the final schedule checked against every row of the compact model (~0) |
+| `bp_{completed,arrived}_{cohort}_{stat}` | per-cohort sojourns of the B&P schedule, same semantics as `exact_` |
+
+**Bound history.** How the bracket closed over time is not a column: it is
+written to `bound_history.csv` (long format, one row per change of either
+bound per trial) and returned by `run_sweep(..., return_history=True)` /
+`load_bound_history(run_name)`. Join on `trial_id` with `results.csv`.
+
+| column | meaning |
+|--------|---------|
+| `trial_id`, `label`, `mean_interarrival`, `max_time`, `delta`, `n_piles`, `bp_status` | which trial |
+| `time_s` | seconds since the bp stage started (incl. building its seed); the last row is ~`bp_runtime_s` |
+| `lower_bound` / `upper_bound` | proven lower bound / incumbent, objective units (total sojourn, minutes); NaN while not yet known |
+| `lower_bound_min` / `upper_bound_min` | the same per vehicle, as mean sojourn (minutes, over `objective_cohorts`) |
+| `gap`, `gap_pct` | `upper - lower`, and `100 * gap / upper` (relative to total sojourn) |
+| `nodes` | tree nodes solved so far |
+| `event` | what moved a bound: `incumbent: <source>`, `node`, `tree`, `end` |
+
+Per trial `lower_bound` never decreases and `upper_bound` never increases;
+both are constant between rows (plot as steps, `where="post"`), and the
+optimum is always inside `[lower_bound, upper_bound]`. The last row equals
+`bp_best_bound` / `bp_objective`.
+
+Cost: on small windows it proves optimality in seconds; on large ones its
+bound is far stronger than the MILP's at the same wall clock but the gap may
+not close — see `offline_cl_PB/README.md`, "Performance".
+
 ### DW: lower bound only, by default
 
 `solve_integer_ub=False` (the default here) stops after column generation and
@@ -335,14 +407,16 @@ Three lower-bound numbers are recorded either way:
   A diagnostic of how close pricing got to proving `z_RMP == z_MP`; *not* a
   certified bracket the way `gap = UB - LB` is.
 
-`dw_LB` is in raw objective units (`sum_j D_j`, absolute departure slots).
-`dw_total_sojourn_LB` / `dw_mean_sojourn_LB` are the same bound converted to
-minutes — those are what compares against a simulation's sojourn figures.
+`dw_LB` is in objective units: total sojourn in minutes over
+`objective_cohorts`, the same as `exact_objective` / `bp_objective`.
+`dw_total_sojourn_LB` repeats it and `dw_mean_sojourn_LB` is it per vehicle.
+`dw_sojourn_floor` is the trivial floor `sum_j (delta*E_j - a_j)` (every
+vehicle at its own earliest departure).
 
 ### DW: setting `gap_tolerance` from a minutes target
 
-`gap_tolerance` is in raw objective units, and the minutes-uncertainty it
-implies depends on `delta` *and* on `n_optimized` (the vehicle count inside
+`gap_tolerance` is in objective units (minutes of total sojourn), and the
+mean-sojourn uncertainty it implies depends on `n_optimized` (the vehicle count inside
 `objective_cohorts` — see the boundary-conditions section above, since that
 count depends on `include_queued`/`boundary_mode`/`objective_cohorts`
 together). Picking a raw value that means the same thing across trials whose
@@ -357,18 +431,26 @@ the raw `gap_tolerance` field, and the actual value column generation runs
 with is computed **per trial**, from that trial's own instance:
 
 ```
-gap_tolerance = m * n_optimized / delta
+gap_tolerance = m * n_optimized
 ```
 
-(mirrors `sim_benchmark.ipynb`'s `gap_tolerance = m * len(vehicles) / delta`,
-but uses `n_optimized` rather than every vehicle in the instance — the two
+(mirrors `sim_benchmark.ipynb`'s `gap_tolerance = m * len(vehicles)`, but
+uses `n_optimized` rather than every vehicle in the instance — the two
 coincide only when `objective_cohorts=COHORTS_ALL`.) This can't be computed
 before the episode runs — `n_optimized` isn't known until the boundary
 snapshot and cohort assignment happen — so it's resolved inside `run_dw`,
-not in `TrialConfig` itself. The value actually used, in raw units, is always
+not in `TrialConfig` itself. The value actually used, in minutes of total sojourn, is always
 recorded as `dw_gap_tolerance_used`, whichever of the two fields set it.
 
 ### Output
+
+**Units.** Every objective/bound column (`exact_objective`, `*_best_bound`,
+`dw_LB`, `dw_z_rmp`, `bp_*` bounds, `bound_history.csv`'s `lower_bound` /
+`upper_bound`) is total sojourn in minutes, `sum_j (delta*D_j - a_j)` over
+`objective_cohorts` — the models' own objective — and `run_meta.json` says so
+(`"objective_units": "total_sojourn_min"`). Runs written before that switch
+have no `objective_units` key: their objective/bound columns are `sum_j D_j`
+in slots. `*_mean_sojourn*` columns are minutes in both.
 
 Written under `experiments/results/<run_name>/`:
 
@@ -378,9 +460,12 @@ results.csv            one row per trial: every config knob AND every metric
 trials/trial_000.json  the same trial in full, nested, plus `arrivals`:
                        the EV specs (id, battery, SoCs, arrival time) the
                        DES was fed. Enough to rebuild that episode with
-                       `replay_episode`; the env object and the Gurobi / DW
-                       models are not saved
-run_meta.json          the sweep definition, stage flags, timing
+                       `replay_episode`; the env object and the Gurobi /
+                       B&P / DW models are not saved
+run_meta.json          the sweep definition, stage flags (sim/exact/bp/dw), timing
+bound_history.csv      (only with run_bp_model) B&P's bracket on the optimum
+                       over time, one row per change per trial -- see
+                       "Branch-and-price" above
 ```
 
 `delta`, `mip_gap`, `time_limit`, `gap_tolerance`, `include_queued`,
@@ -393,11 +478,12 @@ Status and tolerance columns for reading a limited run honestly:
 | column | meaning |
 |--------|---------|
 | `exact_status` | `OPTIMAL`, `TIME_LIMIT`, `SUBOPTIMAL`, … |
-| `exact_mip_gap_achieved` | gap actually reached (vs. the requested `mip_gap` column) |
-| `exact_objective` / `exact_best_bound` | incumbent and the solver's own bound — a time-limited run still brackets the optimum |
+| `exact_mip_gap_achieved` | gap actually reached (vs. the requested `mip_gap` column), relative to total sojourn |
+| `exact_objective` / `exact_best_bound` | incumbent and the solver's own bound, total sojourn in minutes — a time-limited run still brackets the optimum (`exact_mean_sojourn_LB` is the bound per vehicle) |
+| `bp_status` / `bp_objective` / `bp_best_bound` | the same for branch-and-price (see its section) |
 | `dw_status` | `CONVERGED`, `TIME_LIMIT`, `ITERATION_LIMIT`, `NOT_CONVERGED` |
 | `dw_converged` / `dw_iterations` | column generation's own stopping detail |
-| `*_runtime_s` | wall clock per stage (`exact_` also splits build vs. solve, and carries Gurobi's own `exact_gurobi_runtime_s`) |
+| `*_runtime_s` | wall clock per stage (`exact_` also splits build vs. solve, and carries Gurobi's own `exact_gurobi_runtime_s`; `bp_runtime_s` includes building its seed) |
 
-`results.csv` is rewritten after every trial, so an interrupted sweep still
-leaves usable output.
+`results.csv` and `bound_history.csv` are rewritten after every trial, so an
+interrupted sweep still leaves usable output.

@@ -28,7 +28,7 @@ HR2MIN = 60
 @dataclass(frozen=True)
 class TrialConfig:
     """
-    A single (simulation, exact model, DW model) run.
+    A single (simulation, exact model, branch-and-price, DW model) run.
 
     Any field can be swept via ``config_grid``. Fields are grouped below by
     what they control; the defaults reproduce the ``sim_benchmark.ipynb``
@@ -81,10 +81,12 @@ class TrialConfig:
     # Which cohorts the objective is minimised over -- independent of the two
     # flags above: an excluded-from-objective vehicle is still modelled in
     # full (holds its connector, draws modules), its D_j just carries no
-    # weight. Normally exclude BOUNDARY under FIXED, whose D_j is a constant.
+    # weight. Normally exclude BOUNDARY under FIXED, whose sojourn is a constant.
     objective_cohorts: frozenset[Cohort] = COHORTS_ALL
 
     # --- exact model -------------------------------------------------------
+    # Gurobi's relative MIPGap. The objective is total sojourn (minutes), so
+    # this is a fraction of total sojourn.
     mip_gap: float | None = 1e-4
     time_limit: float | None = 1200.0  # seconds; None for no limit
     break_symmetry: bool = False  # must stay False with boundary vehicles
@@ -92,15 +94,15 @@ class TrialConfig:
     tie_break: bool = False
 
     # --- DW model ----------------------------------------------------------
-    # Raw objective units (sum_j D_j). A tolerance of g slots corresponds to
-    # delta*g/J minutes of mean-sojourn uncertainty, where J is n_optimized
-    # (the vehicle count in objective_cohorts) -- see gap_tolerance_target_min
-    # below for setting this the other way round, from a minutes target.
+    # Objective units: minutes of TOTAL sojourn. A tolerance of g minutes
+    # corresponds to g/J minutes of mean-sojourn uncertainty, where J is
+    # n_optimized (the vehicle count in objective_cohorts) -- see
+    # gap_tolerance_target_min below for setting this from a per-vehicle
+    # minutes target instead.
     gap_tolerance: float = 1e-6
     # Set this INSTEAD of gap_tolerance to target a mean-sojourn uncertainty
-    # of m minutes directly (mirrors sim_benchmark.ipynb's
-    # ``gap_tolerance = m * len(vehicles) / delta``). At solve time
-    # gap_tolerance is computed as ``m * n_optimized / delta``, where
+    # of m minutes directly. At solve time
+    # gap_tolerance is computed as ``m * n_optimized``, where
     # n_optimized is read off the actual instance for this trial (it depends
     # on include_queued/boundary_mode/objective_cohorts, so it cannot be
     # known before the episode runs and the instance is built -- this field
@@ -115,6 +117,25 @@ class TrialConfig:
     # compares against the certified LOWER bound, and the integer master is
     # the expensive stage.
     solve_integer_ub: bool = False
+
+    # --- branch-and-price (offline_cl_PB) ----------------------------------
+    # The SAME whole-module model as the exact MILP, solved by branch-and-
+    # price: a proven optimum, or at the time limit a certified bracket
+    # [bp_best_bound, bp_objective]. Only used when the sweep runs with
+    # run_bp_model=True.
+    bp_time_limit: float | None = 1800.0  # seconds; None for no limit
+    # Initial incumbent handed to B&P (it always builds its own greedy list
+    # schedule too, and keeps whichever is best). Every candidate is a full
+    # schedule re-validated against the exact model, never a bare number, so
+    # a bad seed can only be rejected -- it can never produce a false upper
+    # bound:
+    #   "simulation" -- this trial's FIFO episode rebuilt on the slot grid
+    #                   (offline_cl_PB.schedule_from_simulation);
+    #   "exact"      -- the exact MILP's incumbent from the same trial (needs
+    #                   run_exact_model=True; otherwise nothing is seeded);
+    #   "both"       -- the better of the two;
+    #   "none"       -- only B&P's own greedy schedule.
+    bp_initial_schedule: str = "simulation"
 
     # --- bookkeeping -------------------------------------------------------
     label: str = ""  # optional human-readable tag carried into the results
