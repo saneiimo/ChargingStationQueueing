@@ -17,6 +17,7 @@ import heapq
 import math
 
 from offline_cl_opt.boundary import BoundaryMode, BoundaryVehicle
+from offline_cl_opt.model import sojourn_minutes
 from offline_cl_opt.instance import StationSpec, VehicleData
 
 from .columns import Plan
@@ -120,6 +121,7 @@ def validate_schedule(
     *,
     best_lower_bound: float | None = None,
     boundary_vehicles: dict[int, BoundaryVehicle] | None = None,
+    objective_ids: set[int] | None = None,
 ) -> None:
     """
     Section 10.3's checklist, run as assertions. Raises ``AssertionError``
@@ -136,6 +138,12 @@ def validate_schedule(
     ``offline_cl_opt.boundary._discretize_trace_power``'s own docstring),
     an OPTIMIZE-mode one's check adds back ``initial_energy_kwh`` before
     comparing to ``v.W``.
+
+    ``best_lower_bound`` is checked against the schedule's total sojourn
+    ``sum_j (delta*D_j - a_j)`` over ``objective_ids`` (``None``: every
+    vehicle in ``chosen``) -- pass the same vehicle set the objective was
+    summed over. A superset is still a sound check (each extra sojourn is
+    ``>= 0``), just a looser one.
     """
     boundary_vehicles = boundary_vehicles or {}
     h = delta / 60.0
@@ -145,7 +153,8 @@ def validate_schedule(
 
     for j, plan in chosen.items():
         v = vehicles[j]
-        objective += plan.departure
+        if objective_ids is None or j in objective_ids:
+            objective += sojourn_minutes(plan.departure, v.a, delta)
         if plan.is_null:
             continue
 

@@ -38,7 +38,13 @@ from .boundary import (
     vehicles_from_boundary,
 )
 from .instance import StationSpec, VehicleData, vehicles_from_evs
-from .model import ConnectorLaneModel, build_cl_model, solve_cl_model
+from .model import (
+    ConnectorLaneModel,
+    build_cl_model,
+    sojourn_minutes,
+    sojourn_objective_round_up,
+    solve_cl_model,
+)
 from .solution import ConnectorLaneSolution, extract_solution
 from .adaptive import (
     AdaptiveSolveResult,
@@ -49,7 +55,7 @@ from .adaptive import (
 )
 from .preprocess import (
     earliest_departures,
-    incumbent_departure_total,
+    incumbent_objective,
 )
 from .visualization import (
     plot_pile_power_and_modules,
@@ -77,6 +83,8 @@ __all__ = [
     "ConnectorLaneModel",
     "build_cl_model",
     "solve_cl_model",
+    "sojourn_minutes",
+    "sojourn_objective_round_up",
     "ConnectorLaneSolution",
     "extract_solution",
     "AdaptiveSolveResult",
@@ -85,7 +93,7 @@ __all__ = [
     "rounding_test_failures",
     "rounded_module_routing",
     "earliest_departures",
-    "incumbent_departure_total",
+    "incumbent_objective",
     "plot_vehicle_power_and_modules",
     "plot_pile_power_and_modules",
     "plot_pile_power_and_modules_v2",

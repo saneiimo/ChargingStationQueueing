@@ -30,6 +30,7 @@ import gurobipy as gp
 from gurobipy import GRB
 
 from offline_cl_opt.instance import StationSpec
+from offline_cl_opt.model import sojourn_minutes
 
 from .columns import Plan
 
@@ -48,10 +49,13 @@ class RestrictedMaster:
     connector_cap: dict[tuple[int, int], gp.Constr]  # (pile, k) -> row (25)
     module_cap: dict[tuple[int, int], gp.Constr]  # (pile, k) -> row (26)
     convexity: dict[int, gp.Constr]  # vehicle_id -> row (27)
-    # Vehicles whose D_omega carries objective weight. Everyone else's
+    # vehicle_id -> a_j (minutes): a column's cost is its sojourn
+    # delta*D_omega - a_j (see column_cost).
+    arrivals: dict[int, float] = field(default_factory=dict)
+    # Vehicles whose sojourn carries objective weight. Everyone else's
     # columns are added with coefficient 0: they still occupy connectors
     # and draw modules via rows (25)/(26), they just don't pay for their
-    # own departure -- see build_master's objective_ids parameter.
+    # own sojourn -- see build_master's objective_ids parameter.
     objective_ids: set[int] = field(default_factory=set)
     columns: dict[int, list[tuple[Plan, gp.Var]]] = field(default_factory=dict)  # vehicle_id -> [(plan, lambda_var)]
     # Section 8.3's deduplication key set, per vehicle -- see _column_key
@@ -93,6 +97,7 @@ def build_master(
     k_lo: int,
     initial_columns: dict[int, list[Plan]],
     *,
+    arrivals: dict[int, float],
     objective_ids: set[int] | None = None,
     conservative_modules: bool = False,
     model_name: str = "connector_lane_dw_master",
@@ -107,12 +112,17 @@ def build_master(
     see ``colgen.run_column_generation``'s own docstring, "Boundary
     conditions") and no others; column generation adds the rest.
 
-    ``objective_ids``: vehicles whose ``D_omega`` carries objective weight
+    ``arrivals``: ``{vehicle_id: a_j}`` in minutes, for every vehicle. The
+    master minimizes total sojourn: a column costs ``delta*D_omega - a_j``
+    (``column_cost``), the same per-vehicle cost as
+    ``offline_cl_opt.model.build_cl_model``'s objective.
+
+    ``objective_ids``: vehicles whose sojourn carries objective weight
     (``None`` = all of them, the original behaviour). Mirrors
     ``offline_cl_opt.model.build_cl_model``'s ``objective_cohorts``: a
     vehicle left out is still fully present in rows (25)/(26) -- it holds
     its connector and draws its modules -- its columns are just priced at
-    0, so the optimum never pays for its departure. Used to keep FIXED
+    0, so the optimum never pays for its sojourn. Used to keep FIXED
     boundary vehicles, whose ``D_j`` is a pinned constant, out of the
     quantity being minimised.
 
@@ -159,6 +169,7 @@ def build_master(
         connector_cap=connector_cap,
         module_cap=module_cap,
         convexity=convexity,
+        arrivals={j: float(arrivals[j]) for j in vehicle_ids},
         objective_ids=set(vehicle_ids) if objective_ids is None else set(objective_ids),
         columns={j: [] for j in vehicle_ids},
         seen_keys={j: set() for j in vehicle_ids},
@@ -211,20 +222,34 @@ def add_column(rm: RestrictedMaster, plan: Plan) -> gp.Var | None:
                 p_val = plan.power.get(k, 0.0)
                 if p_val > 1e-9:
                     col.addTerms(p_val, rm.module_cap[pile, k])  # (26)
-    # Objective coefficient is this plan's own D_omega -- or 0 for a vehicle
+    # Objective coefficient is this plan's own sojourn -- or 0 for a vehicle
     # outside the objective, which still contributes its capacity terms above.
-    obj_coeff = float(plan.departure) if j in rm.objective_ids else 0.0
-    var = rm.model.addVar(lb=0.0, obj=obj_coeff, column=col, name=f"lambda[{j}]")
+    var = rm.model.addVar(lb=0.0, obj=column_cost(rm, plan), column=col, name=f"lambda[{j}]")
     rm.columns.setdefault(j, []).append((plan, var))
     return var
 
 
-def purge_columns(rm: RestrictedMaster, *, threshold: float = 10.0) -> int:
+def column_cost(rm: RestrictedMaster, plan: Plan) -> float:
+    """
+    A column's objective coefficient: the vehicle's sojourn
+    ``delta*D_omega - a_j`` in minutes (``D_omega = K`` for the null plan),
+    or 0 for a vehicle outside ``rm.objective_ids``. The pricer's objective
+    (``pricer.price``) and the reduced costs in ``colgen`` use the same
+    cost, so the three stay consistent.
+    """
+    j = plan.vehicle_id
+    if j not in rm.objective_ids:
+        return 0.0
+    return sojourn_minutes(plan.departure, rm.arrivals[j], rm.delta)
+
+
+def purge_columns(rm: RestrictedMaster, *, threshold: float | None = None) -> int:
     """
     Section 8.3/8.2: remove non-basic columns whose reduced cost, at the
-    master's own last LP solve, exceeds ``threshold`` (Section 8.2's
-    suggested default, ``PURGE_THRESHOLD = 10``, in the same objective/slot
-    units as the master's own objective). Never removes the null plan
+    master's own last LP solve, exceeds ``threshold`` (in the master's own
+    objective units, minutes of total sojourn). ``None`` (default) is
+    Section 8.2's suggested ``PURGE_THRESHOLD = 10`` departure slots, i.e.
+    ``10 * delta`` minutes. Never removes the null plan
     (mandatory for feasibility from iteration one, Section 7.2) or a basic
     column (still load-bearing for the current solution -- removing it
     would invalidate the very basis the reduced costs were just read from).
@@ -263,6 +288,8 @@ def purge_columns(rm: RestrictedMaster, *, threshold: float = 10.0) -> int:
 
     Returns the number of columns removed (``0`` if none qualified).
     """
+    if threshold is None:
+        threshold = 10.0 * rm.delta
     removed = 0
     for j, entries in rm.columns.items():
         kept: list[tuple[Plan, gp.Var]] = []
