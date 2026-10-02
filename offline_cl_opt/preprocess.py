@@ -12,9 +12,10 @@ Preprocessing -- Section 9 of ``connector_lane_model.html``.
     docstring. The document is explicit that this must use the *discrete*
     recursion, not a continuous closed form, or the resulting bound need
     not be valid for the discrete model being preprocessed.
-  - **UB** (9.2): the objective value (``sum_j D_j``, slot units) of *any*
-    known feasible schedule. The document suggests two sources, and both
-    are supported here via ``incumbent_departures``:
+  - **UB** (9.2): the objective value (total sojourn
+    ``sum_j (delta*D_j - a_j)``, minutes) of *any* known feasible schedule.
+    The document suggests two sources, and both are supported here via
+    ``incumbent_departures``:
       - a reference schedule you already have -- e.g. a finished causal
         (FCFS or otherwise) simulation -- pass its per-vehicle departure
         times (minutes) directly;
@@ -47,6 +48,7 @@ import math
 from .adaptive import conservative_feasible_solution
 from .instance import StationSpec, VehicleData
 from .model import earliest_departures  # noqa: F401  (re-exported for callers of this module)
+from .model import sojourn_minutes
 from .solution import extract_solution
 
 
@@ -65,8 +67,8 @@ def _departures_from_conservative(
     Fallback UB source when no ``incumbent_departures`` is supplied:
     solve Section 8.4's conservative shortcut and read departure times
     (minutes) off its solution. Only served vehicles are included --
-    ``incumbent_departure_total`` treats anything absent the same way (9)
-    does for a vehicle that never departs: contributes ``K``.
+    ``incumbent_objective`` treats anything absent the same way (9)
+    does for a vehicle that never departs: departs at slot ``K``.
     """
     cons = conservative_feasible_solution(
         vehicles,
@@ -86,7 +88,7 @@ def _departures_from_conservative(
     }
 
 
-def incumbent_departure_total(
+def incumbent_objective(
     vehicles: list[VehicleData],
     station: StationSpec,
     delta: float,
@@ -99,11 +101,16 @@ def incumbent_departure_total(
     verbose: bool = False,
 ) -> float:
     """
-    UB (Section 9.2): ``sum_j D_j`` in slot units, from a supplied
-    reference schedule or, if ``incumbent_departures`` is ``None``, Section
-    8.4's conservative shortcut. Directly usable as
-    ``solve_cl_model(..., cutoff=...)`` / ``solve_cl_model_adaptive(...,
-    cutoff=...)``, since both are already in the same slot-unit objective.
+    UB (Section 9.2): total sojourn ``sum_j (delta*D_j - a_j)`` in
+    minutes, from a supplied reference schedule or, if
+    ``incumbent_departures`` is ``None``, Section 8.4's conservative
+    shortcut. Directly usable as ``solve_cl_model(..., cutoff=...)`` /
+    ``solve_cl_model_adaptive(..., cutoff=...)``, since both minimize the
+    same total-sojourn objective.
+
+    Summed over every vehicle in ``vehicles``. When the model's
+    ``objective_cohorts`` covers only some of them the result is still a
+    valid (looser) cutoff: every extra term is a sojourn, hence ``>= 0``.
 
     Parameters
     ----------
@@ -112,7 +119,7 @@ def incumbent_departure_total(
         feasible schedule -- e.g. build it from a finished simulation with
         ``{ev.id: ev.departure_time for ev in env.engine.metrics.finished_evs}``.
         A vehicle missing from the dict is treated as never served/never
-        finished, contributing ``K`` -- the same convention (9) uses.
+        finished, departing at slot ``K`` -- the same convention (9) uses.
         Departure times are converted to slot boundaries by rounding *up*
         (``ceil``): a real schedule that finishes at continuous time ``t``
         can always be read as "done" by the next slot boundary at or after
@@ -142,8 +149,6 @@ def incumbent_departure_total(
     total = 0.0
     for v in vehicles:
         dep = incumbent_departures.get(v.id)
-        if dep is None:
-            total += K
-        else:
-            total += min(K, math.ceil(round(dep / delta, 9)))
+        D = K if dep is None else min(K, math.ceil(round(dep / delta, 9)))
+        total += sojourn_minutes(D, v.a, delta)
     return total

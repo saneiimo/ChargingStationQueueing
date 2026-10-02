@@ -2,7 +2,7 @@
 Connector-lane offline MILP -- Section 4 ("The optimisation model") of
 ``connector_lane_model.html`` -- solved with gurobipy.
 
-Implements the objective (1) and constraints (2)-(19) (Groups A-E), plus
+Implements the objective and constraints (2)-(19) (Groups A-E), plus
 one strengthening the source document adds once it discusses preprocessing
 (Section 9) and treats as part of the model proper:
 
@@ -16,7 +16,7 @@ parameter docstring below and README.md, "Symmetry breaking".
 
 There is no "complete-service" variant modeled here (an earlier revision of
 the source document had one; the current document removes it -- see
-Section 6.3). The single objective (1) is always the censored one: choose
+Section 6.3). The single objective is always the censored one: choose
 ``horizon_minutes`` generous enough that no vehicle is left unresolved at
 the optimum (e.g. longer than a simple first-come-first-served schedule's
 makespan on the same arrivals), and verify that afterwards rather than
@@ -72,10 +72,27 @@ separate summed constraint.
 
 Adaptive module integrality (``adaptive.py``, Section 8) and preprocessing
 (``preprocess.py``, Section 9 -- ``earliest_departures``/
-``incumbent_departure_total``, used for an objective cutoff and a MIP
+``incumbent_objective``, used for an objective cutoff and a MIP
 start, not windowing) are implemented on top of this model -- see their
 module docstrings. The recommended staged solve (Section 11) is not
 implemented end-to-end -- see README.md, "Scope".
+
+Objective: total sojourn, not sum_j D_j
+-----------------------------------------
+The source document's objective (1) is ``sum_j D_j`` (departure slot
+boundaries). This module minimizes total sojourn time in minutes instead,
+
+    sum_{j in objective} (delta * D_j - a_j),
+
+which is (1) scaled by ``delta > 0`` and shifted by the constant
+``sum_j a_j`` (the objective's vehicle set is fixed: an unserved vehicle
+still counts, at ``D_j = K``), so it has exactly the same optimal schedules
+and the same ranking of every feasible schedule. What changes is the
+*value*: ``ObjVal``/``ObjBound`` are total sojourn in minutes, and Gurobi's
+relative ``MIPGap`` is measured against total sojourn rather than against
+a sum inflated by every vehicle's arrival time. Objective values lie on the
+lattice ``delta * n - sum_j a_j`` (``n`` integer); see
+``sojourn_objective_round_up``.
 
 Slot convention: horizon T split into K = ceil(T/delta) half-open slots,
 slot k = [k*delta, (k+1)*delta), k = 0, ..., K-1. Release slot
@@ -144,6 +161,35 @@ from .instance import StationSpec, VehicleData
 def _release_slot(a: float, delta: float) -> int:
     """k_j = ceil(a_j / delta) -- Section 3.4."""
     return math.ceil(round(a / delta, 9))
+
+
+def sojourn_minutes(departure_slot: float, arrival: float, delta: float) -> float:
+    """
+    One vehicle's contribution to the objective: ``delta * D_j - a_j``,
+    minutes from arrival to its departure slot boundary (``D_j = K`` for a
+    vehicle unserved or unfinished at the horizon -- the censored value).
+    Every package (compact model, DW, branch-and-price) prices a vehicle
+    with this, so their objective values are directly comparable.
+    """
+    return delta * departure_slot - arrival
+
+
+def sojourn_objective_round_up(value: float, delta: float, arrival_total: float, slack: float = 0.0) -> float:
+    """
+    The smallest attainable objective value ``>= value - slack``.
+
+    With objective weights in {0, 1}, ``sum_j (delta * D_j - a_j)`` over a
+    fixed vehicle set equals ``delta * n - arrival_total`` for an integer
+    ``n = sum_j D_j``, so any proven lower bound rounds up to that lattice:
+    ``delta * ceil((value - slack + arrival_total) / delta) - arrival_total``.
+    Exact for any ``a_j`` (integer or not); ``slack`` absorbs floating-point
+    noise in ``value`` so a bound sitting exactly on a lattice point is not
+    pushed one step too high. ``-inf``/``inf`` pass through unchanged.
+    """
+    if not math.isfinite(value):
+        return value
+    n = math.ceil(round((value - slack + arrival_total) / delta, 9))
+    return delta * n - arrival_total
 
 
 def _earliest_departure_slot(
@@ -255,8 +301,10 @@ def build_cl_model(
     model_name: str = "connector_lane_offline",
 ) -> ConnectorLaneModel:
     """
-    Build (but do not solve) the connector-lane MILP: minimize
-    ``sum_j D_j`` (1) subject to (2)-(19), plus, by default, (24) (optional,
+    Build (but do not solve) the connector-lane MILP: minimize total
+    sojourn ``sum_j (delta*D_j - a_j)`` over ``objective_cohorts`` (minutes;
+    the document's (1) scaled and shifted -- see the module docstring)
+    subject to (2)-(19), plus, by default, (24) (optional,
     ``bound_departures``).
 
     Parameters
@@ -271,7 +319,8 @@ def build_cl_model(
     horizon_minutes :
         T, the horizon length; K = ceil(T / delta) slots. Vehicles that
         cannot finish by T remain unserved or unfinished and contribute a
-        departure boundary of K (the censored objective, Section 6.3) --
+        departure boundary of K, i.e. a sojourn of ``delta*K - a_j`` (the
+        censored objective, Section 6.3) --
         there is no hard "must finish" variant; choose a horizon generous
         enough that this doesn't bind at the optimum, and verify that
         afterwards (check every vehicle has ``D_j < K`` and received its
@@ -311,17 +360,17 @@ def build_cl_model(
         departing vehicle, the minimum number of slots it must have
         occupied. Cheap (``J`` extra rows), and the source document
         recommends it because the LP relaxation can otherwise report a
-        ``D_j`` -- which *is* the objective -- well below what's
+        ``D_j`` -- which drives the objective -- well below what's
         achievable, weakening the root bound.
     tie_break :
         If True, add a secondary, lower-priority objective that prefers
         front-loaded power delivery, purely to break ties among the (often
         many) power profiles that tie the true optimum -- the primary
-        objective (1) only cares *when* each vehicle departs, never how its
+        objective only cares *when* each vehicle departs, never how its
         power is distributed within its own occupied window. Mirrors
         ``offline_opt.model.build_offline_model``'s own ``tie_break``
         exactly (same hierarchical-objective mechanism, same argument for
-        why it cannot change the reported ``sum_j D_j`` -- see that
+        why it cannot change the reported total sojourn -- see that
         module's docstring and ``offline_opt/README.md``, "Tie breaking").
         Roughly doubles solve effort (two hierarchical optimization
         phases); off by default. When True, read the primary objective via
@@ -334,10 +383,10 @@ def build_cl_model(
         is treated as ``MEASUREMENT``, so omitting this entirely keeps the
         old behaviour (every vehicle in the objective).
     objective_cohorts :
-        Which cohorts the objective (1) is summed over; ``None`` means all
+        Which cohorts the objective is summed over; ``None`` means all
         of them. Vehicles outside the selection still appear in the model
         in full -- they occupy connectors, draw modules and constrain
-        everyone else -- their ``D_j`` simply carries no objective weight.
+        everyone else -- their sojourn simply carries no objective weight.
         ``boundary.COHORTS_MEASUREMENT`` / ``COHORTS_MEASUREMENT_QUEUED`` /
         ``COHORTS_ALL`` are the three nested selections worth using.
         Excluding ``BOUNDARY`` is the usual choice when boundary vehicles
@@ -693,9 +742,11 @@ def build_cl_model(
                 name=f"C24_departure_lower_bound[{j}]",
             )
 
-    # --- (1): objective -- minimize sum_j D_j over the selected cohorts ---------
-    # Vehicles outside objective_cohorts stay fully modelled (they still hold
-    # connectors and draw modules); only their D_j is dropped from the sum --
+    # --- objective -- minimize total sojourn over the selected cohorts ---------
+    # (the document's (1), sum_j D_j, times delta minus sum_j a_j -- see the
+    # module docstring). Vehicles outside objective_cohorts stay fully
+    # modelled (they still hold connectors and draw modules); only their
+    # sojourn is dropped from the sum --
     # see the objective_cohorts parameter docstring.
     cohorts = cohorts or {}
     objective_cohorts = objective_cohorts if objective_cohorts is not None else COHORTS_ALL
@@ -711,11 +762,16 @@ def build_cl_model(
             f"{len(vehicles)} vehicles present cover "
             f"{sorted({cohorts.get(v.id, Cohort.MEASUREMENT).value for v in vehicles})}."
         )
-    primary_obj = gp.quicksum(D[j] for j in objective_ids)
+    # Total sojourn, minutes: sum_j (delta * D_j - a_j). The arrival sum is a
+    # constant (Gurobi keeps it in ObjCon), so ObjVal/ObjBound/MIPGap all
+    # read in total-sojourn terms.
+    primary_obj = gp.quicksum(delta * D[j] for j in objective_ids) - sum(
+        by_id[j].a for j in objective_ids
+    )
 
     if tie_break:
         # Optional secondary objective, purely to break ties among solutions
-        # that already achieve the true sum_j D_j optimum -- (1) only cares
+        # that already achieve the true total-sojourn optimum -- it only cares
         # *when* each vehicle departs, never how its power is distributed
         # within its own occupied window, so many power profiles can tie
         # exactly (same argument as offline_opt.model.build_offline_model's
@@ -730,10 +786,10 @@ def build_cl_model(
         # Priority 1 > 0 makes this strictly hierarchical (lexicographic):
         # Gurobi first solves the priority-1 objective to its true optimum,
         # then re-optimizes the priority-0 objective *holding that value
-        # fixed* (within abstol/reltol below). sum_j D_j values differ by
-        # integers across distinct departure-slot patterns, far above the
-        # 1e-6 tolerance, so the tie-break cannot change which schedules
-        # count as optimal.
+        # fixed* (within abstol/reltol below). Total-sojourn values differ
+        # by multiples of delta across distinct departure-slot patterns, far
+        # above the 1e-6 tolerance, so the tie-break cannot change which
+        # schedules count as optimal.
         tie_break_obj = gp.quicksum(x[j, k] for j, k in jk_x_pairs)
         m.ModelSense = GRB.MINIMIZE
         m.setObjectiveN(
@@ -743,7 +799,7 @@ def build_cl_model(
             weight=1.0,
             abstol=1e-6,
             reltol=0.0,
-            name="sum_departures",
+            name="total_sojourn",
         )
         m.setObjectiveN(
             -tie_break_obj,
@@ -827,8 +883,8 @@ def solve_cl_model(
         parameter") unless given explicitly.
     cutoff :
         Section 9.2/11's recommended technique: pass a known feasible
-        schedule's objective value (``UB``, in slot units -- e.g. from
-        ``preprocess.incumbent_departure_total``) as Gurobi's own
+        schedule's objective value (``UB``, total sojourn in minutes --
+        e.g. from ``preprocess.incumbent_objective``) as Gurobi's own
         ``Cutoff`` parameter, telling the solver not to bother proving
         anything worse than a bound it's already known can be matched.
         This prunes nodes the moment their own dual bound reaches ``UB``,

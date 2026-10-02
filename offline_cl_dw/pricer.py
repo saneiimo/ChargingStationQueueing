@@ -60,9 +60,11 @@ class VehiclePricer:
     x: gp.tupledict
     S: gp.LinExpr
     D: gp.LinExpr
+    delta: float
+    arrival: float  # a_j, minutes
     # False when this vehicle is outside the objective (see master.build_master's
-    # objective_ids): its D_j drops out of the pricing objective (30) too, so
-    # the pricer minimises pure rent and the reduced costs stay consistent
+    # objective_ids): its sojourn drops out of the pricing objective (30) too,
+    # so the pricer minimises pure rent and the reduced costs stay consistent
     # with the master the duals came from.
     in_objective: bool = True
 
@@ -188,6 +190,8 @@ def build_pricer(
         x=x,
         S=S_lin,
         D=D_lin,
+        delta=delta,
+        arrival=v.a,
         in_objective=in_objective,
     )
 
@@ -203,7 +207,9 @@ def price(
 ) -> tuple[float, Plan]:
     """
     (30): re-solve ``pricer`` with the objective built from this round's
-    duals -- ``D_j - sum_k pi[pile,k]*u[k] - sum_k mu[pile,k]*p[k]``, using
+    duals -- ``(delta*D_j - a_j) - sum_k pi[pile,k]*u[k] - sum_k mu[pile,k]*p[k]``
+    (the vehicle's sojourn in minutes, the same cost ``master.add_column``
+    gives its columns), using
     only this pricer's own fixed pile's entries of ``pi``/``mu`` (both
     keyed ``(pile, k)``, matching ``master.LPResult``) -- and return
     ``(zeta, plan)``, ``zeta`` being the pricer's own optimal value (used
@@ -217,7 +223,8 @@ def price(
     untouched, so Gurobi reuses the previous basis automatically (same
     principle as ``offline_cl_opt.adaptive``'s own iterative solves).
     Always feasible and bounded (the all-zero-``u`` point is feasible with
-    objective exactly ``K``, Section 6.2's own note), so this never raises.
+    objective exactly ``delta*K - a_j``, Section 6.2's own note), so this
+    never raises.
 
     ``threads``: caps this one solve's own internal Gurobi thread count.
     Left at ``None`` (Gurobi's own default) when pricers are solved one at
@@ -232,10 +239,13 @@ def price(
     # lookup here must include this pricer's own fixed pile, not the bare
     # slot index (a previous version of this line looked up `pi.get(k,
     # 0.0)`, which always missed and silently priced everything at zero).
-    # (30): D_j - rent, with D_j dropped entirely for a vehicle outside the
-    # objective so this matches the coefficient add_column gave its columns.
-    departure_term = pricer.D if pricer.in_objective else gp.LinExpr(0.0)
-    obj = departure_term - gp.quicksum(
+    # (30): sojourn - rent, with the sojourn dropped entirely for a vehicle
+    # outside the objective so this matches the coefficient add_column gave
+    # its columns.
+    sojourn_term = (
+        pricer.delta * pricer.D - pricer.arrival if pricer.in_objective else gp.LinExpr(0.0)
+    )
+    obj = sojourn_term - gp.quicksum(
         pi.get((pile, k), 0.0) * pricer.u[k] + mu.get((pile, k), 0.0) * pricer.p[k]
         for k in range(k0, K)
     )

@@ -32,7 +32,7 @@ Boundary modes
 --------------
 * ``FIXED``: the optimizer has no control -- occupancy and power are
   pinned to exactly what the simulation realized, discretized to the
-  target ``delta``. Contributes a *constant* D_j, so it is normally left
+  target ``delta``. Contributes a *constant* sojourn, so it is normally left
   out of the objective (see ``objective_cohorts``) while still consuming
   connectors and modules, which is the whole point of modelling it.
 * ``OPTIMIZE``: the optimizer controls this vehicle's future power and
@@ -535,10 +535,9 @@ def cohort_totals(
     Total/mean sojourn for each of ``COHORT_LEVELS``, computed by summing
     the per-vehicle rows rather than from the aggregate objective.
 
-    Summing per-vehicle sojourns is deliberate: the identity
-    ``total_sojourn = delta*sum_j D_j - sum_j a_j`` is only valid when both
-    sums range over the *same* vehicle set, so deriving cohort figures
-    from a partial objective is an easy way to get silently wrong numbers.
+    Summing per-vehicle sojourns is deliberate: the models' objective is
+    total sojourn over ``objective_cohorts`` only, so it cannot be split
+    into cohort figures -- a cohort level outside it needs its own sum.
     Rows are ``{"vehicle_id": int, "sojourn_min": float, ...}`` as built by
     either package's ``extract_solution``.
     """

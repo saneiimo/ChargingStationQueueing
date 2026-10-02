@@ -11,7 +11,7 @@ import pandas as pd
 from gurobipy import GRB
 
 from .boundary import Cohort, cohort_totals
-from .model import ConnectorLaneModel
+from .model import ConnectorLaneModel, sojourn_minutes
 
 _STATUS_NAMES = {
     getattr(GRB, name): name
@@ -25,23 +25,23 @@ class ConnectorLaneSolution:
     """
     Solved-instance summary: aggregate cost plus a per-vehicle timeline.
 
-    ``total_sojourn``/``mean_sojourn`` cover exactly the vehicles the
-    objective was summed over (``ConnectorLaneModel.objective_cohorts``),
-    so they always match the objective they came from.
+    ``objective`` *is* total sojourn (minutes) over the vehicles the
+    objective was summed over (``ConnectorLaneModel.objective_cohorts``);
+    ``total_sojourn`` repeats it and ``mean_sojourn`` divides it by
+    ``n_optimized``.
 
     ``by_cohort`` reports the same two figures for all three nested cohort
     levels regardless of what was optimised -- keys ``"measurement"``
     (arrived in the measured window), ``"measurement_queued"`` (plus those
     queued at the boundary) and ``"all"`` (plus those already plugged in),
     each mapping to ``{"n", "total_sojourn", "mean_sojourn"}``. These come
-    from summing per-vehicle sojourns rather than from a partial objective,
-    since ``delta*Z - sum_j a_j`` is only valid when both sums range over
-    the same vehicle set.
+    from summing per-vehicle sojourns, since the objective only covers
+    ``objective_cohorts``.
     """
 
     status: str
-    objective: float  # sum_j D_j over objective_cohorts, in slot units (eq. 1)
-    total_sojourn: float  # minutes, over objective_cohorts only
+    objective: float  # total sojourn sum_j (delta*D_j - a_j) over objective_cohorts, minutes
+    total_sojourn: float  # == objective
     mean_sojourn: float  # total_sojourn / n_optimized, minutes
     mip_gap: float
     runtime: float
@@ -72,14 +72,14 @@ def extract_solution(cl_model: ConnectorLaneModel) -> ConnectorLaneSolution:
 
     ``objective`` and ``mip_gap`` need to account for ``cl_model.tie_break``:
     with two objectives set, plain ``model.ObjVal`` reports the *last*
-    (lowest-priority, tie-break) phase, not the real ``sum_j D_j`` -- so when
+    (lowest-priority, tie-break) phase, not the real total sojourn -- so when
     ``tie_break`` is set this reads it via ``ObjNVal`` at index 0 instead
     (mirrors ``offline_opt.solution.extract_solution``'s own handling
     exactly -- see that function's docstring). ``model.MIPGap`` goes further
     and is not retrievable at all once more than one objective is set
     (Gurobi raises ``AttributeError``) -- in that case ``mip_gap`` is
     reported as ``nan``. By the time the tie-break phase runs, the primary
-    ``sum_j D_j`` is already fixed within ``abstol=1e-6`` of its optimum
+    total sojourn is already fixed within ``abstol=1e-6`` of its optimum
     (see the comment in ``build_cl_model``).
     """
     m = cl_model.model
@@ -122,7 +122,7 @@ def extract_solution(cl_model: ConnectorLaneModel) -> ConnectorLaneSolution:
                 "connector": connector,
                 "start_slot": S_val,
                 "departure_slot": D_val,
-                "sojourn_min": delta * D_val - v.a,
+                "sojourn_min": sojourn_minutes(D_val, v.a, delta),
                 "energy_kwh": energy_kwh,
                 "energy_delivered_before_kwh": bv.initial_energy_kwh if bv is not None else 0.0,
                 "energy_required_kwh": v.W,
@@ -142,12 +142,8 @@ def extract_solution(cl_model: ConnectorLaneModel) -> ConnectorLaneSolution:
         objective = float(m.ObjVal)
         mip_gap = float(m.MIPGap) if m.IsMIP else 0.0
 
-    # delta*Z - sum_j a_j is only valid when both sums range over the SAME
-    # vehicles, so the arrival sum is restricted to the objective's own
-    # cohorts -- mixing the two sets here would silently corrupt both the
-    # total and the mean.
-    total_arrival = sum(float(r["arrival"]) for r in optimized)  # type: ignore[arg-type]
-    total_sojourn = delta * objective - total_arrival
+    # The objective is total sojourn over exactly the `optimized` vehicles.
+    total_sojourn = objective
     # nan when the objective covers no vehicle at all -- 0.0 would read as
     # a perfect mean sojourn rather than as an empty objective.
     mean_sojourn = total_sojourn / n if n else float("nan")

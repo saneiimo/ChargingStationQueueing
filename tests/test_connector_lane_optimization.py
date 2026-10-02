@@ -43,12 +43,15 @@ from gurobipy import GRB
 
 from models.ev import EV
 from offline_cl_opt import (
+    COHORTS_ALL,
+    COHORTS_MEASUREMENT,
+    Cohort,
     StationSpec,
     VehicleData,
     build_cl_model,
     conservative_feasible_solution,
     earliest_departures,
-    incumbent_departure_total,
+    incumbent_objective,
     rounded_module_routing,
     rounding_test_failures,
     solve_cl_model,
@@ -225,6 +228,29 @@ def test_offline_bound_never_exceeds_fifo_simulation():
     )
     assert sol.per_vehicle["served"].all()
     assert opt_total_sojourn <= fifo_total_sojourn + 1e-6
+    # The objective IS total sojourn (minutes), not sum_j D_j.
+    assert sol.objective == pytest.approx(opt_total_sojourn, abs=1e-6)
+    assert sol.total_sojourn == pytest.approx(opt_total_sojourn, abs=1e-6)
+
+
+@pytest.mark.parametrize("tie_break", [False, True])
+def test_objective_is_total_sojourn_over_objective_cohorts(tie_break):
+    """ObjVal (or the primary ObjNVal under tie_break) is
+    sum_j (delta*D_j - a_j) over objective_cohorts, arrival constant included."""
+    vehicles, station, delta, horizon = _multi_pile_test_instance()
+    cohorts = {vehicles[0].id: Cohort.QUEUED}
+    for objective_cohorts in (COHORTS_ALL, COHORTS_MEASUREMENT):
+        m = build_cl_model(
+            vehicles, station, delta, horizon, tie_break=tie_break,
+            cohorts=cohorts, objective_cohorts=objective_cohorts,
+        )
+        solve_cl_model(m, mip_gap=0.0)
+        sol = extract_solution(m)
+        pv = sol.per_vehicle[sol.per_vehicle["in_objective"]]
+        expected = float((delta * pv["departure_slot"] - pv["arrival"]).sum())
+        assert sol.objective == pytest.approx(expected, abs=1e-6)
+        assert sol.mean_sojourn == pytest.approx(expected / len(pv), abs=1e-6)
+        assert len(pv) == (len(vehicles) if objective_cohorts is COHORTS_ALL else len(vehicles) - 1)
 
 
 # ---------------------------------------------------------------------------
@@ -431,15 +457,15 @@ def test_earliest_departures_are_reachable_lower_bounds():
         assert row["departure_slot"] >= E[int(row["vehicle_id"])] - 1e-6
 
 
-def test_incumbent_departure_total_is_valid_upper_bound():
+def test_incumbent_objective_is_valid_upper_bound():
     """UB (Section 9.2), from either source, must be >= the true optimal objective
-    -- it's the total departure slots of an actually-achievable schedule,
-    and a minimization's optimum can never exceed any feasible value."""
+    -- it's the total sojourn of an actually-achievable schedule, and a
+    minimization's optimum can never exceed any feasible value."""
     vehicles, station, delta, horizon = _multi_pile_test_instance()
     m_exact = build_cl_model(vehicles, station, delta, horizon)
     solve_cl_model(m_exact, mip_gap=1e-6)
 
-    ub_conservative = incumbent_departure_total(vehicles, station, delta, horizon, mip_gap=1e-4)
+    ub_conservative = incumbent_objective(vehicles, station, delta, horizon, mip_gap=1e-4)
     print(f"\nUB (conservative fallback) = {ub_conservative}, true optimum = {m_exact.model.ObjVal}")
     assert ub_conservative >= m_exact.model.ObjVal - 1e-6
 
@@ -468,7 +494,7 @@ def test_cutoff_from_real_simulation_preserves_optimum():
     env = run_toy_episode(toy_station, specs, seed=0, policy_seed=1)
     sim_departures = {ev.id: ev.departure_time for ev in env.engine.metrics.finished_evs}
 
-    UB = incumbent_departure_total(
+    UB = incumbent_objective(
         vehicles, station, delta, horizon, incumbent_departures=sim_departures
     )
     print(f"\nsim_departures={sim_departures}\nUB={UB}")
@@ -489,7 +515,7 @@ def test_cutoff_conservative_fallback_preserves_optimum():
     m_exact = build_cl_model(vehicles, station, delta, horizon)
     solve_cl_model(m_exact, mip_gap=1e-6)
 
-    UB = incumbent_departure_total(vehicles, station, delta, horizon, mip_gap=1e-4)
+    UB = incumbent_objective(vehicles, station, delta, horizon, mip_gap=1e-4)
     m_cut = build_cl_model(vehicles, station, delta, horizon)
     solve_cl_model(m_cut, mip_gap=1e-6, cutoff=UB)
 
@@ -510,7 +536,7 @@ def test_inconsistent_cutoff_raises():
     """
     vehicles, station, delta, horizon = _multi_pile_test_instance()
 
-    bad_UB = incumbent_departure_total(
+    bad_UB = incumbent_objective(
         vehicles,
         station,
         delta,
@@ -641,7 +667,7 @@ if __name__ == "__main__":
     # capsys fixture -- run via pytest, not this __main__ block.
     test_symmetry_breaking_preserves_optimal_objective()
     test_earliest_departures_are_reachable_lower_bounds()
-    test_incumbent_departure_total_is_valid_upper_bound()
+    test_incumbent_objective_is_valid_upper_bound()
     test_cutoff_from_real_simulation_preserves_optimum()
     test_cutoff_conservative_fallback_preserves_optimum()
     test_inconsistent_cutoff_raises()

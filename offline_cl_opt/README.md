@@ -2,9 +2,16 @@
 
 Implements **Section 4 ("The optimisation model")** of the connector-lane
 formulation for offline optimal scheduling of an EV charging station
-(`connector_lane_model.html`): objective (1) subject to constraints (2)-(19),
-plus one strengthening from Section 9 (preprocessing) that the source
-document treats as part of the model proper — see "Preprocessing" below.
+(`connector_lane_model.html`): constraints (2)-(19), plus one strengthening
+from Section 9 (preprocessing) that the source document treats as part of the
+model proper — see "Preprocessing" below. The objective is **total sojourn in
+minutes**, `sum_j (delta*D_j - a_j)` over `objective_cohorts` — the
+document's objective (1), `sum_j D_j`, scaled by `delta` and shifted by the
+constant `sum_j a_j`. Same optimal schedules, same ranking of every feasible
+schedule; but `ObjVal`/`ObjBound`/`solution.objective` read directly as total
+sojourn, and Gurobi's relative `MIPGap` is a fraction of total sojourn rather
+than of a sum inflated by every vehicle's arrival time. Attainable objective
+values are `delta` apart (`sojourn_objective_round_up`).
 Given every vehicle's arrival time and charging requirement up front, finds
 the lane assignment and module-routing schedule that minimizes total
 sojourn time, exactly as in `offline_opt` — but via a structurally
@@ -149,9 +156,10 @@ same trick (see that package's README).
 
 ## Censoring and the horizon (Section 6.3)
 
-There is no hard "must finish" variant of this model. The objective (1) is
+There is no hard "must finish" variant of this model. The objective is
 always the **censored** one: a vehicle that cannot finish within the
-horizon contributes a departure boundary of `K` (the model may even prefer
+horizon departs at boundary `K`, i.e. contributes a sojourn of
+`delta*K - a_j` (the model may even prefer
 leaving it unserved entirely if that frees a lane for someone else). An
 earlier revision of the source document had a `complete_service` variant
 that forced full service via a hard constraint; the current document
@@ -321,14 +329,14 @@ variables get built.
   valid for the discretized model being preprocessed. Lives in `model.py`
   now (re-exported here), since `build_cl_model` itself also needs `E_j`
   internally for (24) below.
-- **`incumbent_departure_total`** (9.2): `UB`, the objective value of *any*
-  known feasible schedule, in slot units. Two sources, matching the
+- **`incumbent_objective`** (9.2): `UB`, the objective value (total
+  sojourn, minutes) of *any* known feasible schedule. Two sources, matching the
   document's own suggestions:
   - **a reference schedule you already have** — pass
     `incumbent_departures={vehicle_id: departure_time_minutes}`, e.g. from
     a finished simulation: `{ev.id: ev.departure_time for ev in
     env.engine.metrics.finished_evs}`. A vehicle missing from the dict
-    counts as never served (contributes `K`, matching (9)'s own
+    counts as never served (departs at slot `K`, matching (9)'s own
     convention). Departure times are rounded *up* to the next slot
     boundary — always a safe upper bound, since a schedule that finishes
     at continuous time `t` can equally be read as "done" by the next slot
@@ -360,15 +368,15 @@ that windowing itself created).
 9.2/11):
 
 ```python
-from offline_cl_opt import incumbent_departure_total, build_cl_model, solve_cl_model_adaptive
+from offline_cl_opt import incumbent_objective, build_cl_model, solve_cl_model_adaptive
 
 # From a finished simulation:
 sim_departures = {ev.id: ev.departure_time for ev in env.engine.metrics.finished_evs}
-UB = incumbent_departure_total(vehicles, station, delta=1.0, horizon_minutes=120.0,
-                                incumbent_departures=sim_departures)
+UB = incumbent_objective(vehicles, station, delta=1.0, horizon_minutes=120.0,
+                         incumbent_departures=sim_departures)
 
 # Or, with no reference schedule, fall back to Section 8.4 automatically:
-UB = incumbent_departure_total(vehicles, station, delta=1.0, horizon_minutes=120.0)
+UB = incumbent_objective(vehicles, station, delta=1.0, horizon_minutes=120.0)
 
 result = solve_cl_model_adaptive(vehicles, station, delta=1.0, horizon_minutes=120.0, cutoff=UB)
 ```
@@ -398,16 +406,17 @@ for a vehicle that actually departs, requiring it to have occupied at
 least `n_min_j` slots, the fewest any departing trajectory could have
 needed, from `E_j` (9.1). An upper bound on `D_j` is never worth adding,
 by contrast (the document is explicit about this): under a minimization of
-`sum_j D_j`, an upper bound on `D_j` can never be active at the optimum.
+total sojourn (increasing in every `D_j`), an upper bound on `D_j` can never
+be active at the optimum.
 (24) is cheap (`J` extra rows) and, per the source document, worth having
-because the LP relaxation can otherwise report a `D_j` — which *is* the
+because the LP relaxation can otherwise report a `D_j` — which drives the
 objective — well below what's actually achievable, weakening the root
 bound.
 
 ## Scope
 
-This package implements the exact model ("(2)-(19)" and the objective (1))
-exactly, plus Section 8 (adaptive module integrality), Section 9's
+This package implements the exact model ("(2)-(19)" and the objective,
+total sojourn) exactly, plus Section 8 (adaptive module integrality), Section 9's
 `E_j`/`UB` (used for an objective cutoff, a MIP start, and the departure
 lower bound (24) — never for windowing, see above), and Section 10's
 symmetry breaking — nothing from the remaining refinement sections of the
@@ -423,7 +432,7 @@ source document:
 - **The recommended staged bracket-then-solve computational sequence**
   (bracket, preprocess, solve compact, adapt, refine) — not implemented
   end-to-end as a single call; `solve_cl_model_adaptive` covers "adapt",
-  `conservative_feasible_solution`/`incumbent_departure_total` cover
+  `conservative_feasible_solution`/`incumbent_objective` cover
   "bracket" and "preprocess", and `break_symmetry` covers "refine", but
   nothing here wires the stages together automatically -- compose them
   yourself, as in "Preprocessing" above.

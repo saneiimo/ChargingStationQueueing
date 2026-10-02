@@ -105,9 +105,10 @@ from offline_cl_opt.boundary import (
     Cohort,
 )
 from offline_cl_opt.instance import StationSpec, VehicleData
+from offline_cl_opt.model import sojourn_minutes
 
 from .columns import Plan
-from .master import RestrictedMaster, add_column, build_master, purge_columns, solve_lp
+from .master import RestrictedMaster, add_column, build_master, column_cost, purge_columns, solve_lp
 from .pricer import VehiclePricer, _release_slot, build_pricer, price
 from .preprocess import boundary_seed_plan, earliest_departures, fixed_plan, seed_columns
 
@@ -123,7 +124,9 @@ class ColGenResult:
     lower_bound_history: list[float]  # running max of the Lagrangian bound (32)
     best_lower_bound: float
     converged: bool  # True iff an exact pricing pass found no improving column
-    earliest_departure_sum: float  # sum_j E_j -- a cheap sanity floor on the optimum
+    # sum_{j in objective} (delta*E_j - a_j): every objective vehicle's own
+    # earliest possible sojourn, a cheap sanity floor on the optimum (minutes)
+    sojourn_floor: float
     columns_purged: int  # cumulative count removed by purge_columns (Section 8.3), 0 if disabled
     boundary_vehicles: dict[int, BoundaryVehicle]  # echoed back, {} if none were passed in
     cohorts: dict[int, Cohort]  # echoed back; missing ids are MEASUREMENT
@@ -142,26 +145,25 @@ def _horizon_slots(delta: float, horizon_minutes: float) -> int:
 def _plan_reduced_cost(
     plan: Plan,
     *,
+    cost: float,
     pi: dict[tuple[int, int], float],
     mu: dict[tuple[int, int], float],
     pile: int,
-    in_objective: bool = True,
 ) -> float:
-    """Evaluate ``D_omega - sum(pi*alpha) - sum(mu*beta)`` (28) for a
+    """Evaluate ``cost - sum(pi*alpha) - sum(mu*beta)`` (28) for a
     concrete plan directly off its own (start, departure, power), against
     whichever duals are passed in -- used both to price on the true duals
     directly and to re-check a smoothed-dual plan against the true ones.
 
-    ``in_objective=False`` drops the ``D_omega`` term, matching both
-    ``master.add_column``'s coefficient and ``pricer.price``'s objective
-    for a vehicle outside the objective (see ``master.build_master``'s
-    ``objective_ids``); getting this out of step with them would make
-    every reduced cost -- and the Lagrangian bound built from them --
-    inconsistent with the master they are supposed to describe."""
-    departure = float(plan.departure) if in_objective else 0.0
+    ``cost`` must be ``master.column_cost(rm, plan)`` -- the plan's sojourn
+    ``delta*D_omega - a_j``, or 0 for a vehicle outside the objective --
+    matching both ``master.add_column``'s coefficient and ``pricer.price``'s
+    objective; getting this out of step with them would make every reduced
+    cost -- and the Lagrangian bound built from them -- inconsistent with
+    the master they are supposed to describe."""
     if plan.is_null:
-        return departure
-    total = departure
+        return cost
+    total = cost
     for k in plan.occupied_slots():
         total -= pi.get((pile, k), 0.0)
         total -= mu.get((pile, k), 0.0) * plan.power.get(k, 0.0)
@@ -190,7 +192,7 @@ def run_column_generation(
     pricer_threads: int | None = 1,
     exact_mip_gap: float | None = 0.0,
     purge_every: int | None = 25,
-    purge_threshold: float = 10.0,
+    purge_threshold: float | None = None,
     progress: bool = False,
 ) -> ColGenResult:
     """
@@ -229,7 +231,7 @@ def run_column_generation(
         the same names, and forwarded to ``master.build_master`` as
         ``objective_ids``. A vehicle outside the selection keeps every
         capacity term it had (rows (25)/(26)) but its columns are priced at
-        0, and its pricer drops the ``D_j`` term to match, so reduced costs
+        0, and its pricer drops the sojourn term to match, so reduced costs
         and the Lagrangian bound stay consistent with the master.
     conservative_modules :
         See ``master.build_master``.
@@ -241,12 +243,13 @@ def run_column_generation(
         Reduced-cost threshold (31) for accepting a column as improving.
     gap_tolerance :
         Section 7.4's second stopping criterion: stop once ``z_RMP -
-        best_lower_bound`` is at or below this (objective units, i.e. slot
-        units -- ``delta*gap_tolerance/n_vehicles`` minutes of mean-sojourn
-        uncertainty). The tight default (``1e-6``, effectively "exactly
-        zero") only ever fires once the bound has genuinely closed; raise
-        it (e.g. to ``n_vehicles`` for a roughly one-slot-of-delta
-        tolerance) to stop earlier once *some* residual uncertainty is
+        best_lower_bound`` is at or below this (objective units: minutes of
+        total sojourn, i.e. ``gap_tolerance/n_optimized`` minutes of
+        mean-sojourn uncertainty). The tight default (``1e-6``, effectively
+        "exactly zero") only ever fires once the bound has genuinely closed;
+        raise it (e.g. to ``delta * n_optimized`` for a roughly
+        one-slot-per-vehicle tolerance) to stop earlier once *some* residual
+        uncertainty is
         acceptable, which the source document notes can matter on a large,
         highly degenerate master where the last fraction of the gap is
         expensive to certify exactly.
@@ -303,15 +306,18 @@ def run_column_generation(
         docstring) -- it only keeps ``solve_lp``'s own cost from growing
         unbounded over a long run.
     purge_threshold :
-        Reduced-cost cutoff (Section 8.2's suggested default, ``10``, in
-        the same objective/slot units as the master's own objective) above
-        which a non-basic column is swept by ``purge_columns``. Only
-        consulted when ``purge_every`` is not ``None``.
+        Reduced-cost cutoff, in the master's own objective units (minutes),
+        above which a non-basic column is swept by ``purge_columns``.
+        ``None`` (default) is Section 8.2's suggested ``10`` departure
+        slots, i.e. ``10 * delta`` minutes. Only consulted when
+        ``purge_every`` is not ``None``.
     progress :
         Print one line per iteration if True. Also prints one extra line
         whenever a purge round actually removes at least one column.
     """
     K = _horizon_slots(delta, horizon_minutes)
+    if purge_threshold is None:
+        purge_threshold = 10.0 * delta  # Section 8.2's 10 slots, in minutes
     vehicle_ids = [v.id for v in vehicles]
     boundary_vehicles = boundary_vehicles or {}
     by_id = {v.id: v for v in vehicles}
@@ -342,7 +348,7 @@ def run_column_generation(
     # constraint at all.
     for j in boundary_vehicles:
         E[j] = 0
-    e_sum = float(sum(E.values()))
+    sojourn_floor = float(sum(sojourn_minutes(E[j], by_id[j].a, delta) for j in objective_ids))
 
     # Seeding: ordinary vehicles get the standard null + per-pile greedy
     # solo pool. Boundary vehicles get none of that -- see the module
@@ -385,6 +391,7 @@ def run_column_generation(
         K,
         k_lo,
         seeds,
+        arrivals={v.id: v.a for v in vehicles},
         objective_ids=objective_ids,
         conservative_modules=conservative_modules,
     )
@@ -462,7 +469,7 @@ def run_column_generation(
                     zeta[j][mm] = z
                 else:
                     true_z = _plan_reduced_cost(
-                        plan, pi=lp.pi, mu=lp.mu, pile=mm, in_objective=j in objective_ids
+                        plan, cost=column_cost(rm, plan), pi=lp.pi, mu=lp.mu, pile=mm
                     )
                     rc = true_z - lp.sigma[j]
                 if not plan.is_null and rc < -eps_rc:
@@ -476,10 +483,10 @@ def run_column_generation(
                 for j, (plan, mm) in fixed_boundary.items():
                     zeta[j][mm] = _plan_reduced_cost(
                         plan,
+                        cost=column_cost(rm, plan),
                         pi=price_pi,
                         mu=price_mu,
                         pile=mm,
-                        in_objective=j in objective_ids,
                     )
             return candidates, zeta
 
@@ -586,7 +593,7 @@ def run_column_generation(
         lower_bound_history=lower_bound_history,
         best_lower_bound=best_lb,
         converged=converged,
-        earliest_departure_sum=e_sum,
+        sojourn_floor=sojourn_floor,
         columns_purged=total_purged,
         boundary_vehicles=boundary_vehicles,
         cohorts=cohorts,

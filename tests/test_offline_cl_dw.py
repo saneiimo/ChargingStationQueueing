@@ -88,11 +88,11 @@ def test_pricer_at_zero_duals_matches_earliest_departure():
 
     E = earliest_departures([v], station, delta, horizon)
     pricer = build_pricer(v, 0, station, delta, K, E[v.id])
-    zeta, plan = price(pricer, {}, {})  # no duals -> pure D_j minimisation
+    zeta, plan = price(pricer, {}, {})  # no duals -> pure sojourn minimisation
 
     assert not plan.is_null
     assert plan.departure == E[v.id]
-    assert zeta == pytest.approx(E[v.id])
+    assert zeta == pytest.approx(delta * E[v.id] - v.a)  # sojourn in minutes
 
 
 # ---------------------------------------------------------------------------
@@ -107,7 +107,7 @@ def test_master_dual_signs_are_non_positive():
     delta, horizon, K = 1.0, 90.0, 90
 
     seeds = seed_columns([v0, v1], station, delta, K)
-    rm = build_master([v0.id, v1.id], station, delta, K, 0, seeds)
+    rm = build_master([v0.id, v1.id], station, delta, K, 0, seeds, arrivals={v0.id: v0.a, v1.id: v1.a})
     lp = solve_lp(rm)  # raises AssertionError internally if signs are wrong
     assert all(val <= 1e-9 for val in lp.pi.values())
     assert all(val <= 1e-9 for val in lp.mu.values())
@@ -173,7 +173,8 @@ def test_lb_only_skips_price_and_branch_but_keeps_the_lower_bound():
 def _known_optimum_instance():
     """Identical to tests/test_connector_lane_optimization.py's own
     _multi_pile_test_instance -- verified there (mip_gap=1e-6) to have true
-    optimum 118.0 for the compact, whole-module model."""
+    optimum sum_j D_j = 118 slots, i.e. total sojourn 118 - 5 = 113 minutes,
+    for the compact, whole-module model."""
     v0 = _toy_vehicle(0, 0.0, 50.0, 0.2, 0.8, p_max=100.0)
     v1 = _toy_vehicle(1, 0.0, 100.0, 0.15, 0.85, p_max=200.0)
     v2 = _toy_vehicle(2, 5.0, 50.0, 0.2, 0.8, p_max=100.0)
@@ -185,7 +186,7 @@ def test_bracket_contains_known_compact_model_optimum():
     vehicles, station, delta, horizon = _known_optimum_instance()
 
     # Independently re-confirm the compact model's own optimum on this
-    # instance (rather than hard-coding 118.0 twice across two test files).
+    # instance (rather than hard-coding 113.0 twice across two test files).
     exact = build_cl_model(vehicles, station, delta, horizon)
     solve_cl_model(exact, mip_gap=1e-6)
     true_optimum = float(exact.model.ObjVal)
@@ -207,6 +208,11 @@ def test_bracket_contains_known_compact_model_optimum():
     # so it can only be >= the true optimum.
     assert solution.UB >= true_optimum - 1e-4
     assert solution.whole_module_feasible
+    # Both bounds are total sojourn (minutes), like the compact model's
+    # objective; the UB schedule's own per-vehicle sojourns add up to UB.
+    assert solution.total_sojourn_UB == pytest.approx(solution.UB)
+    assert float(solution.per_vehicle["sojourn_min"].sum()) == pytest.approx(solution.UB, abs=1e-6)
+    assert solution.mean_sojourn_LB == pytest.approx(solution.LB / len(vehicles))
 
 
 def test_validate_schedule_passes_on_price_and_branch_result():
@@ -243,7 +249,7 @@ def test_add_column_deduplicates_identical_plans():
     v = _toy_vehicle(0, 0.0, 50.0, 0.2, 0.8)
     K = 90
     seeds = seed_columns([v], station, 1.0, K)
-    rm = build_master([v.id], station, 1.0, K, 0, seeds)
+    rm = build_master([v.id], station, 1.0, K, 0, seeds, arrivals={v.id: v.a})
 
     n_before = len(rm.columns[v.id])
     solo_plan = next(p for p in seeds[v.id] if not p.is_null)

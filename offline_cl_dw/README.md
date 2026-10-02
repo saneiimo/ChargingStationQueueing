@@ -63,9 +63,9 @@ print(solution.per_vehicle)
 valid even if `solution.converged` is `False` (an *anytime* bound, see
 "Column generation" below). `solution.upper_bound` is `price-and-branch`'s
 own objective — a genuine feasible schedule, always valid regardless of
-convergence. Both convert to minutes the same way `offline_cl_opt`'s own
-README explains: `delta*gap/n_vehicles` minutes of mean-sojourn-time
-uncertainty.
+convergence. Both are total sojourn in minutes, the same objective as
+`offline_cl_opt` (a column costs its vehicle's sojourn `delta*D - a_j`), so a
+gap of `g` is `g/n_optimized` minutes of mean-sojourn-time uncertainty.
 
 `colgen` (a `ColGenResult`) keeps the full iteration history
 (`z_rmp_history`, `lower_bound_history`) and the live master/pricers, if
@@ -139,7 +139,7 @@ a dual cycling problem, not a harmless waste."
 **Two stopping criteria** (Section 7.4), whichever comes first: an exact
 pricing pass finds no column with reduced cost below `-eps_rc` (`z_RMP ==
 z_MP` exactly), or the bracket `z_RMP - best_lower_bound` closes to within
-`gap_tolerance`. Either way, `max_iterations`/`time_limit` are a soft
+`gap_tolerance` (minutes of total sojourn). Either way, `max_iterations`/`time_limit` are a soft
 backstop; `converged=False` there still leaves `best_lower_bound` valid.
 
 ## Getting an integer schedule: price-and-branch (`master.solve_integer`)
@@ -156,15 +156,17 @@ relaxation's own optimum.
 <summary>How loose can this actually be? (a real example)</summary>
 
 On the 3-vehicle instance `tests/test_offline_cl_dw.py::test_bracket_contains_known_compact_model_optimum`
-uses (true compact-model optimum: 118.0), column generation converges its
-lower bound to 111.09 — correctly below 118.0, since it's a continuous-module
-relaxation — but price-and-branch's own upper bound comes out at 157.0,
+uses (true compact-model optimum: 113.0 minutes of total sojourn), column
+generation (2000 iterations, not formally converged) ends with a certified
+lower bound of 105.42 and a restricted-master LP value of 106.09 — correctly
+below 113.0, since it's a continuous-module relaxation — but
+price-and-branch's own upper bound comes out at 152.0,
 dropping one vehicle entirely (choosing its null plan) rather than serving
 all three. This is exactly the failure mode the source document names: the
 LP-optimal columns can rely on a *fractional blend* across several plans
 per vehicle that no single whole plan replicates, and price-and-branch
 can't fall back to anything better than what was already generated. The
-bracket `[111.09, 157.0]` is still correct (it contains 118.0), just not
+bracket `[105.42, 152.0]` is still correct (it contains 113.0), just not
 tight on this particular instance.
 </details>
 

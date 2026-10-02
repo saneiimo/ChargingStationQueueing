@@ -18,6 +18,7 @@ from offline_cl_opt.boundary import (
     cohort_totals,
 )
 from offline_cl_opt.instance import StationSpec, VehicleData
+from offline_cl_opt.model import sojourn_minutes
 
 from .colgen import ColGenResult, run_column_generation
 from .columns import Plan
@@ -35,15 +36,11 @@ class DWSolution:
     False (an anytime bound, Section 6.4). ``UB`` is the price-and-branch
     integer master's objective (Section 9.1) -- a genuine feasible
     schedule's cost, valid regardless of convergence. ``gap`` is
-    ``UB - LB``, the certified bracket width. All three are in the compact
-    model's own raw objective units (eq. 1: ``sum_j D_j``, each vehicle's
-    *absolute* departure slot counted from ``t=0``) -- **not** sojourn
-    minutes, and not directly comparable to a simulation's total-sojourn
-    metric (``sum_j (departure - arrival)``), which nets out arrival time
-    and this objective does not. Comparing ``LB``/``UB`` straight against a
-    sojourn number is an apples-to-oranges mistake that looks exactly like
-    an invalid bound (e.g. ``LB`` appearing to exceed a feasible sojourn
-    total) without actually being one.
+    ``UB - LB``, the certified bracket width. All three are in the
+    objective's own units: total sojourn ``sum_j (delta*D_j - a_j)`` in
+    minutes over ``objective_cohorts`` -- the same objective as
+    ``offline_cl_opt``'s compact model, so directly comparable to it and to
+    a simulation's total sojourn over the same vehicles.
 
     ``rmp_gap`` is a *different* quantity from ``gap`` -- it is
     ``z_RMP - LB`` at the end of column generation (the final entry of
@@ -59,17 +56,11 @@ class DWSolution:
     same thing even then, since price-and-branch's ``UB`` need not equal
     the LP optimum exactly.
 
-    ``total_sojourn_UB``/``mean_sojourn_UB`` give the *schedule*'s (i.e.
-    ``UB``'s) cost already converted to sojourn minutes -- mirrors
-    ``offline_cl_opt.solution.ConnectorLaneSolution`` exactly (``delta*
-    objective - sum_j a_j``) and equals ``per_vehicle["sojourn_min"].sum()``
-    /``.mean()``. ``total_sojourn_LB``/``mean_sojourn_LB`` apply the same
-    conversion to ``LB`` instead, so those -- not ``LB`` itself -- are what
-    should be compared against a simulation's total/mean sojourn. Both LB
-    conversions are themselves valid bounds: Section 6.4's
-    ``T_bar = (delta*z - sum_j a_j)/J`` is strictly increasing in ``z``, so
-    ``LB <= z*`` carries straight through to
-    ``mean_sojourn_LB <= optimal mean sojourn``.
+    ``total_sojourn_UB`` equals ``UB`` and ``mean_sojourn_UB`` is it divided
+    by ``n_optimized`` (equal to ``per_vehicle["sojourn_min"]`` summed /
+    averaged over the objective's vehicles); ``total_sojourn_LB`` equals
+    ``LB`` and ``mean_sojourn_LB`` is it per vehicle -- a valid lower bound
+    on the optimal mean sojourn, since ``LB <= z*``.
 
     ``columns_purged`` is copied straight from ``ColGenResult.columns_purged``
     (Section 8.3) -- the cumulative count of non-basic columns swept out of
@@ -192,7 +183,7 @@ def extract_solution(
                 float(plan.start) if served and plan.start is not None else float(K)
             )
             departure_slot = float(plan.departure)
-            sojourn_min = delta * plan.departure - v.a
+            sojourn_min = sojourn_minutes(plan.departure, v.a, delta)
         # A boundary vehicle's plan only covers the modeled window, so its
         # in-window energy is reported next to what it already had at t=0 --
         # otherwise the row reads as a shortfall against energy_required.
@@ -219,16 +210,13 @@ def extract_solution(
     per_vehicle = pd.DataFrame(rows).sort_values("vehicle_id").reset_index(drop=True)
     by_cohort = cohort_totals(rows, cohorts)
 
-    # LB/UB bound the objective, which ranges over objective_cohorts only, so
-    # the arrival sum converting them to minutes must range over exactly the
-    # same vehicles -- mixing the two sets silently corrupts both figures.
+    # LB/UB already are total sojourn over objective_cohorts (minutes).
     optimized = [r for r in rows if r["in_objective"]]
     n = len(optimized)
-    total_arrival = sum(float(r["arrival"]) for r in optimized)  # type: ignore[arg-type]
-    total_sojourn_UB = delta * UB - total_arrival
+    total_sojourn_UB = UB
     # nan on an empty objective (see offline_cl_opt.solution) -- never 0.0.
     mean_sojourn_UB = total_sojourn_UB / n if n else float("nan")
-    total_sojourn_LB = delta * LB - total_arrival
+    total_sojourn_LB = LB
     mean_sojourn_LB = total_sojourn_LB / n if n else float("nan")
 
     return DWSolution(
@@ -275,7 +263,7 @@ def solve_by_decomposition(
     pricer_threads: int | None = 1,
     exact_mip_gap: float | None = 0.0,
     purge_every: int | None = 25,
-    purge_threshold: float = 10.0,
+    purge_threshold: float | None = None,
     integer_mip_gap: float | None = 1e-3,
     integer_time_limit: float | None = None,
     solve_integer_ub: bool = True,
@@ -403,6 +391,7 @@ def solve_by_decomposition(
             K,
             best_lower_bound=cg.best_lower_bound,
             boundary_vehicles=boundary_vehicles,
+            objective_ids=cg.master.objective_ids,
         )
 
     return solution, cg
