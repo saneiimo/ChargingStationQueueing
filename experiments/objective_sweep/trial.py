@@ -2,9 +2,9 @@
 One benchmark trial: simulate a measured window, then bound it two ways.
 
 A trial is the ``sim_benchmark.ipynb`` walkthrough, run headless and
-recorded. Four numbers for the same objective come out of it, all reported
-per cohort so they are comparable (see ``metrics.MetricsTracker`` and
-``offline_cl_opt.boundary`` for the cohort definitions):
+recorded. Up to five numbers for the same objective come out of it, all
+reported per cohort so they are comparable (see ``metrics.MetricsTracker``
+and ``offline_cl_opt.boundary`` for the cohort definitions):
 
 * ``sim``   -- the DES's own continuous-time sojourns, truncated at the
                warm-up boundary so the boundary cohorts are clocked the way
@@ -15,7 +15,16 @@ per cohort so they are comparable (see ``metrics.MetricsTracker`` and
                grid schedule.
 * ``exact`` -- the connector-lane MILP's incumbent (an upper bound on the
                optimum) plus the solver's own best bound.
-* ``dw``    -- Dantzig-Wolfe's certified lower bound on the optimum.
+* ``bp``    -- the SAME whole-module model solved by branch-and-price
+               (``offline_cl_PB``): its best schedule plus a proven lower
+               bound; the two coincide when ``bp_status == "OPTIMAL"``.
+* ``dw``    -- Dantzig-Wolfe's certified lower bound on the optimum
+               (continuous-module relaxation).
+
+All three offline models minimize the same objective, total sojourn
+``sum_j (delta*D_j - a_j)`` in minutes over ``objective_cohorts``, so every
+``objective`` / ``best_bound`` / ``LB`` / ``UB`` field is total sojourn in
+minutes; ``*_mean_sojourn*`` divides it by ``n_optimized``.
 
 The DES episode always runs, whatever ``run_sim`` says: both offline models
 are built from the *realized* arrival stream and the boundary snapshot it
@@ -42,7 +51,15 @@ from offline_cl_opt import (
     build_measurement_instance,
     solve_cl_model,
 )
+from offline_cl_opt.boundary import Cohort
 from offline_cl_opt.solution import extract_solution as extract_exact
+from offline_cl_PB import (
+    BranchAndPrice,
+    ScheduleValidationError,
+    schedule_from_compact,
+    schedule_from_simulation,
+    validate_schedule,
+)
 from policy.power.proportional import ProportionalPower
 from policy.queue.fifo import FIFOQueuePolicy
 from simulation.arrivals import generate_arrivals
@@ -76,10 +93,10 @@ class TrialResult:
     """
     Everything one trial produced, in nested dicts ready for JSON.
 
-    ``sim``/``grid``/``exact``/``dw`` are ``None`` for a stage that was
-    switched off, and carry an ``"error"`` key for one that was attempted
-    and failed (a solve can hit an infeasibility or an assertion; a failed
-    stage must not take the whole sweep down with it).
+    ``sim``/``grid``/``exact``/``bp``/``dw`` are ``None`` for a stage that
+    was switched off, and carry an ``"error"`` key for one that was
+    attempted and failed (a solve can hit an infeasibility or an assertion;
+    a failed stage must not take the whole sweep down with it).
     """
 
     config: TrialConfig
@@ -92,6 +109,7 @@ class TrialResult:
     sim: dict[str, Any] | None = None
     grid: dict[str, Any] | None = None
     exact: dict[str, Any] | None = None
+    bp: dict[str, Any] | None = None
     dw: dict[str, Any] | None = None
 
 
@@ -441,7 +459,7 @@ def _arrivals_inside_horizon(
 
 
 def _n_optimized(cfg: TrialConfig, inst) -> int:
-    """Vehicles inside ``cfg.objective_cohorts`` -- the J in delta*g/J."""
+    """Vehicles inside ``cfg.objective_cohorts`` -- the J in (total sojourn)/J."""
     return sum(1 for c in inst.cohorts.values() if c in cfg.objective_cohorts)
 
 
@@ -502,15 +520,24 @@ def run_exact(
     """
     Build and solve the connector-lane MILP; report incumbent *and* bound.
 
-    ``objective`` is the solver's incumbent (``sum_j D_j``, an upper bound on
-    the optimum); ``best_bound`` is Gurobi's ``ObjBound`` (a lower bound), so
-    a time-limited run still brackets the optimum. ``status``/``mip_gap``
-    say whether the limit was what stopped it.
+    ``objective`` is the solver's incumbent (total sojourn in minutes, an
+    upper bound on the optimum); ``best_bound`` is Gurobi's ``ObjBound`` (a
+    lower bound, same units; ``mean_sojourn_LB`` is it per optimized
+    vehicle), so a time-limited run still brackets the optimum.
+    ``status``/``mip_gap`` say whether the limit was what stopped it --
+    ``mip_gap`` is relative to total sojourn.
 
     ``solver_progress=True`` turns on Gurobi's own solve log (branch-and-bound
     node counts, incumbent/bound as they improve) -- see ``run_trial``'s
     docstring for when that is (and is not) a good idea.
     """
+    row, cl = _solve_exact(cfg, inst, station, solver_progress=solver_progress)
+    cl.model.dispose()
+    return row
+
+
+def _solve_exact(cfg: TrialConfig, inst, station: StationSpec, *, solver_progress: bool):
+    """``run_exact``'s work; also returns the solved model (for seeding B&P)."""
     t0 = time.perf_counter()
     cl = build_cl_model(
         inst.vehicles,
@@ -541,13 +568,14 @@ def run_exact(
         best_bound = NAN
 
     completed, arrived, diag = _model_groups(sol.per_vehicle, sol.K)
-    return {
+    row = {
         "status": sol.status,
-        "objective": sol.objective,  # incumbent sum_j D_j, slot units
-        "best_bound": best_bound,  # solver's own lower bound, slot units
-        "mip_gap_achieved": sol.mip_gap,
+        "objective": sol.objective,  # incumbent total sojourn, minutes
+        "best_bound": best_bound,  # solver's own lower bound, minutes
+        "mip_gap_achieved": sol.mip_gap,  # relative to total sojourn
         "total_sojourn": sol.total_sojourn,
         "mean_sojourn": sol.mean_sojourn,
+        "mean_sojourn_LB": best_bound / sol.n_optimized if sol.n_optimized else NAN,
         "n_vehicles": sol.n_vehicles,
         "n_optimized": sol.n_optimized,
         "K": sol.K,
@@ -559,10 +587,173 @@ def run_exact(
         "completed_by_cohort": completed,
         "arrived_by_cohort": arrived,
     }
+    return row, cl
 
 
 # --------------------------------------------------------------------------- #
-# Stage 4 -- Dantzig-Wolfe
+# Stage 4 -- branch-and-price (the exact model, solved by offline_cl_PB)
+# --------------------------------------------------------------------------- #
+
+BP_INITIAL_SCHEDULES = ("simulation", "exact", "both", "none")
+
+
+def _bp_seed(cfg: TrialConfig, inst, station: StationSpec, env, exact_model) -> tuple[dict | None, str, float]:
+    """
+    The initial incumbent for B&P, per ``cfg.bp_initial_schedule``.
+
+    Returns ``(schedule or None, source label, objective or nan)``. Each
+    candidate is a complete schedule checked against the exact model here
+    (and again inside B&P), never a bare objective value -- so a seed that
+    does not survive discretization is dropped, not trusted.
+    """
+    choice = cfg.bp_initial_schedule
+    if choice not in BP_INITIAL_SCHEDULES:
+        raise ValueError(f"bp_initial_schedule must be one of {BP_INITIAL_SCHEDULES}, got {choice!r}")
+    K = math.ceil(round(cfg.offline_horizon / cfg.delta, 9))
+    weights = {
+        v.id: 1.0 if inst.cohorts.get(v.id, Cohort.MEASUREMENT) in cfg.objective_cohorts else 0.0
+        for v in inst.vehicles
+    }
+    candidates: list[tuple[str, dict]] = []
+    if choice in ("simulation", "both"):
+        sched, _counts = schedule_from_simulation(
+            env.engine.metrics.arrived_evs, inst.vehicles, station, cfg.delta, K,
+            inst.boundary_vehicles, warmup_period=env.engine.warmup_period,
+        )
+        candidates.append(("simulation", sched))
+    if choice in ("exact", "both") and exact_model is not None and exact_model.model.SolCount > 0:
+        sched, _conns = schedule_from_compact(exact_model)
+        candidates.append(("exact", sched))
+    best: tuple[dict | None, str, float] = (None, "none", NAN)
+    for label, sched in candidates:
+        try:
+            obj = validate_schedule(
+                sched, inst.vehicles, station, cfg.delta, K, inst.boundary_vehicles, weights
+            ).objective
+        except ScheduleValidationError:
+            continue
+        if best[0] is None or obj < best[2]:
+            best = (sched, label, obj)
+    return best
+
+
+def _bp_bound_history(sol, offset_s: float) -> list[dict[str, Any]]:
+    """
+    ``PBSolution.bound_history`` in sweep units: the certified bracket on the
+    optimum over time, one row per change.
+
+    ``time_s`` is measured from the start of the B&P stage (``offset_s`` adds
+    the seed construction that precedes the solver), so the last row's time
+    is ~``bp_runtime_s``. Bounds are given in objective units (total sojourn,
+    minutes) and per vehicle as mean sojourn over ``objective_cohorts`` --
+    the same figures as ``bp_objective`` / ``bp_best_bound`` and
+    ``bp_mean_sojourn`` / ``bp_mean_sojourn_LB``. ``gap_pct`` is
+    ``100 * (upper - lower) / upper``, the gap relative to total sojourn. A
+    lower bound of ``-inf`` (before the root is first priced) is stored as
+    NaN.
+    """
+    n = sol.n_optimized
+    rows = []
+    for h in sol.bound_history:
+        lb = h["lower_bound"] if math.isfinite(h["lower_bound"]) else NAN
+        ub = h["upper_bound"] if math.isfinite(h["upper_bound"]) else NAN
+        gap = ub - lb
+        rows.append(
+            {
+                "time_s": offset_s + h["time_s"],
+                "lower_bound": lb,
+                "upper_bound": ub,
+                "gap": gap,
+                "gap_pct": 100.0 * gap / ub if ub else NAN,
+                "lower_bound_min": lb / n if n else NAN,
+                "upper_bound_min": ub / n if n else NAN,
+                "nodes": h["nodes"],
+                "event": h["event"],
+            }
+        )
+    return rows
+
+
+def run_bp(
+    cfg: TrialConfig,
+    inst,
+    station: StationSpec,
+    env: ChargingStationEnv,
+    *,
+    exact_model=None,
+    solver_progress: bool = False,
+) -> dict[str, Any]:
+    """
+    Solve the exact whole-module model by branch-and-price (``offline_cl_PB``).
+
+    ``objective`` is the best schedule found (total sojourn in minutes, an
+    upper bound on the optimum) and ``best_bound`` a proven lower bound, so a
+    time-limited run still brackets the optimum -- the same two fields
+    ``run_exact`` reports, for the same model. ``status`` is ``OPTIMAL``
+    when they coincide, else ``TIME_LIMIT``. ``root_lower_bound`` is the
+    root node's bound (the whole-module Dantzig-Wolfe bound).
+
+    The initial incumbent comes from ``cfg.bp_initial_schedule`` (see
+    ``TrialConfig``); ``seed_source``/``seed_objective`` record which one
+    was used and its value, ``incumbent_source`` where the final schedule
+    came from. ``exact_model`` is the solved compact model from the same
+    trial, needed only for the ``"exact"``/``"both"`` seeds.
+
+    ``bound_history`` is the certified bracket over time (see
+    ``_bp_bound_history``); the sweep writes it to ``bound_history.csv``,
+    not to ``results.csv``.
+
+    ``solver_progress=True`` prints B&P's own per-node log.
+    """
+    t0 = time.perf_counter()
+    seed, seed_source, seed_objective = _bp_seed(cfg, inst, station, env, exact_model)
+    seed_s = time.perf_counter() - t0
+    sol = BranchAndPrice(
+        inst.vehicles,
+        station,
+        cfg.delta,
+        cfg.offline_horizon,
+        boundary_vehicles=inst.boundary_vehicles,
+        cohorts=inst.cohorts,
+        objective_cohorts=cfg.objective_cohorts,
+        initial_schedule=seed,
+        time_limit=cfg.bp_time_limit,
+        progress=solver_progress,
+    ).solve()
+    elapsed = time.perf_counter() - t0
+    completed, arrived, diag = _model_groups(sol.per_vehicle, sol.K)
+    return {
+        "status": sol.status,
+        "bound_history": _bp_bound_history(sol, seed_s),
+        "objective": sol.objective,  # best schedule's total sojourn, minutes
+        "best_bound": sol.lower_bound,  # proven lower bound, minutes
+        "gap": sol.gap,  # objective - best_bound (0 when OPTIMAL)
+        "rel_gap": sol.gap / sol.objective if sol.objective else NAN,  # relative to total sojourn
+        "root_lower_bound": sol.root_lower_bound,
+        "total_sojourn": sol.total_sojourn,
+        "mean_sojourn": sol.mean_sojourn,
+        "total_sojourn_LB": sol.total_sojourn_LB,
+        "mean_sojourn_LB": sol.mean_sojourn_LB,
+        "n_vehicles": sol.n_vehicles,
+        "n_optimized": sol.n_optimized,
+        "K": sol.K,
+        "nodes": sol.nodes_processed,
+        "columns": sol.columns,
+        "seed_source": seed_source,
+        "seed_objective": seed_objective,
+        "incumbent_source": sol.incumbent_source,
+        "compact_check_max_violation": (
+            sol.compact_check.max_violation if sol.compact_check is not None else NAN
+        ),
+        "runtime_s": elapsed,
+        **diag,
+        "completed_by_cohort": completed,
+        "arrived_by_cohort": arrived,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Stage 5 -- Dantzig-Wolfe
 # --------------------------------------------------------------------------- #
 
 
@@ -601,18 +792,16 @@ def run_dw(
     log (``[colgen] iter N: z_RMP=..., best_LB=..., gap=..., ...``) -- see
     ``run_trial``'s docstring for when that is (and is not) a good idea.
 
-    ``gap_tolerance`` (raw ``sum_j D_j`` units, passed to column generation)
-    comes from ``cfg.gap_tolerance_target_min`` when set: a target of ``m``
-    mean-sojourn minutes becomes ``m * n_optimized / cfg.delta``, using this
-    instance's own ``n_optimized`` (mirrors ``sim_benchmark.ipynb``'s
-    ``gap_tolerance = m * len(vehicles) / delta``, but with ``n_optimized``
-    -- the vehicles actually in ``objective_cohorts`` -- rather than every
-    vehicle in the instance). Falls back to ``cfg.gap_tolerance`` otherwise.
+    ``gap_tolerance`` (objective units: minutes of total sojourn, passed to
+    column generation) comes from ``cfg.gap_tolerance_target_min`` when set:
+    a target of ``m`` mean-sojourn minutes becomes ``m * n_optimized``, using
+    this instance's own ``n_optimized`` (the vehicles actually in
+    ``objective_cohorts``). Falls back to ``cfg.gap_tolerance`` otherwise.
     The value actually used is reported back as ``gap_tolerance_used``.
     """
     n_optimized = _n_optimized(cfg, inst)
     if cfg.gap_tolerance_target_min is not None:
-        gap_tolerance = cfg.gap_tolerance_target_min * n_optimized / cfg.delta
+        gap_tolerance = cfg.gap_tolerance_target_min * n_optimized
     else:
         gap_tolerance = cfg.gap_tolerance
 
@@ -645,13 +834,13 @@ def run_dw(
         "converged": sol.converged,
         "iterations": sol.iterations,
         "columns_purged": sol.columns_purged,
-        "gap_tolerance_used": gap_tolerance,  # raw units, whichever mode set it
-        # Lower bounds, raw objective units (sum_j D_j).
+        "gap_tolerance_used": gap_tolerance,  # minutes of total sojourn, whichever mode set it
+        # Lower bounds, objective units (total sojourn, minutes).
         "LB": sol.LB,
         "z_rmp": sol.LB + sol.rmp_gap,  # final restricted-master LP value
         "rmp_gap": sol.rmp_gap,
-        "earliest_departure_sum": cg.earliest_departure_sum,  # cheap sanity floor
-        # Lower bounds converted to sojourn minutes (the comparable numbers).
+        "sojourn_floor": cg.sojourn_floor,  # cheap sanity floor
+        # The same lower bound per optimized vehicle.
         "total_sojourn_LB": sol.total_sojourn_LB,
         "mean_sojourn_LB": sol.mean_sojourn_LB,
         # Upper-bound side: nan unless price-and-branch ran.
@@ -687,26 +876,33 @@ def run_trial(
     run_sim: bool = True,
     run_exact_model: bool = True,
     run_dw_model: bool = True,
+    run_bp_model: bool = False,
     verbose: bool = True,
     solver_progress: bool = False,
 ) -> TrialResult:
     """
     Simulate, then bound, one configuration.
 
-    The three ``run_*`` flags switch off *reporting/solving* stages
-    independently. The DES episode itself always runs -- both offline models
-    are built from its realized arrivals and boundary snapshot -- so
-    ``run_sim=False`` skips only the sim/grid sojourn tables, not the
-    episode.
+    The ``run_*`` flags switch off *reporting/solving* stages independently.
+    The DES episode itself always runs -- every offline model is built from
+    its realized arrivals and boundary snapshot -- so ``run_sim=False``
+    skips only the sim/grid sojourn tables, not the episode.
+
+    ``run_exact_model`` and ``run_bp_model`` solve the same exact
+    whole-module model two ways (compact MILP / branch-and-price); either,
+    both or neither can run. When both run, exact goes first so B&P can be
+    seeded from its incumbent (``bp_initial_schedule="exact"``/``"both"``).
+    Stages run in the order exact, bp, dw.
 
     ``verbose`` prints one line per trial/stage (this module's own summary --
     "instance: J=...", "exact: OPTIMAL obj=..."). ``solver_progress`` is a
     separate, much noisier switch: it turns on each solver's OWN internal
-    log -- Gurobi's native branch-and-bound log for the exact model, column
-    generation's own ``[colgen] iter N: z_RMP=..., best_LB=..., gap=...``
-    line per iteration for DW. Meant for debugging a single slow/stuck
-    trial, not for a sweep of many -- left on across a whole sweep it floods
-    the console with every solver's full internal log for every trial.
+    log -- Gurobi's native branch-and-bound log for the exact model, B&P's
+    per-node log, column generation's own ``[colgen] iter N: z_RMP=...,
+    best_LB=..., gap=...`` line per iteration for DW. Meant for debugging a
+    single slow/stuck trial, not for a sweep of many -- left on across a
+    whole sweep it floods the console with every solver's full internal log
+    for every trial.
 
     A solve that raises is recorded as ``{"error": ...}`` on its stage and
     the trial still returns, so one infeasible point cannot abort a sweep.
@@ -728,7 +924,7 @@ def run_trial(
         result.sim = {"runtime_s": sim_runtime, **sim}
         result.grid = dict(grid)
 
-    if not (run_exact_model or run_dw_model):
+    if not (run_exact_model or run_bp_model or run_dw_model):
         return result
 
     if verbose:
@@ -738,23 +934,44 @@ def run_trial(
             f"optimized={result.instance['n_optimized']}"
         )
 
-    for enabled, name, fn in (
-        (run_exact_model, "exact", run_exact),
-        (run_dw_model, "dw", run_dw),
-    ):
-        if not enabled:
-            continue
-        t0 = time.perf_counter()
-        try:
-            stage = fn(cfg, inst, station, solver_progress=solver_progress)
-        except Exception as exc:  # a failed solve must not kill the sweep
-            stage = {
-                "error": f"{type(exc).__name__}: {exc}",
-                "runtime_s": time.perf_counter() - t0,
-            }
-        setattr(result, name, stage)
-        if verbose:
-            print(f"  {name}: {_stage_line(stage)}")
+    # The solved compact model is kept only if B&P may be seeded from it.
+    keep_exact = run_bp_model and cfg.bp_initial_schedule in ("exact", "both")
+    exact_model = None
+
+    def solve_exact(cfg, inst, station, *, solver_progress):
+        nonlocal exact_model
+        row, cl = _solve_exact(cfg, inst, station, solver_progress=solver_progress)
+        if keep_exact:
+            exact_model = cl
+        else:
+            cl.model.dispose()
+        return row
+
+    def solve_bp(cfg, inst, station, *, solver_progress):
+        return run_bp(cfg, inst, station, env, exact_model=exact_model, solver_progress=solver_progress)
+
+    try:
+        for enabled, name, fn in (
+            (run_exact_model, "exact", solve_exact),
+            (run_bp_model, "bp", solve_bp),
+            (run_dw_model, "dw", run_dw),
+        ):
+            if not enabled:
+                continue
+            t0 = time.perf_counter()
+            try:
+                stage = fn(cfg, inst, station, solver_progress=solver_progress)
+            except Exception as exc:  # a failed solve must not kill the sweep
+                stage = {
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "runtime_s": time.perf_counter() - t0,
+                }
+            setattr(result, name, stage)
+            if verbose:
+                print(f"  {name}: {_stage_line(stage)}")
+    finally:
+        if exact_model is not None:
+            exact_model.model.dispose()
 
     return result
 
@@ -768,6 +985,14 @@ def _stage_line(stage: dict[str, Any]) -> str:
             f"{stage['status']} LB={stage['LB']:.2f} "
             f"mean_sojourn_LB={stage['mean_sojourn_LB']:.2f} min "
             f"({stage['runtime_s']:.1f}s, {stage['iterations']} iters)"
+        )
+    if "nodes" in stage:  # branch-and-price
+        return (
+            f"{stage['status']} obj={stage['objective']:.2f} "
+            f"bound={stage['best_bound']:.2f} gap={stage['rel_gap']:.2%} "
+            f"mean_sojourn={stage['mean_sojourn']:.2f} min "
+            f"({stage['runtime_s']:.1f}s, {stage['nodes']} nodes, "
+            f"seed={stage['seed_source']})"
         )
     return (
         f"{stage['status']} obj={stage['objective']:.2f} "
