@@ -221,6 +221,8 @@ class MetricsTracker:
         self.in_service_at_warmup_end: list[InServiceAtBoundary] = []
 
         # Time-weighted occupancy samples (one entry per inter-event interval).
+        # Interval i is [event_times[i], event_times[i] + event_durations[i]]:
+        # event_times holds each interval's START.
         self.history_L: list[int] = []
         self.history_Q: list[int] = []
         self.event_times: list[float] = []
@@ -398,11 +400,13 @@ class MetricsTracker:
                 return 0.0
             return float(np.sum(vals * durations) / total)
 
+        # update_metrics logs each interval as [t_start, t_start + dt]:
+        # event_times holds its START (the clock before the step).
         weighted_sum = 0.0
         total_weight = 0.0
-        for t_end, dt, v in zip(self.event_times, self.event_durations, values):
-            eff_start = max(t_end - dt, since)
-            eff_dt = t_end - eff_start
+        for t_start, dt, v in zip(self.event_times, self.event_durations, values):
+            eff_start = max(t_start, since)
+            eff_dt = t_start + dt - eff_start
             if eff_dt <= 0:
                 continue
             weighted_sum += v * eff_dt
@@ -448,12 +452,14 @@ class MetricsTracker:
                 total = total + v
             return total
 
+        # Interval i covers [event_times[i], event_times[i] + dt] -- see
+        # _windowed_time_average.
         total = np.zeros(shape)
-        for t_end, dt, v in zip(self.event_times, self.event_durations, values):
+        for t_start, dt, v in zip(self.event_times, self.event_durations, values):
             if dt <= 0:
                 continue
-            eff_start = max(t_end - dt, since)
-            eff_dt = t_end - eff_start
+            eff_start = max(t_start, since)
+            eff_dt = t_start + dt - eff_start
             if eff_dt <= 0:
                 continue
             total = total + v * (eff_dt / dt)
@@ -1044,10 +1050,12 @@ class MetricsTracker:
         rather than a guaranteed-feasible schedule for the offline model.
 
         Returns, per cohort level, ``{"n", "total_sojourn", "mean_sojourn",
-        "total_departure_slots"}``. The last is ``sum_j D_j`` in the offline
-        objective's own slot units, directly comparable with
-        ``ConnectorLaneSolution.objective`` when the objective covers the
-        matching cohorts.
+        "total_departure_slots"}``. ``total_sojourn`` is in the offline
+        models' objective units (total sojourn, minutes), directly
+        comparable with ``ConnectorLaneSolution.objective`` when the
+        objective covers the matching cohorts; ``total_departure_slots`` is
+        ``sum_j D_j``, the slot-count form (``delta * it - sum_j a_j`` is
+        ``total_sojourn``).
         """
         departure_slot, by_id = self._grid_departure_slots(delta, since)
         levels = (
