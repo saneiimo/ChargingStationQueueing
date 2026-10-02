@@ -96,7 +96,7 @@ VIZ_PALETTE = (
 )
 
 # Semantic colors for EV theory-vs-sim overlays (also reused by
-# offline_opt.visualization for the offline MILP's own solution plots).
+# offline_cl_opt.visualization for the offline MILP's own solution plots).
 VIZ_SERIES = {
     "theory": VIZ_COLORS["neutral"],
     "sim_bms": VIZ_COLORS["sky"],

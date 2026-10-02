@@ -5,26 +5,20 @@ directly off the model's own decision variables, not the DES simulator.
 Call ``solve_cl_model`` (or ``solve_cl_model_adaptive``, and pass
 ``result.cl_model``) first -- these read ``.X`` values.
 
-Adapted from ``offline_opt/visualization.py``'s ``plot_vehicle_power_and_modules``
-/ ``plot_pile_power_and_modules`` for this package's different variable set:
+How the model's variables map onto the plots:
 
-  - No ``alpha``/``sigma`` pair. Occupancy is a single ``u[j,k]``, and
-    ``S[j]``/``D[j]`` (dependent expressions, see ``model.py``) already give
-    the occupied interval directly -- no reconstruction from two variables
-    needed.
-  - No per-vehicle module-count variable. ``offline_opt``'s ``n[j,m,k]`` has
-    no analogue here -- module routing (``r[m,c,k]``) lives per lane-slot,
-    not per vehicle. The "module power capacity" curve shown here is
+  - Occupancy is a single ``u[j,k]``, and ``S[j]``/``D[j]`` (dependent
+    expressions, see ``model.py``) give the occupied interval directly.
+  - There is no per-vehicle module-count variable: module routing
+    (``r[m,c,k]``) lives per lane-slot, not per vehicle. The "module power
+    capacity" curve shown here is
     ``ceil(p[j,k]/Delta)*Delta`` -- ``adaptive.py``'s Lemma (Section 8.1):
     the modules this vehicle's own delivered power genuinely requires, not
     a stored decision variable.
-  - Connector identity **is** a real decision here (``y[j,m,c]``), unlike
-    ``offline_opt`` where a pile's connectors aren't individually named by
-    the model and have to be assigned for display only
-    (``assign_display_connectors``). There is no equivalent step in this
-    file -- vehicles are grouped by the connector the model actually chose.
+  - Connector identity is a real decision (``y[j,m,c]``), so vehicles are
+    grouped by the connector the model actually chose.
 
-Styling reuses ``visualization.style``, same as ``offline_opt/visualization.py``.
+Styling reuses ``visualization.style``.
 """
 
 from __future__ import annotations
@@ -68,14 +62,12 @@ def vehicle_slot_series(
     ``t`` is each slot's start time (``k*delta``), for ``k = k_j`` through
     the slot the vehicle actually departs in (``D[j].getValue()``, capped
     at the model's own horizon ``K``) -- includes any slots spent waiting
-    before plug-in (``p_act`` is correctly 0 there via (13)), matching
-    ``offline_opt``'s equivalent. Empty arrays if the vehicle was never
-    served.
+    before plug-in (``p_act`` is correctly 0 there via (13)). Empty arrays
+    if the vehicle was never served.
 
     ``p_act`` is ``p[j,k].X`` (kW). ``p_req`` reconstructs the BMS
     acceptance curve from the vehicle's own energy trajectory, using its
-    *own* ``s_th`` (a per-vehicle field here, unlike ``offline_opt`` which
-    takes a shared ``s_th`` parameter since its vehicles don't carry one).
+    *own* ``s_th`` (a per-vehicle field).
     ``module_power`` is ``ceil(p_act/Delta)*Delta`` -- see this module's
     docstring.
     """
@@ -122,8 +114,7 @@ def vehicle_lane(cl_model: ConnectorLaneModel, vehicle_id: int) -> tuple[int, in
 
 def _occupancy_interval(cl_model: ConnectorLaneModel, vehicle_id: int) -> tuple[int, int] | None:
     """``[k_start, k_end)`` vehicle_id actually occupies a lane, read
-    straight off ``S[j]``/``D[j]`` -- no alpha/sigma reconstruction needed
-    here, unlike ``offline_opt``. ``None`` if never served (``S_j = K``)."""
+    straight off ``S[j]``/``D[j]``. ``None`` if never served (``S_j = K``)."""
     cm = cl_model
     S_val = cm.S[vehicle_id].getValue()
     D_val = cm.D[vehicle_id].getValue()
@@ -324,7 +315,7 @@ def plot_pile_power_and_modules(
     """
     One figure for ``pile_id``, built from the connector-lane MILP's own
     solution: vertical subplots = the pile's real connectors (``y[j,m,c]``
-    -- no display-only reassignment needed, unlike ``offline_opt``), x = time.
+    -- the connectors the model actually chose), x = time.
 
     Each subplot bars its occupant(s)' power drawn each slot, with the
     reconstructed BMS max request and the power capacity the delivered
@@ -730,8 +721,7 @@ def _slot_start_p_req(
 
     Matches constraint (18): ``p_jk`` is capped by the taper limit at
     ``x_jk`` (energy *before* the slot), not by the intra-slot SoC
-    trajectory. Uses ``v.s_th`` directly (a per-vehicle field here, unlike
-    ``offline_opt`` which takes a shared ``s_th`` parameter).
+    trajectory. Uses ``v.s_th`` directly (a per-vehicle field).
     """
     h = delta / 60.0
     req_at: dict[int, float] = {}
@@ -805,14 +795,12 @@ def plot_pile_power_and_modules_v2(
     piecewise-constant holds on ``[kδ, (k+1)δ)``, not as bar tips connected
     across slots.
 
-    Unlike ``offline_opt`` (whose MILP tracks connector *occupancy* per pile
-    but not *identity*, needing ``assign_display_connectors`` for display),
-    connector identity is a real decision here (``y[j,m,c]``) -- occupants
-    are grouped by the connector the model actually chose, straight off
+    Connector identity is a real decision (``y[j,m,c]``) -- occupants are
+    grouped by the connector the model actually chose, straight off
     ``pile_vehicle_intervals``.
 
-    There is also no per-vehicle module-count decision variable to read
-    (unlike ``offline_opt``'s ``n[j,m,k]``): the "modules" curve here is
+    There is no per-vehicle module-count decision variable to read: the
+    "modules" curve here is
     reconstructed as ``ceil(p_jk/Delta)``, same convention as
     ``vehicle_slot_series``/``plot_pile_power_and_modules``'s ``module_power``
     and Section 8.1's Lemma.

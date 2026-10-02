@@ -73,9 +73,8 @@ def extract_solution(cl_model: ConnectorLaneModel) -> ConnectorLaneSolution:
     ``objective`` and ``mip_gap`` need to account for ``cl_model.tie_break``:
     with two objectives set, plain ``model.ObjVal`` reports the *last*
     (lowest-priority, tie-break) phase, not the real total sojourn -- so when
-    ``tie_break`` is set this reads it via ``ObjNVal`` at index 0 instead
-    (mirrors ``offline_opt.solution.extract_solution``'s own handling
-    exactly -- see that function's docstring). ``model.MIPGap`` goes further
+    ``tie_break`` is set this reads it via ``ObjNVal`` at index 0 instead.
+    ``model.MIPGap`` goes further
     and is not retrievable at all once more than one objective is set
     (Gurobi raises ``AttributeError``) -- in that case ``mip_gap`` is
     reported as ``nan``. By the time the tie-break phase runs, the primary
