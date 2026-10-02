@@ -14,6 +14,9 @@ data/
 # Experiment sweep output (results.csv, per-trial JSON, run metadata)
 experiments/results/
 
+# Solved-model files written by cl_model.ipynb
+cl_model_saved/
+
 # Virtual environments only (do not list ENV/ — on Windows it also matches env/)
 .venv/
 venv/
