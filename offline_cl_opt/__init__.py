@@ -5,9 +5,8 @@ charging station.
 
 Explicitly assigns each vehicle to a physical lane (pile, connector) for
 its whole stay and sequences vehicles that share a lane via a disjunctive
-precedence variable, rather than the slot-indexed pile-occupancy scheme in
-``offline_opt``. See ``offline_cl_opt/README.md`` for the full formulation,
-scope, and unit conventions.
+precedence variable. See ``offline_cl_opt/README.md`` for the full
+formulation, scope, and unit conventions.
 
 Typical usage::
 

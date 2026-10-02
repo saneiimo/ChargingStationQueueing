@@ -347,8 +347,7 @@ def build_cl_model(
         (25)/(26) force piles, and connectors within a pile, to be used in
         order of the lowest-id vehicle that occupies them -- see README.md,
         "Symmetry breaking" for the full argument and proof that this never
-        excludes the true optimum. Off by default: unlike ``offline_opt``'s
-        analogous ``break_pile_symmetry`` (on by default there), the source
+        excludes the true optimum. Off by default: the source
         document explicitly warns aggressive symmetry breaking "can
         interfere with warm starts" (Section 8.2's warm-start note), which
         matters more here since ``adaptive.py``'s whole strategy leans on
@@ -367,11 +366,13 @@ def build_cl_model(
         front-loaded power delivery, purely to break ties among the (often
         many) power profiles that tie the true optimum -- the primary
         objective only cares *when* each vehicle departs, never how its
-        power is distributed within its own occupied window. Mirrors
-        ``offline_opt.model.build_offline_model``'s own ``tie_break``
-        exactly (same hierarchical-objective mechanism, same argument for
-        why it cannot change the reported total sojourn -- see that
-        module's docstring and ``offline_opt/README.md``, "Tie breaking").
+        power is distributed within its own occupied window. Uses
+        Gurobi's hierarchical multi-objective mode: total sojourn is
+        optimized first (priority 1), then the tie-break (priority 0) with
+        total sojourn held within ``abstol=1e-6`` of its optimum. Distinct
+        departure patterns differ by multiples of ``delta``, far above that
+        tolerance, so the tie-break cannot change the reported total
+        sojourn (see the comment at the objective below).
         Roughly doubles solve effort (two hierarchical optimization
         phases); off by default. When True, read the primary objective via
         ``extract_solution`` (not ``cl_model.model.ObjVal`` directly -- see
@@ -496,9 +497,8 @@ def build_cl_model(
     # eta_jk: continuous [0,1], pinned to the exact 0/1 plug-in (rising)
     # edge indicator by (3)-(5) regardless of declared type -- see
     # Proposition 2 in the source document. Leaving it continuous drops
-    # J*K variables from branching for free, same spirit as z in
-    # offline_opt (see that package's README, "z is continuous, not
-    # binary").
+    # J*K variables from branching for free: once u is integral, (3)-(5)
+    # leave eta no fractional option.
     eta = m.addVars(jk_pairs, lb=0.0, ub=1.0, name="eta")
     # x_jk (17): delivered energy strictly before slot k, kWh. A real Gurobi
     # variable -- see the module docstring, "x is a real variable, not a
@@ -580,8 +580,7 @@ def build_cl_model(
     # identical, so any solution has many relabelled twins. Force piles,
     # and connectors within a pile, to be used in order of the lowest-id
     # vehicle occupying them -- see README.md, "Symmetry breaking" for the
-    # full argument (same relabelling-based proof as offline_opt's
-    # break_pile_symmetry) that this never excludes the true optimum.
+    # relabelling argument that this never excludes the true optimum.
     # Placed here (right after (10), which it constrains) rather than after
     # Section 10's position in the document's own narrative, which comes
     # much later -- the constraint only involves y, so there's no reason to
@@ -774,9 +773,7 @@ def build_cl_model(
         # that already achieve the true total-sojourn optimum -- it only cares
         # *when* each vehicle departs, never how its power is distributed
         # within its own occupied window, so many power profiles can tie
-        # exactly (same argument as offline_opt.model.build_offline_model's
-        # own tie_break -- see that module's docstring and
-        # offline_opt/README.md, "Tie breaking"). Maximizing sum(x[j,k]) --
+        # exactly. Maximizing sum(x[j,k]) --
         # cumulative energy delivered strictly before each slot, already a
         # real Gurobi variable (see the module docstring, "x is a real
         # variable") -- rewards front-loading for a fixed departure

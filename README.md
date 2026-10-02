@@ -20,14 +20,19 @@ Read the code in this order the first time through:
 10. `main.py` — short script that rolls out the FIFO baseline.
 11. Notebooks at the repo root (run with the project root as the working
     directory / kernel cwd so package imports resolve):
-    - `simulate_episode.ipynb` — one DES episode + validation / power plots
+    - `simulate_episode_cl.ipynb` — one DES episode + validation / power plots
+      against the connector-lane model
     - `compare_policies.ipynb` — Monte Carlo replications across queue/power policies
-    - `offline_opt.ipynb` — clairvoyant MILP / relaxation bounds on a toy instance
-12. `offline_opt/` — offline (clairvoyant) lower-bound MILP for total sojourn
-    time, solved with gurobipy. Given full knowledge of arrivals up front, its
-    optimum lower-bounds every causal queue/power policy's cost on the same
-    instance — the benchmark to compare FIFO / heuristics / RL against. See
-    `offline_opt/README.md`.
+    - `cl_model.ipynb` — the offline connector-lane model (compact MILP,
+      branch-and-price, Dantzig-Wolfe) on one simulated window
+12. Offline (clairvoyant) optimum for total sojourn time, solved with
+    gurobipy. Given full knowledge of arrivals up front, its optimum
+    lower-bounds every causal queue/power policy's cost on the same
+    instance — the benchmark to compare FIFO / heuristics / RL against:
+    - `offline_cl_opt/` — the connector-lane compact MILP. See
+      `offline_cl_opt/README.md`.
+    - `offline_cl_PB/` — the same model solved exactly by branch-and-price.
+    - `offline_cl_dw/` — its Dantzig-Wolfe lower bound (continuous modules).
 
 ```text
                     +------------------+

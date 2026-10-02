@@ -14,9 +14,9 @@ than of a sum inflated by every vehicle's arrival time. Attainable objective
 values are `delta` apart (`sojourn_objective_round_up`).
 Given every vehicle's arrival time and charging requirement up front, finds
 the lane assignment and module-routing schedule that minimizes total
-sojourn time, exactly as in `offline_opt` — but via a structurally
-different formulation. See "How this differs from `offline_opt`" below for
-when to reach for which.
+sojourn time: each vehicle is assigned to one lane (a specific
+pile+connector pair) for its whole stay, and vehicles sharing a lane are
+sequenced by an explicit disjunctive precedence variable `b_ij`.
 
 ## Quickstart
 
@@ -39,8 +39,7 @@ print(solution.mean_sojourn, solution.per_vehicle)
 
 `vehicles_from_evs` / `VehicleData.from_ev` / `StationSpec.from_station`
 build these from this repo's simulator objects (`models.ev.EV`,
-`models.station.ChargingStation`), the same convenience `offline_opt`
-offers. See `cl_model.ipynb` (repo root) for a full worked example against
+`models.station.ChargingStation`). See `cl_model.ipynb` (repo root) for a full worked example against
 a FIFO simulation.
 
 For the exact model (`build_cl_model`/`solve_cl_model`), solving is a
@@ -111,9 +110,9 @@ only the left (arrival) edge is used to narrow anything; see
 `eta` is declared continuous `[0,1]`, not binary — (3)-(5) pin it to the
 exact rising-edge indicator regardless of declared type (see the source
 document's Proposition 2), so leaving it continuous drops `J*K` variables
-from branching for free, same spirit as `z` in `offline_opt` (see that
-package's README, "`z` is continuous, not binary"). There is no equivalent
-falling-edge variable — see below.
+from branching for free: integrality of `u` already forces every feasible
+`eta` to be 0 or 1. There is no equivalent falling-edge variable — see
+below.
 
 `S[j]`, `D[j]` (start slot, departure boundary) are Gurobi `LinExpr`
 objects built from `eta`/`u`, not decision variables — they're already
@@ -151,8 +150,7 @@ scales linearly with `K` (confirmed empirically: ~25 nonzeros per slot,
 flat, from `K=100` through `K=800`), where the old approach scaled
 quadratically. The vehicle's total energy requirement is enforced by `x`'s
 own upper bound (`W_j`, a per-variable bound, cheaper than a row) rather
-than by a separate summed constraint — `offline_opt`'s `x[j,k]` uses the
-same trick (see that package's README).
+than by a separate summed constraint.
 
 ## Censoring and the horizon (Section 6.3)
 
@@ -192,10 +190,10 @@ implements the alternative:
    combinatorics).
 2. `rounding_test_failures` checks every pile-slot: does
    `sum_c ceil(p_occupant/Delta)` (the *real* whole-module requirement)
-   still fit the pile's *real* module count `N`? (This is exactly
-   `offline_opt`'s `n[j,m,k]=ceil(p[j,k]/Delta)` reconstruction argument
-   for its own constraint (20), applied here per pile-slot instead of
-   globally.)
+   still fit the pile's *real* module count `N`? (Each occupant needs at
+   least `ceil(p/Delta)` whole modules to draw power `p`, and that many
+   always suffice, so this is exactly whole-module feasibility of the
+   pile-slot.)
 3. If every pile-slot passes: stop. `rounded_module_routing` gives the
    Lemma's `hat_r = ceil(p/Delta)` directly — a genuine `(14)`-`(15)`-valid
    integer routing, proven exactly optimal for the fully-integer exact
@@ -300,15 +298,13 @@ strictly smaller id already uses pile `m-1` (on any connector); (26) says
 the same for connectors within a pile. Given any feasible solution,
 relabelling piles by the smallest-id occupant, then relabelling connectors
 within each pile the same way, produces an equivalent solution satisfying
-both — the same relabelling-based proof as `offline_opt`'s
-`break_pile_symmetry` (see that package's README, "Pile symmetry"), so
-this never excludes the true optimum. `i < j` here uses ascending vehicle
+both, with the same objective (piles are identical, and so are connectors
+within a pile), so this never excludes the true optimum. `i < j` here uses ascending vehicle
 `id`, matching `(11)`-`(12)`'s own sequencing-pair order, not the source
 document's arrival-time order — the proof only needs *some* fixed total
 order over vehicles, not that specific one.
 
-Off by default, unlike `offline_opt`'s analogous flag (on by default
-there): this document explicitly warns "aggressive symmetry breaking can
+Off by default: this document explicitly warns "aggressive symmetry breaking can
 interfere with warm starts" (Section 8.2's warm-start note), which matters
 more here since `adaptive.py`'s whole strategy leans on warm-starting.
 Measure the effect on your own instance — for `solve_cl_model_adaptive`,
@@ -439,36 +435,6 @@ source document:
 
 `(14)` is `O(J*M*C*K)` rows, the largest family in the model once the
 energy block is sparse (see "Why `x` is a real variable" above) — this
-implementation is practical mainly for small-to-moderate instances,
-similar in scale to `offline_opt`'s toy examples, for stations/horizons
-where that count stays manageable.
-
-## How this differs from `offline_opt`
-
-Both packages solve the same underlying question (offline-optimal EV
-charging-station scheduling) and both produce a valid performance-ceiling
-lower bound, but via different formulations:
-
-- **`offline_opt`** tracks per-slot completion state (`alpha`/`sigma`) and
-  module counts per (vehicle, pile, slot); pile assignment is implicit
-  through which pile's connector capacity a vehicle's modules draw from.
-- **`offline_cl_opt`** (this package) assigns each vehicle to one *lane*
-  (a specific pile+connector pair) for its whole stay, and sequences
-  vehicles sharing a lane via an explicit disjunctive precedence variable
-  `b_ij`. It has no `offline_opt`-style tapering safety margin to retrofit
-  — the taper constraint (18) already uses the *effective discrete* time
-  constant `tau^delta_j` from the start (see `instance.py`,
-  `tau_delta_hours`), which is exactly the fix `offline_opt/README.md`
-  documents having to add after the fact ("Taper cap looks ahead to slot
-  end") — here it's part of the source formulation itself.
-- Units: `offline_cl_opt` uses real kWh/kW/hours throughout (`h=delta/60`);
-  `offline_opt` folds a kW*min scaling into battery capacity so `delta` in
-  minutes combines with power directly. The two packages' `VehicleData`
-  are **not** interchangeable — always use each package's own `instance.py`
-  helpers to build vehicles for it.
-
-Neither model is a special case of the other, so their optimal
-`total_sojourn` / `mean_sojourn` values are not guaranteed to be numerically
-identical on the same instance in general — both are valid lower bounds
-on any causal policy's cost, which is what `test_offline_bound_never_exceeds_fifo_simulation`
-in each package's test suite checks directly.
+implementation is practical mainly for small-to-moderate instances, for
+stations/horizons where that count stays manageable (for larger ones, see
+`offline_cl_PB` and `offline_cl_dw`).

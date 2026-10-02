@@ -7,10 +7,7 @@ Unit convention
 ---------------
 Real-world units throughout, as the source document specifies (Section 3.2):
 power in kW, energy in kWh, time in minutes for inputs, and hours
-(``h = delta / 60``) wherever time meets power/energy. This is a different
-convention from ``offline_opt`` (which folds a kW*min factor into battery
-capacity so ``delta`` in minutes combines with power directly) -- the two
-packages' ``VehicleData`` classes are not interchangeable.
+(``h = delta / 60``) wherever time meets power/energy.
 """
 
 from __future__ import annotations
@@ -72,10 +69,9 @@ class VehicleData:
         boundary whenever the taper binds throughout the slot -- tighter
         (always >= tau_j, and >= h) than using tau_j directly, which would
         understate how fast the battery actually decays and let the model
-        claim power it couldn't really accept by a slot's end (the same
-        class of bug documented in ``offline_opt/README.md``, "Taper cap
-        looks ahead to slot end" -- this formulation avoids it from the
-        start rather than needing a later fix).
+        claim power it couldn't really accept by a slot's end (the taper
+        cap is set from the energy at the slot's start, while the
+        instantaneous acceptance keeps falling through the slot).
         """
         h = delta_minutes / 60.0
         tau = self.tau_hours
