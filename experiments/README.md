@@ -133,12 +133,93 @@ Up to five numbers for the same objective come out, each reported per cohort:
 | `dw`    | Dantzig-Wolfe's certified **lower** bound on the optimum (continuous-module relaxation) | yes |
 
 On every row: `grid ≥ exact ≥ z* ≥ bp_best_bound` and `bp_objective ≥ z*`,
-where `z*` is the true optimum; `dw_LB ≤ z*` too.
+where `z*` is the true optimum; `dw_LB ≤ z*` too. In a closed-system trial
+(below) the upper-bound side of that chain needs one qualification — see
+"What the model numbers mean".
 
 The offline models can only depart on slot boundaries (assumption A1), so
 each connector handover costs the successor up to `delta` minutes.
 Comparing an optimum against `sim` directly is apples-to-oranges and makes
 the optimum look worse for no real reason — compare against `grid`.
+
+### Closed-system trials (the default)
+
+`TrialConfig.closed_system=True` runs every source on **the same closed set
+of vehicles from the same starting state**:
+
+1. FIFO warms the station up over `[0, t0]`, `t0 = warmup_period`.
+2. The state at `t0` is snapshotted: who is queued and who is plugged in.
+   The optimizer controls both (they enter the models with `a = 0`; the
+   plugged-in ones keep their lane).
+3. Vehicles arrive over `[t0, T]`, `T = t0 + max_time`. An arrival at
+   exactly `T` is admitted; none arrives after `T`.
+4. The simulation **drains** the station: it keeps serving (FIFO) until
+   nobody is queued or plugged in, and records that instant
+   (`sim_clock_end`; `drain_minutes` is how long past `T` it took). It is
+   not cut off at `T`, so nothing is censored on the simulation side and
+   the `completed` and `arrived` groups coincide.
+5. The models get exactly that set — queue and plugged-in vehicles at `t0`
+   plus every arrival in `[t0, T]` (checked; a mismatch raises) — and a
+   horizon read off the discretized FIFO run:
+
+   ```
+   K = ceil( max(K_grid_fifo, K_feasible_fifo) * (1 + horizon_slack) )
+   ```
+
+   `K_grid_fifo` is the slot by which the `grid` replay empties the
+   station; `K_feasible_fifo` the same for the whole-module schedule
+   `offline_cl_PB.schedule_from_simulation` builds from the run (validated
+   against the exact model, every vehicle completed). Taking the larger
+   guarantees the models contain at least one schedule that completes
+   everyone. All three are `inst_*` columns, with `inst_horizon_minutes`.
+
+Mean sojourn is reported over every vehicle in the set (cohort `all`). The
+configuration must keep the sets equal: `include_queued=True`, a
+`boundary_mode` (OPTIMIZE, or FIXED), no `flush_queue_at_warmup`, and
+`objective_cohorts=COHORTS_ALL` — `TrialConfig` raises otherwise. A vehicle
+turned away by a full queue would leave the simulation's set but not the
+models', so that raises too (raise `queue_capacity`).
+
+`closed_system=False` is the older measured-window trial: the simulation
+stops at `T`, the models' horizon is `max_time`, and unfinished vehicles are
+censored there. Trials stored before this field existed replay that way.
+
+**What the model numbers mean.** A model with a finite horizon may leave a
+vehicle unfinished at `K`, scoring it the censored `delta*K - a_j`.
+Truncating any complete schedule at `K` costs no more, so every model
+**lower bound** (`exact_best_bound`, `bp_best_bound`, `dw_LB`) is a valid
+lower bound on the closed-system optimum `z*`, whatever `K` is. A model
+**schedule** (`exact_objective`, `bp_objective`, `dw_UB`) is a closed-system
+value only if it completes every vehicle — its `*_all_completed` column.
+
+A vehicle can be left unfinished even at the model optimum: one charging
+through the last slot has `D_j = K` whether or not it completes, so the
+model is indifferent. Before reporting, each schedule with unfinished
+vehicles is **repaired** where possible: holding every start, departure and
+lane fixed (so the value cannot change), the compact model re-solves power
+and module routing to see whether those vehicles can be fully charged
+anyway (`*_n_completion_repaired` counts the ones that could). A vehicle
+the schedule never serves cannot be repaired this way.
+
+`closed_*` columns combine the stages into what is actually proven about
+`z*` (here, the discrete model's closed-system optimum — the like-for-like
+counterpart of `grid`, not of `sim`):
+
+| column | meaning |
+|--------|---------|
+| `closed_lower_bound` / `_source` | the best model lower bound, and which stage gave it |
+| `closed_upper_bound` / `_source` | the best value of a schedule that completes every vehicle (`exact`, `bp`, `dw`, or `feasible_fifo` — the FIFO schedule always qualifies) |
+| `closed_gap`, `closed_rel_gap` | upper − lower, and that over upper |
+| `closed_proven_optimal` | the two meet (gap ≤ 1e-6) |
+| `closed_mean_sojourn_LB` / `_UB` | the bracket per vehicle, minutes |
+
+If a schedule stays unfinished after repair, `K` was too short for it:
+raise `horizon_slack`. Every model grows roughly linearly in `K`.
+
+**Cost.** Draining an overloaded station can take far longer than `max_time`
+(the warm-up backlog plus every arrival must clear), and `K` follows it, so
+congested trials produce much larger models than the same `max_time` did
+under the old hard stop.
 
 ### Two reporting groups: `completed` and `arrived`
 
@@ -195,11 +276,12 @@ power.
 `exact_n_completed_at_horizon` counts vehicles that finished *exactly* at
 the horizon edge. Nonzero means the horizon is binding on the optimum.
 
-**Watch the `n` columns.** Even within `arrived`, lengthen `max_time` until
-the censored share is small before reading a gap as "what the policy leaves
-on the table" — the two sides never agree on `n` for the `completed` group,
-and a short window is dominated by the censoring convention rather than by
-scheduling quality.
+**Watch the `n` columns.** In a measured-window trial, even within
+`arrived`, lengthen `max_time` until the censored share is small before
+reading a gap as "what the policy leaves on the table" — the two sides never
+agree on `n` for the `completed` group, and a short window is dominated by
+the censoring convention rather than by scheduling quality. A closed-system
+trial has no censoring on the simulation side, so all sources share `n`.
 
 ### Quick start
 
@@ -256,7 +338,9 @@ held fixed.
 
 ### The window's two edges
 
-Both edges of the measured window are handled explicitly, because an arrival
+Both edges of the measured window are handled explicitly (the closing edge
+only matters in a measured-window trial — a closed-system horizon lies past
+every vehicle's FIFO departure), because an arrival
 landing exactly on one is routine with a gridded arrival stream (`delta_arr`,
 whose grid normally divides `warmup_period`):
 
@@ -484,6 +568,10 @@ Status and tolerance columns for reading a limited run honestly:
 | `dw_status` | `CONVERGED`, `TIME_LIMIT`, `ITERATION_LIMIT`, `NOT_CONVERGED` |
 | `dw_converged` / `dw_iterations` | column generation's own stopping detail |
 | `*_runtime_s` | wall clock per stage (`exact_` also splits build vs. solve, and carries Gurobi's own `exact_gurobi_runtime_s`; `bp_runtime_s` includes building its seed) |
+| `*_all_completed`, `*_n_completion_repaired` | whether a model schedule completes every vehicle (after the repair), and how many vehicles the repair fixed — closed-system trials, see "What the model numbers mean" |
+| `closed_*` | the bracket on the closed-system optimum (closed-system trials) |
+| `arrivals_close_at`, `sim_clock_end`, `drain_minutes` | when arrivals closed (`T`), when the simulation ended, and the difference (0 in a measured-window trial) |
+| `inst_horizon_minutes`, `inst_K`, `inst_K_grid_fifo`, `inst_K_feasible_fifo`, `inst_K_fifo` | the models' horizon and where it came from |
 
 `results.csv` and `bound_history.csv` are rewritten after every trial, so an
 interrupted sweep still leaves usable output.

@@ -34,6 +34,9 @@ def _episode(mean_interarrival: float):
     cfg = TrialConfig(
         n_piles=1, n_connectors=2, n_modules=6, p_module=25.0, battery_cap_kwh=(75.0,),
         warmup_period=360.0, max_time=240.0, mean_interarrival=mean_interarrival, seed=41,
+        # A hard stop at T: the overloaded case below relies on the window
+        # ending while the backlog is still there (a drained run idles at the end).
+        closed_system=False,
     )
     env, _, _ = run_episode(cfg)
     return env

@@ -7,6 +7,28 @@ fully described (and reproducible) by the row it writes to ``results.csv``.
 ``config_grid`` builds the Cartesian product of whichever fields you want to
 sweep; pass explicit ``TrialConfig`` objects instead when the combinations
 are not a product.
+
+Closed-system trials (``closed_system=True``, the default)
+-----------------------------------------------------------
+Every source -- the simulation, its grid replay and the offline models --
+is run on the same closed set of vehicles from the same starting state:
+
+1. FIFO warms the station up over ``[0, t0]``, ``t0 = warmup_period``.
+2. The state at ``t0`` is snapshotted: the queue and the vehicles plugged
+   in. The optimizer controls both (they are in the model with ``a=0``).
+3. Vehicles arrive over ``[t0, T]``, ``T = t0 + max_time`` (an arrival at
+   exactly ``T`` is admitted); none arrives after ``T``.
+4. The simulation keeps serving until the station is empty (it is not cut
+   off at ``T``), and records that end time.
+5. The offline models get exactly that set: the queue and the plugged-in
+   vehicles at ``t0`` plus every arrival in ``[t0, T]``. Their horizon is
+   read off the discretized FIFO run -- the slot by which it empties the
+   station -- plus ``horizon_slack``.
+
+Mean sojourn is reported over every vehicle in the set. With
+``closed_system=False`` a trial is the older measured *window* instead: the
+simulation stops at ``T``, the models' horizon is ``max_time``, and
+unfinished vehicles are censored there.
 """
 
 from __future__ import annotations
@@ -44,9 +66,17 @@ class TrialConfig:
 
     # --- traffic / simulation ----------------------------------------------
     mean_interarrival: float = 30.0
-    max_time: float = 2 * HR2MIN  # length of the MEASURED phase (minutes)
-    warmup_period: float = 6 * HR2MIN  # run before the measured phase
+    # Length of the arrival window [t0, T] after warm-up (minutes). In a
+    # closed-system trial the station is then drained, so the measured phase
+    # runs past T; otherwise the run (and the measured window) stops at T.
+    max_time: float = 2 * HR2MIN
+    warmup_period: float = 6 * HR2MIN  # FIFO warm-up before t0
     flush_queue_at_warmup: bool = False
+    # Closed-system trial (see the module docstring): arrivals close at T,
+    # the simulation drains the station, and the models' horizon is read off
+    # the discretized FIFO run. False reproduces the older measured-window
+    # trial (hard stop at T, censoring there).
+    closed_system: bool = True
     battery_cap_kwh: tuple[float, ...] = (75.0,)  # kWh; converted on use
     seed: int = 39  # arrival stream
     policy_seed: int = 12  # queue-policy RNG
@@ -66,12 +96,26 @@ class TrialConfig:
 
     # --- discretization ----------------------------------------------------
     delta: float = 2.0  # slot length (minutes) for both offline models
+    # Closed-system trials only: extra horizon, as a fraction of the FIFO
+    # horizon K_fifo (K = ceil(K_fifo * (1 + horizon_slack))). A finite
+    # horizon lets a model leave a vehicle unfinished at K at the censored
+    # cost delta*K - a_j; any model value is still a valid LOWER bound on
+    # the closed-system optimum, but a schedule only gives the closed-system
+    # value when it completes every vehicle -- reported per model as
+    # *_all_completed. Raise this if a model censors anyone. Larger K grows
+    # every model roughly linearly.
+    horizon_slack: float = 0.0
     # Arrival-time grid. ``"delta"`` snaps arrivals to the model's own grid
     # (what the notebook does); ``None`` keeps continuous exponential times;
     # a number snaps to that grid instead.
     delta_arr: float | str | None = "delta"
 
-    # --- measured-window boundary conditions (both offline models) ---------
+    # --- boundary conditions at t0 (every offline model) ------------------
+    # A closed-system trial needs all of: include_queued=True, a boundary
+    # mode (OPTIMIZE -- the optimizer controls them -- or FIXED), no flush,
+    # and objective_cohorts=COHORTS_ALL; otherwise the models would not see
+    # the same vehicle set as the simulation (checked in __post_init__).
+    #
     # Fold the boundary queue in as ordinary a=0 vehicles (cohort QUEUED).
     include_queued: bool = True
     # How to treat vehicles already plugged in at the boundary (cohort
@@ -142,6 +186,27 @@ class TrialConfig:
     notes: str = ""
 
     # ------------------------------------------------------------------ #
+    def __post_init__(self) -> None:
+        if self.horizon_slack < 0:
+            raise ValueError(f"horizon_slack must be >= 0, got {self.horizon_slack}")
+        if not self.closed_system:
+            return
+        problems = []
+        if not self.include_queued:
+            problems.append("include_queued=False drops the queue at t0 from the models")
+        if self.boundary_mode is None:
+            problems.append("boundary_mode=None drops the vehicles plugged in at t0 from the models")
+        if self.flush_queue_at_warmup:
+            problems.append("flush_queue_at_warmup=True removes the queue at t0 from the simulation")
+        if self.objective_cohorts != COHORTS_ALL:
+            problems.append("objective_cohorts must be COHORTS_ALL so every vehicle is optimized")
+        if problems:
+            raise ValueError(
+                "closed_system=True runs every source on the same vehicle set, but: "
+                + "; ".join(problems)
+                + ". Fix these or set closed_system=False."
+            )
+
     @property
     def battery_cap_options(self) -> list[float]:
         """Battery capacities in the engine's native kW*min units."""
@@ -167,9 +232,19 @@ class TrialConfig:
     @property
     def offline_horizon(self) -> float:
         """
-        Completion horizon for both offline models: the MEASURED phase only,
-        not warm-up + measured (the models start at the boundary, t=0).
+        Completion horizon for the offline models in a measured-window trial
+        (``closed_system=False``): the measured phase only, not warm-up +
+        measured (the models start at the boundary, t=0).
+
+        A closed-system trial has no fixed horizon -- it is read off that
+        trial's own FIFO run (``trial.closed_system_horizon``) -- so this
+        raises there rather than return a wrong number.
         """
+        if self.closed_system:
+            raise ValueError(
+                "closed_system=True: the offline horizon is derived per trial from the "
+                "discretized FIFO run (see trial.closed_system_horizon), not from max_time."
+            )
         return float(self.max_time)
 
     def to_row(self) -> dict[str, Any]:

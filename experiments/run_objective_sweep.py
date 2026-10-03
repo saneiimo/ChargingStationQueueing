@@ -2,12 +2,25 @@
 Worked example: how does the realized objective move against its bounds as
 the simulation configuration changes?
 
-Run with ``python -m experiments.run_objective_sweep``. As written it is four
-trials that finish in well under a minute; edit ``SWEEP`` (or copy this file)
-to scale it up.
+Run with ``python -m experiments.run_objective_sweep``. Edit ``SWEEP`` /
+``main()``'s ``combos`` (or copy this file) to change what is run.
 
-Cost, measured on this station layout -- worth knowing before widening the
-grid, because the two models scale very differently:
+Each trial is a closed-system trial (``TrialConfig.closed_system``, the
+default): FIFO warms the station up to ``t0``, vehicles arrive over
+``[t0, t0 + max_time]`` and none after, the simulation drains the station,
+and every source -- simulation, grid replay, exact MILP, branch-and-price,
+DW -- is run on that same closed set of vehicles. The models' horizon is
+read off the discretized FIFO run (``inst_K``; ``horizon_slack`` adds to
+it). ``closed_*`` columns bracket the closed-system optimum: the best model
+lower bound against the best schedule that completes every vehicle. See
+``experiments/README.md``, "Closed-system trials".
+
+Cost. Draining means ``K`` follows how long FIFO takes to empty the station,
+not ``max_time``: an overloaded trial (a large warm-up backlog, arrivals
+faster than service) can drain for many hours and give the models a horizon
+several times longer than ``max_time``. The table below was measured on
+this station layout for measured-window trials (``closed_system=False``,
+``K = max_time / delta``) -- read it as cost per slot of horizon:
 
     max_time  delta   J   K    exact      DW
         60     5.0    5   12   0.1-0.5s   0.2-0.5s
@@ -44,7 +57,10 @@ bracket on each trial's optimum over time (also saved as
 ``gap`` and ``gap_pct`` (100*gap/upper_bound, i.e. relative to total
 sojourn), ``nodes`` and ``event``.
 Both bounds are step functions of ``time_s`` (constant between rows), and
-the true optimum always lies in ``[lower_bound, upper_bound]``.
+the optimum of the horizon-K model always lies in
+``[lower_bound, upper_bound]``. ``lower_bound`` also bounds the
+closed-system optimum; ``upper_bound`` does only when the incumbent
+completes every vehicle (``bp_all_completed`` for the final one).
 
 .venv/Scripts/python.exe -m experiments.run_objective_sweep
 
@@ -95,8 +111,15 @@ BASE = TrialConfig(
     n_modules=6,
     p_module=25.0,
     battery_cap_kwh=[75],
-    warmup_period=6 * HR2MIN,  # long relative to max_time, to reach steady state
-    max_time=2 * HR2MIN,
+    warmup_period=6 * HR2MIN,  # FIFO warm-up before t0, to reach steady state
+    max_time=2 * HR2MIN,  # arrival window [t0, T]; the station is then drained
+    # Closed-system trial: every source on the same vehicle set, simulation
+    # drained, models' horizon K read off the discretized FIFO run. Needs
+    # include_queued=True, a boundary_mode, objective_cohorts=COHORTS_ALL
+    # (the defaults). horizon_slack lengthens K by that fraction; raise it if
+    # a model schedule leaves vehicles unfinished at K (*_all_completed).
+    closed_system=True,
+    horizon_slack=0.0,
     # Every trial with this seed sees the SAME EV population, whichever axis
     # is swept: generate_arrivals draws inter-arrival gaps and vehicle
     # characteristics from separate streams, so vehicle k's battery/SoC

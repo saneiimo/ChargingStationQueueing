@@ -1009,6 +1009,16 @@ class MetricsTracker:
 
         return departure_slot, {ev.id: ev for ev in active}
 
+    def grid_departure_slots(self, delta: float, since: float = 0.0) -> dict[int, int]:
+        """
+        ``{vehicle_id: departure_slot}`` in this run's grid replay, slots
+        counted from ``since`` -- the same replay ``grid_sojourn_by_cohort``
+        reports (see its docstring for the method and caveats). Covers the
+        finished vehicles that held a lane after ``since``; its maximum is
+        the slot by which the replayed schedule has emptied the station.
+        """
+        return dict(self._grid_departure_slots(delta, since)[0])
+
     def grid_sojourn_by_cohort(
         self, delta: float, since: float = 0.0
     ) -> dict[str, dict[str, float]]:

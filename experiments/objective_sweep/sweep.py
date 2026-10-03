@@ -92,6 +92,7 @@ def flatten_trial(result: TrialResult, trial_id: int) -> dict[str, Any]:
         ("exact", result.exact),
         ("bp", result.bp),
         ("dw", result.dw),
+        ("closed", result.closed),
     ):
         if stage is None:
             continue
@@ -143,6 +144,7 @@ def _trial_to_json(result: TrialResult, trial_id: int) -> dict[str, Any]:
         "exact": result.exact,
         "bp": result.bp,
         "dw": result.dw,
+        "closed": result.closed,
         # Arrival specs only. Rebuilt via replay_episode; the env and the
         # solved MILP / B&P / DW objects are not serialized.
         "arrivals": result.arrivals,
@@ -285,8 +287,15 @@ def comparison_table(
     slot grid (the like-for-like target), ``exact`` is the MILP incumbent,
     ``bp`` / ``bp_LB`` are branch-and-price's best schedule and proven lower
     bound for the same model (equal when ``bp_status == "OPTIMAL"``), and
-    ``dw_LB`` is DW's certified lower bound. Missing columns (a stage that
-    was switched off) are simply absent from the result.
+    ``dw_LB`` is DW's certified lower bound. In a closed-system trial
+    ``closed_LB`` / ``closed_UB`` bracket the closed-system optimum (best
+    lower bound of any model, best schedule that completes every vehicle;
+    see ``trial.closed_system_bracket``), and ``exact_complete`` /
+    ``bp_complete`` say whether that stage's schedule finishes every vehicle
+    -- in a closed-system trial ``exact``/``bp`` is the closed-system value
+    of a schedule only when it does (otherwise a vehicle's sojourn is capped
+    at the horizon and the mean is understated). Missing columns (a stage
+    that was switched off, or a run predating them) are simply absent.
 
     ``group`` picks which population every source is averaged over, and the
     default ``"arrived"`` is the one to compare on: it covers every vehicle
@@ -307,6 +316,11 @@ def comparison_table(
         "bp": f"bp_{group}_{cohort}_mean_sojourn",
         "bp_LB": "bp_mean_sojourn_LB",
         "dw_LB": "dw_mean_sojourn_LB",
+        "closed_LB": "closed_mean_sojourn_LB",
+        "closed_UB": "closed_mean_sojourn_UB",
+        "closed_optimal": "closed_proven_optimal",
+        "exact_complete": "exact_all_completed",
+        "bp_complete": "bp_all_completed",
         "sim_n": f"sim_{group}_{cohort}_n",
         "grid_n": f"grid_{group}_{cohort}_n",
         "exact_n": f"exact_{group}_{cohort}_n",
