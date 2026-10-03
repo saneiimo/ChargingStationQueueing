@@ -40,6 +40,19 @@ single continuous, memoryless Poisson stream sampled once over
 ``[0, max_time]`` (the *total* horizon) at ``reset()``, exactly as before --
 splitting it into "warm-up" and "measured" arrivals is purely a reporting
 concern (``MetricsTracker``'s ``since`` parameter), not a generation one.
+
+Draining the station (``drain=True``)
+-------------------------------------
+By default the episode is a hard stop: ``SIM_OVER`` at ``max_time`` ends it,
+and whoever is still queued or charging is simply cut off there. With
+``drain=True`` the same instant instead *closes arrivals*: no vehicle
+arriving after ``max_time`` is admitted (they are never put on the event
+heap), every vehicle already in the station -- and any arriving exactly at
+``max_time`` -- is still served by the queue policy, and the episode ends
+the moment the station is empty. That instant is ``end_time`` (it equals
+``max_time`` when the station happens to be empty then). Every admitted
+vehicle therefore finishes, so nothing is censored. Off by default, so
+every existing caller (RL training, the policy sweep) is unaffected.
 """
 
 from __future__ import annotations
@@ -67,6 +80,7 @@ class SimulationEngine:
         delta_arr: float | None = None,
         warmup_period: float | None = None,
         flush_queue_at_warmup: bool | None = None,
+        drain: bool = False,
     ):
         """
         Parameters
@@ -76,7 +90,8 @@ class SimulationEngine:
             after any warm-up period. Defaults to ``config.MAX_TIME``. See
             the module docstring, "Warm-up period", for how this combines
             with ``warmup_period`` into ``self.max_time`` (the *total*
-            horizon / actual SIM_OVER instant).
+            horizon / actual SIM_OVER instant). With ``drain=True`` this is
+            when arrivals close, not when the episode ends.
         battery_cap_options :
             Battery capacities (kW*min, same units as
             ``config.BATTERY_CAP_OPTIONS``) sampled from when generating
@@ -110,6 +125,11 @@ class SimulationEngine:
             (historical fact: they did arrive) -- see ``MetricsTracker``'s
             module docstring. No effect when ``warmup_period`` is ``0``
             (there is no boundary to flush at).
+        drain :
+            If True, ``SIM_OVER`` (at ``self.max_time``) closes arrivals
+            instead of ending the episode, and the episode ends once the
+            station is empty -- see the module docstring, "Draining the
+            station". The end instant is ``self.end_time``.
         """
 
         self.station = station
@@ -139,8 +159,12 @@ class SimulationEngine:
         self.max_time = self.warmup_period + self.measurement_horizon
         self.battery_cap_options = battery_cap_options
         self.delta_arr = validate_delta_arr(delta_arr)
+        self.drain = bool(drain)
         self._external_arrivals: list[EV] | None = None
         self.terminated = False
+        # Clock value when the episode ended (None while running). Equals
+        # max_time without drain; with drain, when the station emptied.
+        self.end_time: float | None = None
 
     def set_arrivals(self, arrivals: list[EV] | None) -> None:
         """
@@ -167,9 +191,14 @@ class SimulationEngine:
         self.nxt_evnt_typ: EventType | None = None
         self.next_time: float | None = None
         self.terminated: bool = False
+        self.end_time = None
         self.departure_happened: bool = False
         self.last_drops: int = 0
         self.last_event_type: EventType | None = None
+        # Drain bookkeeping: ARRIVAL events still on the heap, and whether
+        # SIM_OVER has closed arrivals (see "Draining the station").
+        self._pending_arrivals: int = 0
+        self.arrivals_closed: bool = False
 
         if arrivals is not None:
             self.set_arrivals(arrivals)
@@ -219,9 +248,17 @@ class SimulationEngine:
         # External lists are snapped here; internally sampled lists are
         # already on the grid (idempotent if delta_arr is set twice).
         evs = snap_arrivals(evs, self.delta_arr, max_time=self.max_time)
+        if self.drain:
+            # Arrivals close at max_time. snap_arrivals already drops later
+            # ones on a grid, but a continuous stream (delta_arr=None) is
+            # returned unfiltered, so filter explicitly. Without drain they
+            # are harmless (SIM_OVER ends the run first); with drain they
+            # would be admitted while the station empties.
+            evs = [ev for ev in evs if ev.arrival_time <= self.max_time]
 
         for ev in evs:
             self.event_heap.push(Event(ev.arrival_time, EventType.ARRIVAL, obj=ev))
+        self._pending_arrivals = len(evs)
 
         if self.warmup_period > 0:
             self.event_heap.push(Event(self.warmup_period, EventType.WARMUP_END))
@@ -251,6 +288,18 @@ class SimulationEngine:
     def _load_next_event(self) -> None:
         """Skip stale DEPARTURE/CHARGE_CHANGE events until a live one remains."""
         while True:
+            if self.event_heap.empty():
+                # Only reachable while draining: SIM_OVER (always on the heap
+                # otherwise) has fired, yet the station is not empty and no
+                # departure is pending -- i.e. vehicles are waiting while a
+                # connector sits free and nobody assigned them.
+                raise RuntimeError(
+                    f"Event heap exhausted at t={self.current_time:g} with "
+                    f"{len(self.station.queue)} vehicle(s) still queued and "
+                    f"{sum(len(p.evs) for p in self.station.piles)} plugged in. "
+                    "While draining, the queue policy must keep assigning waiting "
+                    "vehicles to free connectors until the station is empty."
+                )
             event = self.event_heap.pop()
             if not self._is_valid_event(event):
                 continue
@@ -319,6 +368,7 @@ class SimulationEngine:
         self.last_drops = 0
 
         if event_type == EventType.ARRIVAL:
+            self._pending_arrivals -= 1
             self.metrics.update_arrived_evs(next_ev)
             if not self.station.add_to_queue(next_ev):
                 self.metrics.update_dropped_evs(next_ev)
@@ -335,7 +385,10 @@ class SimulationEngine:
             self._redistribute_power(pile=next_ev.pile, ev=next_ev)
 
         elif event_type == EventType.SIM_OVER:
-            self.terminated = True
+            if self.drain:
+                self.arrivals_closed = True  # ends below, once the station is empty
+            else:
+                self.terminated = True
 
         elif event_type == EventType.WARMUP_END:
             self._handle_warmup_end()
@@ -344,6 +397,22 @@ class SimulationEngine:
             raise ValueError(
                 f"Simulation Logic doesn't know how to handle {event_type.name} Type"
             )
+
+        # Draining: end as soon as arrivals are closed, none is still on the
+        # heap (one landing exactly on max_time may be popped after
+        # SIM_OVER -- equal-time events have no fixed order), and the
+        # station is empty.
+        if (
+            self.drain
+            and self.arrivals_closed
+            and self._pending_arrivals == 0
+            and self.station_is_empty()
+        ):
+            self.terminated = True
+
+    def station_is_empty(self) -> bool:
+        """No vehicle queued and none plugged in."""
+        return not self.station.queue and all(not pile.evs for pile in self.station.piles)
 
     def _snapshot_in_service(self) -> list[InServiceAtBoundary]:
         """
@@ -408,7 +477,8 @@ class SimulationEngine:
 
     def advance_time(self) -> bool:
         """
-        One DES step. Returns True when the episode has ended (SIM_OVER).
+        One DES step. Returns True when the episode has ended (SIM_OVER, or
+        with ``drain`` the station emptying after it).
         """
         self._load_next_event()
 
@@ -418,6 +488,8 @@ class SimulationEngine:
         self._update_ev_state()
         self._process_event()
         self.current_time = self.next_time
+        if self.terminated:
+            self.end_time = self.current_time
 
         if CHECK_INVARIANTS:
             for pile in self.station.piles:

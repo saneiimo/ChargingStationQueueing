@@ -46,7 +46,10 @@ class EventType(Enum):
     DEPARTURE = 2  # EV reaches target SoC and leaves its connector
     # Opt-in via PowerPolicy.supports_underuse_reallocation (Prop yes, Static no).
     CHARGE_CHANGE = 3  # EV underuses a module; policy may free/redistribute it
-    SIM_OVER = 4  # Hard stop at engine.max_time (= warmup_period + measurement_horizon)
+    # At engine.max_time (= warmup_period + measurement_horizon): a hard stop,
+    # or with engine.drain the instant arrivals close (the run then ends when
+    # the station is empty).
+    SIM_OVER = 4
     WARMUP_END = 5  # Boundary between the warm-up phase and the measured phase
 
 

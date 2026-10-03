@@ -66,6 +66,7 @@ class ChargingStationEnv(gym.Env):
         delta_arr: float | None = None,
         warmup_period: float | None = None,
         flush_queue_at_warmup: bool | None = None,
+        drain: bool = False,
     ):
         """
         Parameters
@@ -115,6 +116,11 @@ class ChargingStationEnv(gym.Env):
             ``SimulationEngine``). ``None`` (the default) uses
             ``config.FLUSH_QUEUE_AT_WARMUP`` (``False`` out of the box).
             No effect when ``warmup_period`` is 0.
+        drain :
+            If True, arrivals close at ``warmup_period + max_time`` and the
+            episode runs on until the station is empty, instead of stopping
+            there. The end instant is ``self.engine.end_time``. See
+            ``SimulationEngine``'s module docstring, "Draining the station".
         """
         super().__init__()
 
@@ -157,6 +163,7 @@ class ChargingStationEnv(gym.Env):
             delta_arr=delta_arr,
             warmup_period=warmup_period,
             flush_queue_at_warmup=flush_queue_at_warmup,
+            drain=drain,
         )
         if arrivals is not None:
             self.engine.set_arrivals(arrivals)
