@@ -63,7 +63,8 @@ def vehicle_slot_series(
     the slot the vehicle actually departs in (``D[j].getValue()``, capped
     at the model's own horizon ``K``) -- includes any slots spent waiting
     before plug-in (``p_act`` is correctly 0 there via (13)). Empty arrays
-    if the vehicle was never served.
+    if no occupancy is found (defensive: the closed model serves every
+    vehicle).
 
     ``p_act`` is ``p[j,k].X`` (kW). ``p_req`` reconstructs the BMS
     acceptance curve from the vehicle's own energy trajectory, using its
@@ -102,10 +103,7 @@ def vehicle_slot_series(
 
 def vehicle_lane(cl_model: ConnectorLaneModel, vehicle_id: int) -> tuple[int, int] | None:
     """``(pile, connector)`` that ``y[j,m,c].X > 0.5`` picked for this
-    vehicle (``None`` if unsolved, or never served -- (10)'s nominal
-    assignment for an unserved vehicle is still reported here since it's a
-    real, if physically meaningless, decision; callers that care should
-    check ``_occupancy_interval`` / ``served`` first)."""
+    vehicle (``None`` if the model is unsolved)."""
     for (mm, cc) in cl_model.lanes:
         if cl_model.y[vehicle_id, mm, cc].X > 0.5:
             return mm, cc
@@ -114,7 +112,8 @@ def vehicle_lane(cl_model: ConnectorLaneModel, vehicle_id: int) -> tuple[int, in
 
 def _occupancy_interval(cl_model: ConnectorLaneModel, vehicle_id: int) -> tuple[int, int] | None:
     """``[k_start, k_end)`` vehicle_id actually occupies a lane, read
-    straight off ``S[j]``/``D[j]``. ``None`` if never served (``S_j = K``)."""
+    straight off ``S[j]``/``D[j]``. ``None`` if the vehicle has no
+    occupancy (defensive: the closed model serves every vehicle)."""
     cm = cl_model
     S_val = cm.S[vehicle_id].getValue()
     D_val = cm.D[vehicle_id].getValue()
@@ -303,6 +302,7 @@ def plot_pile_power_and_modules(
     show_pile_capacity: bool = False,
     bar_width: float = 0.9,
     show_ev_ids: bool = True,
+    ev_label_fontsize: float | None = None,
     show_legend: bool = True,
     figsize: tuple[float, float] | None = None,
     label_own_power: str | None = None,
@@ -315,7 +315,9 @@ def plot_pile_power_and_modules(
     """
     One figure for ``pile_id``, built from the connector-lane MILP's own
     solution: vertical subplots = the pile's real connectors (``y[j,m,c]``
-    -- the connectors the model actually chose), x = time.
+    -- the connectors the model actually chose), x = time. Every connector
+    panel shares one y-axis (same limits and ticks), so their bars compare
+    directly.
 
     Each subplot bars its occupant(s)' power drawn each slot, with the
     reconstructed BMS max request and the power capacity the delivered
@@ -348,7 +350,9 @@ def plot_pile_power_and_modules(
     bar_width :
         Bar width in minutes.
     show_ev_ids :
-        Annotate each vehicle's own bar segment with "EV {id}".
+        Annotate each vehicle's own bar segment with "EV {id}" (in black).
+    ev_label_fontsize :
+        Font size of those labels; ``None`` uses the style's annotation size.
     show_legend :
         Single shared figure-level legend.
     figsize :
@@ -446,8 +450,31 @@ def plot_pile_power_and_modules(
             viz_style.FIGSIZE_WIDE[0],
             max(viz_style.FIGSIZE_PANEL_HEIGHT * n_connectors * 0.85, 4.0),
         )
-    fig, axes = plt.subplots(n_connectors, 1, sharex=True, figsize=figsize, squeeze=False)
+    fig, axes = plt.subplots(n_connectors, 1, sharex=True, sharey=True, figsize=figsize, squeeze=False)
     axes = axes[:, 0]
+
+    # One y-range for every connector: the tallest thing drawn on any panel
+    # (own bars plus, when stacked, every other connector's; BMS request and
+    # module capacity when shown; the pile capacity line when shown), with
+    # headroom for the EV labels above the bars.
+    pile_total = sum(arrays_by_connector[n][0] for n in range(n_connectors))
+    y_candidates = [
+        float(np.max(pile_total if stack_other_connectors else arrays_by_connector[n][0], initial=0.0))
+        for n in range(n_connectors)
+    ]
+    for n in range(n_connectors):
+        segs = arrays_by_connector[n][3]
+        if show_bms_request:
+            y_candidates += [float(np.max(seg_req[act], initial=0.0)) for _v, _p, seg_req, _m, act in segs]
+        if show_modules:
+            y_candidates += [float(np.max(seg_mod[act], initial=0.0)) for _v, _p, _r, seg_mod, act in segs]
+    if show_pile_capacity:
+        y_candidates.append(pile_capacity)
+    y_top = max(y_candidates, default=0.0)
+    if y_top <= 0.0:
+        y_top = pile_capacity
+    y_top *= 1.12
+    label_fontsize = viz_style.FONT_SIZE_ANNOTATION if ev_label_fontsize is None else ev_label_fontsize
 
     any_bars = False
     any_modules = False
@@ -478,7 +505,7 @@ def plot_pile_power_and_modules(
                 **viz_style.annotation_kwargs(color=viz_style.COLORS["muted"]),
             )
             ax.set_xlim(t_lo, t_hi)
-            ax.set_ylim(0.0, cm.station.n_modules * cm.station.p_module)
+            ax.set_ylim(0.0, y_top)
             viz_style.style_axes(ax, title=None)
             ax.grid(True, axis="y", alpha=viz_style.GRID_ALPHA, linewidth=viz_style.GRID_LINEWIDTH)
             ax.grid(True, axis="x", alpha=viz_style.GRID_ALPHA * 0.7, linewidth=viz_style.GRID_LINEWIDTH)
@@ -499,7 +526,7 @@ def plot_pile_power_and_modules(
                     f"EV {vid}",
                     ha="center",
                     va="bottom",
-                    **viz_style.annotation_kwargs(fontsize=viz_style.FONT_SIZE_ANNOTATION, color=color),
+                    **viz_style.annotation_kwargs(fontsize=label_fontsize, color="black"),
                 )
 
         running_bottom = own_p.copy()
@@ -573,7 +600,7 @@ def plot_pile_power_and_modules(
 
         ax.set_ylabel(f"Connector {connector}\nP (kW)")
         ax.set_xlim(t_lo, t_hi)
-        ax.set_ylim(bottom=0.0)
+        ax.set_ylim(0.0, y_top)
         viz_style.style_axes(ax, title=None)
         ax.grid(True, axis="y", alpha=viz_style.GRID_ALPHA, linewidth=viz_style.GRID_LINEWIDTH)
         ax.grid(True, axis="x", alpha=viz_style.GRID_ALPHA * 0.7, linewidth=viz_style.GRID_LINEWIDTH)

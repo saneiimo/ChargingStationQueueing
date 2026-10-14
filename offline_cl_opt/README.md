@@ -1,11 +1,13 @@
 # `offline_cl_opt` — connector-lane offline MILP
 
-Implements **Section 4 ("The optimisation model")** of the connector-lane
-formulation for offline optimal scheduling of an EV charging station
-(`connector_lane_model.html`): constraints (2)-(19), plus one strengthening
-from Section 9 (preprocessing) that the source document treats as part of the
-model proper — see "Preprocessing" below. The objective is **total sojourn in
-minutes**, `sum_j (delta*D_j - a_j)` over `objective_cohorts` — the
+The connector-lane formulation for offline optimal scheduling of an EV
+charging station, for a **closed system**: every vehicle in the instance must
+be served and must receive its full energy within the horizon (there is no
+"unserved" or "unfinished" option). Built on the design note
+`connector_lane_model.html` (its "Section N" references below), with the
+completion constraint added and the station-power row and departure lower
+bound (24) dropped. The objective is **total sojourn in
+minutes**, `sum_j delta*(D_j - k_j)` (`k_j = ceil(a_j/delta)`, the release slot: sojourn is measured on the slot grid like every other decision, so every objective value is a multiple of `delta` and any lower bound rounds up to the next one — `lattice_round_up`; `solve_cl_model(tolerance=...)` stops once the incumbent is proven that close, using the same rounding via `lattice_abs_gap`) over `objective_cohorts` — the
 document's objective (1), `sum_j D_j`, scaled by `delta` and shifted by the
 constant `sum_j a_j`. Same optimal schedules, same ranking of every feasible
 schedule; but `ObjVal`/`ObjBound`/`solution.objective` read directly as total
@@ -89,18 +91,17 @@ through `h`, never `delta` directly.
 |---|---|---|
 | (2) | *(implicit)* | `u[j,k]` for `k < k_j` is never created — provably 0 |
 | (3)-(5) | `C3_eta_lb`, `C4_eta_le_u`, `C5_eta_le_1mprev` | pin `eta[j,k]` to the plug-in (rising) edge indicator |
-| (6) | `C6_one_start` | at most one plug-in per vehicle |
-| (7)-(9) | `S[j]`, `D[j]` (dependent expressions, not variables) | served indicator, start slot, departure boundary |
+| (6) | `C6_one_start` | exactly one plug-in per vehicle (every vehicle is served) |
+| (8)-(9) | `S[j]`, `D[j]` (dependent expressions, not variables) | start slot `S_j = sum_k k*eta[j,k]`, departure boundary `D_j = S_j + sum_k u[j,k]` |
 | (10) | `C10_one_lane` | each vehicle gets exactly one lane |
-| (11)-(12) | `C11_seq`, `C12_seq` | two vehicles sharing a lane never overlap in time |
+| (11)-(12) | `C11_seq`, `C12_seq` | two vehicles sharing a lane never overlap in time (big-M `K - k_j`) |
 | (13) | `C13_power_cap` | power only while connected, capped at `P_bar_j = min(P_max_j, N*Delta)` |
 | (14) | `C14_power_from_modules` | power capped by modules routed to the vehicle's own lane |
 | (15) | `C15_module_pool` | a pile routes at most `N` modules total (`module_pool_cap` when tightened) |
-| (16) | `C16_station_power` | station-wide power bound (valid inequality, tightens the LP relaxation) |
 | (17) | `C17_energy_recursion` | `x[j,k+1] = x[j,k] + h*p[j,k]` — a real variable, not an inline sum (see "Why `x` is a real variable" below) |
 | (18) | `C18_taper_cap` | BMS taper cap, in terms of the *effective discrete* time constant `tau^delta_j` |
-| (19) | `C19_departure_rule` | can't unplug before receiving the full `W_j` — the raw occupancy difference, no extra indicator variable needed |
-| (24) | `C24_departure_lower_bound` | valid lower bound on `D_j` from `E_j` and the occupancy count (Section 9.3; on by default, `bound_departures`) |
+| (19) | `C19_departure_rule` | can't unplug before receiving the full `W_j` — the raw occupancy difference, no extra indicator variable needed (implied by completion for integer solutions; kept for the LP) |
+| — | `C_completion` | `x[j,K] >= W_j`: every vehicle holds its full request by the end of the horizon |
 | (25)-(26) | `C25_pile_symmetry`, `C26_connector_symmetry` | optional pile/connector symmetry breaking (`break_symmetry`) |
 
 Every vehicle's variables/rows are generated over the *whole* `[k_j, K)` —
@@ -116,7 +117,7 @@ below.
 
 `S[j]`, `D[j]` (start slot, departure boundary) are Gurobi `LinExpr`
 objects built from `eta`/`u`, not decision variables — they're already
-exactly pinned by (7)-(9), so materializing them as Vars would only add
+exactly pinned by (8)-(9), so materializing them as Vars would only add
 branching surface for nothing.
 
 ### No `theta` variable
@@ -148,27 +149,26 @@ Carrying `x` as a variable keeps every row of (17)/(18)/(19) at a constant
 few nonzeros regardless of `k` — verified directly: nonzero count now
 scales linearly with `K` (confirmed empirically: ~25 nonzeros per slot,
 flat, from `K=100` through `K=800`), where the old approach scaled
-quadratically. The vehicle's total energy requirement is enforced by `x`'s
-own upper bound (`W_j`, a per-variable bound, cheaper than a row) rather
-than by a separate summed constraint.
+quadratically. `x <= W_j` is a per-variable bound; the completion row
+`x[j,K] >= W_j` is one row per vehicle.
 
-## Censoring and the horizon (Section 6.3)
+## Completion and the horizon
 
-There is no hard "must finish" variant of this model. The objective is
-always the **censored** one: a vehicle that cannot finish within the
-horizon departs at boundary `K`, i.e. contributes a sojourn of
-`delta*K - a_j` (the model may even prefer
-leaving it unserved entirely if that frees a lane for someone else). An
-earlier revision of the source document had a `complete_service` variant
-that forced full service via a hard constraint; the current document
-removes it in favor of a simpler practice — choose `horizon_minutes`
-generous enough that censoring doesn't bind at the optimum (e.g. longer
-than a simple FIFO simulation's makespan on the same arrivals), then
-**verify that afterwards** rather than enforcing it structurally:
-`extract_solution`'s `per_vehicle` reports both `departure_slot` and
-`energy_kwh`/`energy_required_kwh` per vehicle, so checking every vehicle
-has `departure_slot < K` and `energy_kwh == energy_required_kwh` confirms
-the horizon was generous enough for this instance.
+Every vehicle must finish by the end of the horizon (`C_completion`), so the
+model is only feasible when the horizon is long enough for some schedule to
+serve and complete everyone — e.g. at least the makespan of a FIFO schedule on
+the same slot grid. A feasible horizon can still restrict the optimum (a long
+charge may have to finish early at others' expense); lengthening the horizon
+only adds slots, so the optimal value never increases with `K`, and it stops
+changing once `K` reaches the makespan of some optimal schedule. A schedule's
+own value does not depend on `K`. The objective sweep reads the horizon off
+the discretized FIFO run (plus `horizon_slack`).
+
+An earlier revision of this package used a *censored* model instead, with no
+completion constraint: a vehicle could be left unfinished at `K` and was
+charged `delta*K - a_j`. That model is a relaxation of this one (a valid lower
+bound on the closed-system optimum at any `K`), but its schedules could leave
+vehicles unfinished, which is why it was replaced.
 
 ## Adaptive module integrality (`adaptive.py`, current Section 8)
 
@@ -323,22 +323,23 @@ variables get built.
   model's own discrete recursion (`P_bar_j`, `tau^delta_j`), *not* a
   continuous closed form, since only the discrete version is guaranteed
   valid for the discretized model being preprocessed. Lives in `model.py`
-  now (re-exported here), since `build_cl_model` itself also needs `E_j`
-  internally for (24) below.
+  (re-exported here). Not a constraint of the model — a cheap per-vehicle
+  floor for diagnostics.
 - **`incumbent_objective`** (9.2): `UB`, the objective value (total
   sojourn, minutes) of *any* known feasible schedule. Two sources, matching the
   document's own suggestions:
   - **a reference schedule you already have** — pass
     `incumbent_departures={vehicle_id: departure_time_minutes}`, e.g. from
     a finished simulation: `{ev.id: ev.departure_time for ev in
-    env.engine.metrics.finished_evs}`. A vehicle missing from the dict
-    counts as never served (departs at slot `K`, matching (9)'s own
-    convention). Departure times are rounded *up* to the next slot
+    env.engine.metrics.finished_evs}` of a drained run. It must cover every
+    vehicle (a missing one, or one departing after the horizon, raises).
+    Departure times are rounded *up* to the next slot
     boundary — always a safe upper bound, since a schedule that finishes
     at continuous time `t` can equally be read as "done" by the next slot
     boundary at or after `t`.
   - **Section 8.4's conservative shortcut** — used automatically when
-    `incumbent_departures` is omitted (`None`).
+    `incumbent_departures` is omitted (`None`). With fewer usable modules it
+    charges more slowly, so on a tight horizon it can be infeasible.
 
 ### No per-vehicle right-edge windowing
 
@@ -385,36 +386,29 @@ result = solve_cl_model_adaptive(vehicles, station, delta=1.0, horizon_minutes=1
   `conservative_feasible_solution`'s own result and `warm_start_evs` are
   used in `solve_cl_model_adaptive`.
 
-### Bounding the departure variables directly (9.3)
+## FIFO as a solved model (`replay.py`)
 
-Independent of the above, `bound_departures=True` (`build_cl_model`'s
-default) adds constraint (24), a cheap and always-valid lower bound on
-each `D_j`:
-
-```
-sum_{k in Kset_j} u[j,k]  >=  n_min_j * (v_j - u[j, K-1])      n_min_j = E_j - k_j
-```
-
-`(v_j - u[j, K-1])` is 1 exactly when vehicle `j` genuinely departed within
-the horizon (served, and not still occupying the last slot), 0 otherwise
-(never served, or still present at the horizon edge) — so this only binds
-for a vehicle that actually departs, requiring it to have occupied at
-least `n_min_j` slots, the fewest any departing trajectory could have
-needed, from `E_j` (9.1). An upper bound on `D_j` is never worth adding,
-by contrast (the document is explicit about this): under a minimization of
-total sojourn (increasing in every `D_j`), an upper bound on `D_j` can never
-be active at the optimum.
-(24) is cheap (`J` extra rows) and, per the source document, worth having
-because the LP relaxation can otherwise report a `D_j` — which drives the
-objective — well below what's actually achievable, weakening the root
-bound.
+`grid_fifo_cl_model(metrics, inst, station, delta, horizon_minutes)` returns
+a drained simulation's grid-replayed FIFO schedule
+(`MetricsTracker.grid_replay_intervals`: FIFO's lanes and order, each stay
+rounded up to whole slots) as a solved `ConnectorLaneModel`, so
+`extract_solution` and the plots work on it like on an optimum. Power follows
+the simulator's rule: in every slot but its last a vehicle draws
+`min(P_bar, taper cap, Delta * modules on its connector)`, holds no more
+modules than it needs, and is module-limited only when its pile hands out all
+`N` (`no_idle_modules`; by default tried and, if the timetable cannot satisfy
+it, relaxed to the per-vehicle rule). Among routings that obey it, the one
+whose power is closest to what FIFO's power sharing delivered in each window
+of each stay is taken; the returned `info` reports how much had to move. It
+raises if no routing completes every vehicle on the replayed timetable (the
+grid replay is a timing reconstruction, not a certified schedule).
 
 ## Scope
 
-This package implements the exact model ("(2)-(19)" and the objective,
-total sojourn) exactly, plus Section 8 (adaptive module integrality), Section 9's
-`E_j`/`UB` (used for an objective cutoff, a MIP start, and the departure
-lower bound (24) — never for windowing, see above), and Section 10's
+This package implements the closed-system model (the constraints in the
+table above and the objective, total sojourn) exactly, plus Section 8
+(adaptive module integrality), Section 9's `UB` (used for an objective cutoff
+and a MIP start — never for windowing, see above), and Section 10's
 symmetry breaking — nothing from the remaining refinement sections of the
 source document:
 

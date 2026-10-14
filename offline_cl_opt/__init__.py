@@ -40,6 +40,9 @@ from .instance import StationSpec, VehicleData, vehicles_from_evs
 from .model import (
     ConnectorLaneModel,
     build_cl_model,
+    lattice_abs_gap,
+    lattice_round_up,
+    release_time,
     sojourn_minutes,
     sojourn_objective_round_up,
     solve_cl_model,
@@ -56,6 +59,7 @@ from .preprocess import (
     earliest_departures,
     incumbent_objective,
 )
+from .replay import grid_fifo_cl_model
 from .visualization import (
     plot_pile_power_and_modules,
     plot_pile_power_and_modules_v2,
@@ -82,6 +86,9 @@ __all__ = [
     "ConnectorLaneModel",
     "build_cl_model",
     "solve_cl_model",
+    "lattice_abs_gap",
+    "lattice_round_up",
+    "release_time",
     "sojourn_minutes",
     "sojourn_objective_round_up",
     "ConnectorLaneSolution",
@@ -93,6 +100,7 @@ __all__ = [
     "rounded_module_routing",
     "earliest_departures",
     "incumbent_objective",
+    "grid_fifo_cl_model",
     "plot_vehicle_power_and_modules",
     "plot_pile_power_and_modules",
     "plot_pile_power_and_modules_v2",
