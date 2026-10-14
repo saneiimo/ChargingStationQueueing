@@ -117,6 +117,20 @@ pairing. `sign` is `-1` when the pair's first policy is lower, `+1` when the
 second is, `0` when not significant; lower is better for the time metrics and
 for `dropped EVs`, higher for `finished EVs` and energy delivered.
 
+Every simulation metric these sweeps report -- what it means, how it is
+computed, realized vs theoretical, and how the metrics relate -- is
+explained in `metrics/README.md`.
+
+**Objective and optimality tolerances.** Every model minimizes total
+sojourn measured on the slot grid, `sum_j delta*(D_j - k_j)` with
+`k_j = ceil(a_j/delta)` the release slot, so every objective value is a
+whole multiple of `delta` and any lower bound can be rounded up to the
+next multiple (the free tightening; all reported bounds are). With
+`TrialConfig.exact_tolerance_min` / `bp_tolerance_min = x`, the exact
+model / branch-and-price stop as soon as their schedule is proven within
+`x` minutes of mean sojourn of the optimum (`x * n` of total); only whole
+steps of `delta / n` count.
+
 ## The objective sweep
 
 ### What a trial produces
@@ -133,19 +147,18 @@ Up to five numbers for the same objective come out, each reported per cohort:
 | `dw`    | Dantzig-Wolfe's certified **lower** bound on the optimum (continuous-module relaxation) | yes |
 
 On every row: `grid ≥ exact ≥ z* ≥ bp_best_bound` and `bp_objective ≥ z*`,
-where `z*` is the true optimum; `dw_LB ≤ z*` too. In a closed-system trial
-(below) the upper-bound side of that chain needs one qualification — see
-"What the model numbers mean".
+where `z*` is the closed-system optimum at the trial's horizon; `dw_LB ≤ z*`
+too.
 
 The offline models can only depart on slot boundaries (assumption A1), so
 each connector handover costs the successor up to `delta` minutes.
 Comparing an optimum against `sim` directly is apples-to-oranges and makes
 the optimum look worse for no real reason — compare against `grid`.
 
-### Closed-system trials (the default)
+### Closed-system trials
 
-`TrialConfig.closed_system=True` runs every source on **the same closed set
-of vehicles from the same starting state**:
+Every trial runs every source on **the same closed set of vehicles from the
+same starting state**:
 
 1. FIFO warms the station up over `[0, t0]`, `t0 = warmup_period`.
 2. The state at `t0` is snapshotted: who is queued and who is plugged in.
@@ -170,8 +183,10 @@ of vehicles from the same starting state**:
    station; `K_feasible_fifo` the same for the whole-module schedule
    `offline_cl_PB.schedule_from_simulation` builds from the run (validated
    against the exact model, every vehicle completed). Taking the larger
-   guarantees the models contain at least one schedule that completes
-   everyone. All three are `inst_*` columns, with `inst_horizon_minutes`.
+   guarantees the models are feasible: the discretized FIFO schedule is one
+   of their schedules (it is also DW's starting schedule and B&P's
+   `"simulation"` seed). All three are `inst_*` columns, with
+   `inst_horizon_minutes`.
 
 Mean sojourn is reported over every vehicle in the set (cohort `all`). The
 configuration must keep the sets equal: `include_queued=True`, a
@@ -180,41 +195,21 @@ configuration must keep the sets equal: `include_queued=True`, a
 turned away by a full queue would leave the simulation's set but not the
 models', so that raises too (raise `queue_capacity`).
 
-`closed_system=False` is the older measured-window trial: the simulation
-stops at `T`, the models' horizon is `max_time`, and unfinished vehicles are
-censored there. Trials stored before this field existed replay that way.
+**What the model numbers mean.** Every offline model is the closed-system
+model: each vehicle is served and receives its full energy by `K`, so every
+model schedule (`exact_objective`, `bp_objective`, `dw_UB`) completes every
+vehicle and every model lower bound (`exact_best_bound`, `bp_best_bound`,
+`dw_LB`) bounds the optimum over such schedules. `z*` here is the discrete
+model's closed-system optimum — slot grid, whole modules — the like-for-like
+counterpart of `grid`, not of `sim`. Lengthening `K` (`horizon_slack`) can
+only lower `z*` (more schedules fit), and stops changing it once `K` reaches
+the makespan of some optimal schedule; a model schedule with vehicles
+departing exactly at `K` (`*_n_at_horizon > 0`) hints the horizon may bind.
+Every model grows roughly linearly in `K`.
 
-**What the model numbers mean.** A model with a finite horizon may leave a
-vehicle unfinished at `K`, scoring it the censored `delta*K - a_j`.
-Truncating any complete schedule at `K` costs no more, so every model
-**lower bound** (`exact_best_bound`, `bp_best_bound`, `dw_LB`) is a valid
-lower bound on the closed-system optimum `z*`, whatever `K` is. A model
-**schedule** (`exact_objective`, `bp_objective`, `dw_UB`) is a closed-system
-value only if it completes every vehicle — its `*_all_completed` column.
-
-A vehicle can be left unfinished even at the model optimum: one charging
-through the last slot has `D_j = K` whether or not it completes, so the
-model is indifferent. Before reporting, each schedule with unfinished
-vehicles is **repaired** where possible: holding every start, departure and
-lane fixed (so the value cannot change), the compact model re-solves power
-and module routing to see whether those vehicles can be fully charged
-anyway (`*_n_completion_repaired` counts the ones that could). A vehicle
-the schedule never serves cannot be repaired this way.
-
-`closed_*` columns combine the stages into what is actually proven about
-`z*` (here, the discrete model's closed-system optimum — the like-for-like
-counterpart of `grid`, not of `sim`):
-
-| column | meaning |
-|--------|---------|
-| `closed_lower_bound` / `_source` | the best model lower bound, and which stage gave it |
-| `closed_upper_bound` / `_source` | the best value of a schedule that completes every vehicle (`exact`, `bp`, `dw`, or `feasible_fifo` — the FIFO schedule always qualifies) |
-| `closed_gap`, `closed_rel_gap` | upper − lower, and that over upper |
-| `closed_proven_optimal` | the two meet (gap ≤ 1e-6) |
-| `closed_mean_sojourn_LB` / `_UB` | the bracket per vehicle, minutes |
-
-If a schedule stays unfinished after repair, `K` was too short for it:
-raise `horizon_slack`. Every model grows roughly linearly in `K`.
+Trial JSON from the older measured-window sweep (`closed_system: false` in
+its config) still replays as the hard-stop episode it was
+(`replay_episode`).
 
 **Cost.** Draining an overloaded station can take far longer than `max_time`
 (the warm-up backlog plus every arrival must clear), and `K` follows it, so
@@ -223,65 +218,27 @@ under the old hard stop.
 
 ### Two reporting groups: `completed` and `arrived`
 
-Every source reports each cohort over **two** populations, because "who
-counts" is exactly where a naive comparison goes wrong:
+Every source reports each cohort over two populations:
 
-| group | who it covers | use it for |
-|-------|---------------|-----------|
-| `arrived` | every vehicle the models were given; unfinished ones censored at the horizon | **comparing sources** — all of them cover the same set |
-| `completed` | only vehicles that received their full energy | reading realized service quality |
+| group | who it covers |
+|-------|---------------|
+| `arrived` | every vehicle the models were given (an unfinished one would be censored at the end of the run; the drained simulation and the closed-system models have none) |
+| `completed` | only vehicles that received their full energy |
 
 Columns are `{source}_{group}_{cohort}_{stat}`, e.g.
-`grid_arrived_all_mean_sojourn`. `arrived` additionally carries
-`..._n_censored`.
+`grid_arrived_all_mean_sojourn`. In a closed-system trial the two groups
+coincide for every source; both are kept so results from the older
+measured-window sweep (where they differed, and `arrived` was the one to
+compare on) read the same way. `comparison_table` defaults to
+`group="arrived"` and prints each source's `n`.
 
-**Why both.** The simulation can only average vehicles that *finished*; the
-offline models cannot drop anyone, so they censor the unfinished at
-`D_j = K`. Mixing the two averages different populations, and the bias is
-one-directional — the simulation drops precisely the longest sojourns while
-the models keep them at their censored value, so the optimizer looks worse
-than it is. Badly enough, at small `n`, to invert the ordering entirely and
-make a *proven optimum* read as worse than feasible FIFO. `comparison_table`
-defaults to `group="arrived"` for this reason, and prints each source's `n`
-so any residual mismatch stays visible.
+Note `dw_LB` and `bp_best_bound` / `bp_mean_sojourn_LB` bound the objective
+over `objective_cohorts` as a whole, not any per-cohort figure.
 
-Note `dw_LB` and `bp_best_bound` / `bp_mean_sojourn_LB` are always
-`arrived`-group quantities (each bounds the objective
-over `objective_cohorts` as a whole), so it is not a valid bound for the
-`completed` subset — comparing them will look like a bound violation
-without being one.
-
-### What counts as "completed"
-
-A vehicle is completed iff it **received its full energy**:
-
-```
-energy_kwh + energy_delivered_before_kwh >= energy_required_kwh - 1e-6
-```
-
-Not `departure_slot < K`. That test is sound in one direction only —
-constraint (19) forces `x_j >= W_j` at any departure edge strictly inside
-the horizon, so `D_j < K` *does* imply completion — but the converse fails.
-`D_j = S_j + sum_k u_jk` is an **exclusive** boundary, so a vehicle charging
-through the final slot `K-1` lands on `D_j = K`, exactly where an unserved
-vehicle sits (`S_j = K`, no occupancy). (19) has no row at `k = K` (Section
-6.3's deliberate censoring), so the departure slot cannot separate the two.
-`tests/test_experiments_sweep.py` pins both cases: same `D_j = K`, opposite
-verdicts, distinguishable only by energy.
-
-`served` is not a completion test either — it is `any(u_jk > 0.5)`, i.e.
-"held a connector", and a censored vehicle can hold one while drawing zero
-power.
-
-`exact_n_completed_at_horizon` counts vehicles that finished *exactly* at
-the horizon edge. Nonzero means the horizon is binding on the optimum.
-
-**Watch the `n` columns.** In a measured-window trial, even within
-`arrived`, lengthen `max_time` until the censored share is small before
-reading a gap as "what the policy leaves on the table" — the two sides never
-agree on `n` for the `completed` group, and a short window is dominated by
-the censoring convention rather than by scheduling quality. A closed-system
-trial has no censoring on the simulation side, so all sources share `n`.
+A model schedule short of some vehicle's energy is a solver bug, not a
+result: the reporting step raises on one (counting a boundary vehicle's
+`energy_delivered_before_kwh`, and exempting FIXED boundary vehicles, whose
+pinned power misses their final partial slot — the model exempts them too).
 
 ### Quick start
 
@@ -336,24 +293,16 @@ held fixed.
 > around gaps and attributes sharing a single stream. It has been removed;
 > drop it from any config that still passes it.
 
-### The window's two edges
+### The window's opening edge
 
-Both edges of the measured window are handled explicitly (the closing edge
-only matters in a measured-window trial — a closed-system horizon lies past
-every vehicle's FIFO departure), because an arrival
-landing exactly on one is routine with a gridded arrival stream (`delta_arr`,
-whose grid normally divides `warmup_period`):
-
-* **Opening edge.** An EV arriving exactly at `warmup_period` can be in the
-  boundary snapshot *and* pass `arrived_post_warmup`'s `>=` test.
-  `MetricsTracker.arrived_post_warmup` now excludes anyone already in the
-  snapshot, so the three cohorts stay disjoint — otherwise
-  `build_measurement_instance` emits the vehicle twice and the model dies on
-  `KeyError: 'Duplicate keys in Model.addVars()'`.
-* **Closing edge.** An EV arriving at (or within the last slot of) the
-  window's end has release slot `k_j >= K` — no slot to be released in, and
-  zero time inside the window. Those are dropped from the instance and
-  counted as `inst_n_dropped_late_arrivals`.
+An arrival landing exactly at `warmup_period` is routine with a gridded
+arrival stream (`delta_arr`, whose grid normally divides `warmup_period`).
+Such an EV can be in the boundary snapshot *and* pass
+`arrived_post_warmup`'s `>=` test. `MetricsTracker.arrived_post_warmup`
+excludes anyone already in the snapshot, so the three cohorts stay disjoint
+— otherwise `build_measurement_instance` emits the vehicle twice and the
+model dies on `KeyError: 'Duplicate keys in Model.addVars()'`. (The closing
+edge needs nothing: the horizon lies past every vehicle's FIFO departure.)
 
 ### Which stages run
 
@@ -401,7 +350,7 @@ full internal log, in full, for every single trial.
 
 ### Boundary conditions
 
-Two independent knobs decide who is in the measured-window instance:
+Two independent knobs decide who is in the offline instance:
 
 * `include_queued` — fold the vehicles waiting in the queue at the boundary in
   as ordinary `a=0` vehicles (cohort `QUEUED`).
@@ -414,9 +363,13 @@ Two independent knobs decide who is in the measured-window instance:
 A third, `objective_cohorts`, decides who the optimizer *works for* — separate
 from who is in the model. A vehicle outside it is still modelled in full (it
 holds its connector, draws its modules, constrains everyone else); its `D_j`
-just carries no weight. Normally exclude `BOUNDARY` under `FIXED`, whose
-`D_j` is a constant; but under `OPTIMIZE`, excluding them means the optimizer
-has no incentive to finish them and will let them linger.
+just carries no weight.
+
+The objective sweep's closed-system trials need the models to see exactly
+the simulated set, so they require `include_queued=True`, a `boundary_mode`
+and `objective_cohorts=COHORTS_ALL` (`TrialConfig` raises otherwise). The
+other choices remain available in `build_measurement_instance` and the
+models for use outside the sweep.
 
 ### Branch-and-price: the exact model, a second way
 
@@ -438,7 +391,7 @@ Columns (`bp_` prefix):
 
 | column | meaning |
 |--------|---------|
-| `bp_status` | `OPTIMAL`, `TIME_LIMIT` (or `NODE_LIMIT`) |
+| `bp_status` | `OPTIMAL`, `WITHIN_TOLERANCE` (stopped by `bp_tolerance_min` with the bracket inside it), `TIME_LIMIT` (or `NODE_LIMIT`) |
 | `bp_objective` / `bp_best_bound` | best schedule's total sojourn (minutes) and the proven lower bound (equal when OPTIMAL) |
 | `bp_gap` / `bp_rel_gap` | `objective - best_bound`, and that over `objective` (i.e. relative to total sojourn) |
 | `bp_root_lower_bound` | the root node's bound (whole-module DW bound) |
@@ -530,7 +483,7 @@ recorded as `dw_gap_tolerance_used`, whichever of the two fields set it.
 
 **Units.** Every objective/bound column (`exact_objective`, `*_best_bound`,
 `dw_LB`, `dw_z_rmp`, `bp_*` bounds, `bound_history.csv`'s `lower_bound` /
-`upper_bound`) is total sojourn in minutes, `sum_j (delta*D_j - a_j)` over
+`upper_bound`) is total sojourn in minutes, `sum_j delta*(D_j - k_j)` (`k_j = ceil(a_j/delta)`, the release slot) over
 `objective_cohorts` — the models' own objective — and `run_meta.json` says so
 (`"objective_units": "total_sojourn_min"`). Runs written before that switch
 have no `objective_units` key: their objective/bound columns are `sum_j D_j`
@@ -563,14 +516,15 @@ Status and tolerance columns for reading a limited run honestly:
 |--------|---------|
 | `exact_status` | `OPTIMAL`, `TIME_LIMIT`, `SUBOPTIMAL`, … |
 | `exact_mip_gap_achieved` | gap actually reached (vs. the requested `mip_gap` column), relative to total sojourn |
-| `exact_objective` / `exact_best_bound` | incumbent and the solver's own bound, total sojourn in minutes — a time-limited run still brackets the optimum (`exact_mean_sojourn_LB` is the bound per vehicle) |
+| `exact_objective` / `exact_best_bound` | incumbent and the solver's bound rounded up to a multiple of `delta` (the free tightening: every objective value is one; `exact_best_bound_raw` is Gurobi's own), total sojourn in minutes — a time-limited run still brackets the optimum (`exact_mean_sojourn_LB` is the bound per vehicle) |
+| `exact_` / `bp_` `tolerance_used`, `mean_gap_min`, `within_tolerance` | the optimality tolerance applied (`exact_tolerance_min` / `bp_tolerance_min` × n, total minutes; NaN when proving optimality), the proven distance from the optimum in mean-sojourn minutes, `(objective − best_bound)/n`, and whether it is within the tolerance (or zero, without one) |
 | `bp_status` / `bp_objective` / `bp_best_bound` | the same for branch-and-price (see its section) |
 | `dw_status` | `CONVERGED`, `TIME_LIMIT`, `ITERATION_LIMIT`, `NOT_CONVERGED` |
+| `dw_LB` / `dw_LB_raw` | DW's lower bound rounded up to a multiple of `delta` (the free tightening) / as column generation produced it |
 | `dw_converged` / `dw_iterations` | column generation's own stopping detail |
 | `*_runtime_s` | wall clock per stage (`exact_` also splits build vs. solve, and carries Gurobi's own `exact_gurobi_runtime_s`; `bp_runtime_s` includes building its seed) |
-| `*_all_completed`, `*_n_completion_repaired` | whether a model schedule completes every vehicle (after the repair), and how many vehicles the repair fixed — closed-system trials, see "What the model numbers mean" |
-| `closed_*` | the bracket on the closed-system optimum (closed-system trials) |
-| `arrivals_close_at`, `sim_clock_end`, `drain_minutes` | when arrivals closed (`T`), when the simulation ended, and the difference (0 in a measured-window trial) |
+| `*_n_at_horizon` | model schedule's vehicles departing exactly at `K` (nonzero: the horizon may bind) |
+| `arrivals_close_at`, `sim_clock_end`, `drain_minutes` | when arrivals closed (`T`), when the simulation ended, and the difference |
 | `inst_horizon_minutes`, `inst_K`, `inst_K_grid_fifo`, `inst_K_feasible_fifo`, `inst_K_fifo` | the models' horizon and where it came from |
 
 `results.csv` and `bound_history.csv` are rewritten after every trial, so an

@@ -34,7 +34,7 @@ from experiments.core.run_store import DEFAULT_OUT_DIR, RunStore, load_table
 from .config import TrialConfig
 
 # run_meta.json's "objective_units": every objective/bound column is total
-# sojourn sum_j (delta*D_j - a_j) over objective_cohorts, in minutes.
+# sojourn sum_j delta*(D_j - k_j) over objective_cohorts, in minutes.
 OBJECTIVE_UNITS = "total_sojourn_min"
 from .trial import COHORT_NAMES, TrialResult, run_trial
 
@@ -63,10 +63,10 @@ def flatten_trial(result: TrialResult, trial_id: int) -> dict[str, Any]:
     Stage scalars are prefixed by source (``exact_``, ``bp_``, ``dw_``);
     per-cohort figures become ``{source}_{group}_{cohort}_{stat}`` columns, where
     ``group`` is ``completed`` (vehicles that got their full energy) or
-    ``arrived`` (all of them, unfinished ones censored at the horizon).
-    Comparing a ``completed`` figure against an ``arrived`` one averages
-    different populations -- that mismatch is exactly what makes an optimum
-    look worse than a feasible schedule. The offline objective is total
+    ``arrived`` (all of them, an unfinished one censored at the end of the
+    run). The station is drained and the models are closed-system models,
+    so the two groups coincide; both are kept for older results. The
+    offline objective is total
     sojourn in minutes, so ``exact_objective``, ``bp_objective`` /
     ``bp_best_bound`` and ``dw_LB`` line up directly with
     ``grid_arrived_{cohort}_total_sojourn`` for the cohort level matching
@@ -80,7 +80,7 @@ def flatten_trial(result: TrialResult, trial_id: int) -> dict[str, Any]:
         {
             f"inst_{k}": v
             for k, v in result.instance.items()
-            if k not in ("cohort_sizes", "late_arrival_ids")
+            if k != "cohort_sizes"
         }
     )
     for cohort, n in result.instance.get("cohort_sizes", {}).items():
@@ -92,7 +92,6 @@ def flatten_trial(result: TrialResult, trial_id: int) -> dict[str, Any]:
         ("exact", result.exact),
         ("bp", result.bp),
         ("dw", result.dw),
-        ("closed", result.closed),
     ):
         if stage is None:
             continue
@@ -123,7 +122,7 @@ def bound_history_rows(result: TrialResult, trial_id: int) -> list[dict[str, Any
     ident = {
         "trial_id": trial_id,
         "label": cfg.label,
-        "mean_interarrival": cfg.mean_interarrival,
+        "mean_interarrival": cfg.effective_mean_interarrival,
         "max_time": cfg.max_time,
         "delta": cfg.delta,
         "n_piles": cfg.n_piles,
@@ -144,7 +143,6 @@ def _trial_to_json(result: TrialResult, trial_id: int) -> dict[str, Any]:
         "exact": result.exact,
         "bp": result.bp,
         "dw": result.dw,
-        "closed": result.closed,
         # Arrival specs only. Rebuilt via replay_episode; the env and the
         # solved MILP / B&P / DW objects are not serialized.
         "arrivals": result.arrivals,
@@ -219,7 +217,7 @@ def run_sweep(
             tag = f" [{cfg.label}]" if cfg.label else ""
             print(
                 f"\n[trial {trial_id + 1}/{len(configs)}]{tag} "
-                f"interarrival={cfg.mean_interarrival:g} max_time={cfg.max_time:g} "
+                f"interarrival={cfg.effective_mean_interarrival:g} max_time={cfg.max_time:g} "
                 f"delta={cfg.delta:g} mip_gap={cfg.mip_gap} "
                 f"gap_tol={cfg.gap_tolerance:g}"
             )
@@ -287,24 +285,15 @@ def comparison_table(
     slot grid (the like-for-like target), ``exact`` is the MILP incumbent,
     ``bp`` / ``bp_LB`` are branch-and-price's best schedule and proven lower
     bound for the same model (equal when ``bp_status == "OPTIMAL"``), and
-    ``dw_LB`` is DW's certified lower bound. In a closed-system trial
-    ``closed_LB`` / ``closed_UB`` bracket the closed-system optimum (best
-    lower bound of any model, best schedule that completes every vehicle;
-    see ``trial.closed_system_bracket``), and ``exact_complete`` /
-    ``bp_complete`` say whether that stage's schedule finishes every vehicle
-    -- in a closed-system trial ``exact``/``bp`` is the closed-system value
-    of a schedule only when it does (otherwise a vehicle's sojourn is capped
-    at the horizon and the mean is understated). Missing columns (a stage
-    that was switched off, or a run predating them) are simply absent.
+    ``dw_LB`` is DW's certified lower bound. Every model is the
+    closed-system model, so every model schedule serves and completes every
+    vehicle. Missing columns (a stage that was switched off, or a run
+    predating them) are simply absent.
 
-    ``group`` picks which population every source is averaged over, and the
-    default ``"arrived"`` is the one to compare on: it covers every vehicle
-    the models were given, censoring unfinished ones at the horizon, so all
-    four columns describe the same set. ``"completed"`` restricts to
-    vehicles that got their full energy -- readable, but it conditions on an
-    outcome, dropping precisely the longest sojourns, and the simulation and
-    the models drop *different* vehicles, so an apparent "optimum worse than
-    FIFO" there is a population artifact rather than a real inversion.
+    ``group`` picks which population every source is averaged over. In a
+    drained, closed-system trial ``"arrived"`` and ``"completed"`` are the
+    same set; ``"arrived"`` (the default) is the one to compare on for
+    older measured-window results too.
 
     ``n`` columns for each source are included so a residual mismatch stays
     visible instead of silently skewing the means.
@@ -316,11 +305,6 @@ def comparison_table(
         "bp": f"bp_{group}_{cohort}_mean_sojourn",
         "bp_LB": "bp_mean_sojourn_LB",
         "dw_LB": "dw_mean_sojourn_LB",
-        "closed_LB": "closed_mean_sojourn_LB",
-        "closed_UB": "closed_mean_sojourn_UB",
-        "closed_optimal": "closed_proven_optimal",
-        "exact_complete": "exact_all_completed",
-        "bp_complete": "bp_all_completed",
         "sim_n": f"sim_{group}_{cohort}_n",
         "grid_n": f"grid_{group}_{cohort}_n",
         "exact_n": f"exact_{group}_{cohort}_n",

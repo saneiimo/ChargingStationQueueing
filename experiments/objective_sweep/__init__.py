@@ -1,7 +1,8 @@
 """
 Objective sweep: how far is a realized episode from the true optimum?
 
-For each configuration, simulate a measured window and bound its objective
+For each configuration, simulate a closed system (warm-up, an arrival window,
+then drain the station) and bound its objective
 -- the connector-lane MILP (an incumbent plus the solver's own bound),
 branch-and-price on the same model (``run_bp_model=True``: a proven optimum,
 or a certified bracket at its time limit), and Dantzig-Wolfe (a certified
@@ -37,6 +38,7 @@ from .trial import (
     run_exact,
     run_trial,
     simulation_metrics,
+    station_load,
 )
 
 __all__ = [
@@ -50,6 +52,7 @@ __all__ = [
     "episode_utilization",
     "episode_counts",
     "simulation_metrics",
+    "station_load",
     "build_instance",
     "run_exact",
     "run_bp",

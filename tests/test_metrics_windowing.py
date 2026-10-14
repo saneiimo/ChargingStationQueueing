@@ -27,19 +27,19 @@ import math
 import numpy as np
 import pytest
 
-from experiments.objective_sweep import TrialConfig, run_episode
+from experiments.objective_sweep import TrialConfig, replay_episode, run_episode
 
 
 def _episode(mean_interarrival: float):
     cfg = TrialConfig(
         n_piles=1, n_connectors=2, n_modules=6, p_module=25.0, battery_cap_kwh=(75.0,),
         warmup_period=360.0, max_time=240.0, mean_interarrival=mean_interarrival, seed=41,
-        # A hard stop at T: the overloaded case below relies on the window
-        # ending while the backlog is still there (a drained run idles at the end).
-        closed_system=False,
     )
-    env, _, _ = run_episode(cfg)
-    return env
+    _, _, specs = run_episode(cfg)
+    # A hard stop at T: the overloaded case below relies on the window ending
+    # while the backlog is still there (a drained run idles at the end). A
+    # trial record marked closed_system=False replays as that window.
+    return replay_episode({**cfg.to_row(), "closed_system": False}, specs)
 
 
 def _overlap(a: float, b: float, lo: float, hi: float) -> float:

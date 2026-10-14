@@ -5,22 +5,21 @@ the simulation configuration changes?
 Run with ``python -m experiments.run_objective_sweep``. Edit ``SWEEP`` /
 ``main()``'s ``combos`` (or copy this file) to change what is run.
 
-Each trial is a closed-system trial (``TrialConfig.closed_system``, the
-default): FIFO warms the station up to ``t0``, vehicles arrive over
-``[t0, t0 + max_time]`` and none after, the simulation drains the station,
-and every source -- simulation, grid replay, exact MILP, branch-and-price,
-DW -- is run on that same closed set of vehicles. The models' horizon is
-read off the discretized FIFO run (``inst_K``; ``horizon_slack`` adds to
-it). ``closed_*`` columns bracket the closed-system optimum: the best model
-lower bound against the best schedule that completes every vehicle. See
-``experiments/README.md``, "Closed-system trials".
+Each trial is a closed-system trial: FIFO warms the station up to ``t0``,
+vehicles arrive over ``[t0, t0 + max_time]`` and none after, the simulation
+drains the station, and every source -- simulation, grid replay, exact
+MILP, branch-and-price, DW -- is run on that same closed set of vehicles.
+The offline models are closed-system models (every vehicle served and fully
+charged by the horizon); their horizon is read off the discretized FIFO run
+(``inst_K``; ``horizon_slack`` adds to it). See ``experiments/README.md``,
+"Closed-system trials".
 
 Cost. Draining means ``K`` follows how long FIFO takes to empty the station,
 not ``max_time``: an overloaded trial (a large warm-up backlog, arrivals
 faster than service) can drain for many hours and give the models a horizon
 several times longer than ``max_time``. The table below was measured on
-this station layout for measured-window trials (``closed_system=False``,
-``K = max_time / delta``) -- read it as cost per slot of horizon:
+this station layout for the older measured-window trials
+(``K = max_time / delta``) -- read it as cost per slot of horizon:
 
     max_time  delta   J   K    exact      DW
         60     5.0    5   12   0.1-0.5s   0.2-0.5s
@@ -57,10 +56,8 @@ bracket on each trial's optimum over time (also saved as
 ``gap`` and ``gap_pct`` (100*gap/upper_bound, i.e. relative to total
 sojourn), ``nodes`` and ``event``.
 Both bounds are step functions of ``time_s`` (constant between rows), and
-the optimum of the horizon-K model always lies in
-``[lower_bound, upper_bound]``. ``lower_bound`` also bounds the
-closed-system optimum; ``upper_bound`` does only when the incumbent
-completes every vehicle (``bp_all_completed`` for the final one).
+the optimum of the horizon-K closed-system model always lies in
+``[lower_bound, upper_bound]``.
 
 .venv/Scripts/python.exe -m experiments.run_objective_sweep
 
@@ -112,20 +109,26 @@ BASE = TrialConfig(
     p_module=25.0,
     battery_cap_kwh=[75],
     warmup_period=6 * HR2MIN,  # FIFO warm-up before t0, to reach steady state
-    max_time=2 * HR2MIN,  # arrival window [t0, T]; the station is then drained
+    max_time=4 * HR2MIN,  # arrival window [t0, T]; the station is then drained
     # Closed-system trial: every source on the same vehicle set, simulation
     # drained, models' horizon K read off the discretized FIFO run. Needs
     # include_queued=True, a boundary_mode, objective_cohorts=COHORTS_ALL
-    # (the defaults). horizon_slack lengthens K by that fraction; raise it if
-    # a model schedule leaves vehicles unfinished at K (*_all_completed).
-    closed_system=True,
-    horizon_slack=0.0,
+    # (the defaults). horizon_slack lengthens K by that fraction; a longer K
+    # can only lower the optimum (a schedule departing at K,
+    # *_n_at_horizon > 0, hints the horizon may bind).
+    # horizon_slack is a FRACTION of the FIFO horizon, not a horizon:
+    #     K = ceil(K_fifo * (1 + horizon_slack))
+    # where K_fifo is the slot by which the discretized FIFO schedule empties
+    # the station. 0.0 -> exactly K_fifo; 0.2 -> 20% longer; 1.0 -> twice as
+    # long. Any value >= 0 is valid (0.0-0.5 is a sensible range); each model
+    # grows roughly linearly with K.
+    horizon_slack=0.25,
     # Every trial with this seed sees the SAME EV population, whichever axis
     # is swept: generate_arrivals draws inter-arrival gaps and vehicle
     # characteristics from separate streams, so vehicle k's battery/SoC
     # depend only on k. A mean_interarrival sweep therefore varies the
     # arrival process alone, instead of also resampling the fleet under it.
-    seed=41,
+    seed=40,
     # Cap both solvers so one hard trial cannot run away with the sweep. A
     # limit that bites is recorded, not hidden: see exact_status/dw_status.
     time_limit=1800.0,
@@ -141,7 +144,28 @@ BASE = TrialConfig(
     # the simulated FIFO schedule and the exact MILP's incumbent (the latter
     # only when RUN_EXACT_MODEL is also True).
     bp_time_limit=1800.0,
-    bp_initial_schedule="simulation",
+    bp_initial_schedule="none",
+    # Optimality tolerances, in minutes of MEAN sojourn (None = prove the
+    # optimum). The exact model / B&P stop as soon as their schedule is
+    # proven within this many minutes of the true optimum (of the trial's
+    # model: slot grid, whole modules, horizon K). Reported per stage as
+    # exact_/bp_ tolerance_used (total minutes), mean_gap_min (proven gap)
+    # and within_tolerance. A time limit that bites first leaves the stage
+    # with within_tolerance=False.
+    #
+    # The tolerance only acts in whole steps of delta / n minutes, where n is
+    # the number of vehicles in the trial (n_optimized). Every schedule's
+    # total sojourn is a multiple of delta, so mean sojourns are delta / n
+    # apart, and a tolerance x counts as floor(x / (delta / n)) steps:
+    #   * x < delta / n   -> identical to None: the solver proves the optimum
+    #     (it gains nothing from the tolerance);
+    #   * otherwise       -> rounded DOWN to a whole number of steps, e.g. with
+    #     delta = 2 min and n = 10 vehicles a step is 0.2 min, so x = 0.5
+    #     behaves exactly like x = 0.4.
+    # n is only known once the trial's instance is built (it depends on the
+    # arrivals), so check exact_/bp_n_optimized in the results.
+    exact_tolerance_min=None,
+    bp_tolerance_min=1,
 )
 
 # Which stages run. The exact model can be solved as a compact MILP
@@ -149,7 +173,7 @@ BASE = TrialConfig(
 # bp_* columns), or both; DW adds its continuous-module lower bound (dw_*).
 RUN_EXACT_MODEL = False
 RUN_BP_MODEL = True
-RUN_DW_MODEL = True
+RUN_DW_MODEL = False
 
 # The swept axes. First keyword varies slowest, so the cheap knobs cycle
 # fastest and any early failure shows up on a cheap trial.
@@ -167,45 +191,97 @@ SWEEP = dict(
 #     delta=[1.0, 2.0, 5.0],
 # )
 
+# .venv/Scripts/python.exe -m experiments.run_objective_sweep
+
 
 def main() -> tuple[pd.DataFrame, pd.DataFrame]:
     # configs = config_grid(BASE, **SWEEP)
     coef = 1
+    # One row per trial:
+    #   (mean_interarrival, rho_P, delta, mip_gap, gap_tolerance_target_min,
+    #    time_limit, dw_time_limit, max_time, label)
+    # The arrival rate comes from EITHER of the first two fields:
+    #   * mean_interarrival (minutes between arrivals): used as given; rho_P is
+    #     then ignored (put None).
+    #   * mean_interarrival = None and rho_P = target THEORETICAL offered power
+    #     load (the theoretical counterpart of overall power utilization: the
+    #     fraction of the station's rated power the arriving demand needs, e.g.
+    #     0.8). The sweep sets mean_interarrival = 60 * E[W] / (rho_P * R),
+    #     with E[W] the mean requested energy (kWh) of the battery/SoC
+    #     distributions and R = n_piles * n_modules * p_module (kW). The value
+    #     used is recorded in results.csv's mean_interarrival column, and the
+    #     resulting load in sim_offered_power_load_theory (= rho_P).
+    #   e.g. (None, 0.8, 2.0, 1e-4, None, 1800.0, 1200.0, 4 * HR2MIN, "rho0.8"),
+    #  (mean_interarrival, rho_P, delta, mip_gap, bp_tolerance_min,
+    #   time_limit, dw_time_limit, max_time, label, bp_initial_schedule)
+
     combos = [
-        (60.0 / 8 / coef, 2.0, 1e-3, 0.1, 2 * 3600.0, 1800.0, 4 * HR2MIN, "8veh"),
-        (60.0 / 7.5 / coef, 2.0, 1e-3, 0.1, 2 * 3600.0, 1800.0, 4 * HR2MIN, "7.5veh"),
-        (60.0 / 7 / coef, 2.0, 1e-3, 0.1, 2 * 3600.0, 1800.0, 4 * HR2MIN, "7veh"),
-        (60.0 / 6.5 / coef, 2.0, 1e-3, 0.1, 2 * 3600.0, 1800.0, 4 * HR2MIN, "6.5veh"),
-        (60.0 / 6 / coef, 2.0, 1e-3, 0.1, 2 * 3600.0, 1800.0, 4 * HR2MIN, "6veh"),
-        (60.0 / 5.5 / coef, 2.0, 1e-3, 0.1, 2 * 3600.0, 1800.0, 4 * HR2MIN, "5.5veh"),
-        (60.0 / 5 / coef, 2.0, 1e-3, 0.1, 2 * 3600.0, 1800.0, 4 * HR2MIN, "5veh"),
-        (60.0 / 4.5 / coef, 2.0, 1e-3, 0.1, 1.5 * 3600.0, 1800.0, 4 * HR2MIN, "4.5veh"),
-        (60.0 / 4 / coef, 2.0, 1e-3, 0.1, 3600.0, 1800.0, 4 * HR2MIN, "4veh"),
-        (60.0 / 3.5 / coef, 2.0, 1e-4, None, 1800.0, 1200.0, 4 * HR2MIN, "3.5veh"),
-        (60.0 / 3 / coef, 2.0, 1e-4, None, 1800.0, 1200.0, 4 * HR2MIN, "3veh"),
-        (60.0 / 2.5 / coef, 1.0, 1e-4, None, 1800.0, 1200.0, 4 * HR2MIN, "2.5veh"),
-        (60.0 / 2 / coef, 1.0, 1e-4, None, 1800.0, 1200.0, 4 * HR2MIN, "2veh"),
-        (60.0 / 1.5 / coef, 1.0, 1e-4, None, 1800.0, 1200.0, 4 * HR2MIN, "1.5veh"),
-        (60.0 / 1 / coef, 1.0, 1e-4, None, 1800.0, 1200.0, 4 * HR2MIN, "1veh"),
+        # (None, 0.1, 1.0, 1e-4, None, 1800.0, 1200.0, 8 * HR2MIN, "rho0.1"),
+        # (None, 0.2, 1.0, 1e-4, None, 1800.0, 1200.0, 8 * HR2MIN, "rho0.2"),
+        # (None, 0.3, 1.0, 1e-4, None, 1800.0, 1200.0, 8 * HR2MIN, "rho0.3"),
+        # (None, 0.4, 1.0, 1e-4, None, 2 * 1800.0, 1200.0, 4 * HR2MIN, "rho0.4"),
+        # (None, 0.5, 2.0, 1e-4, None, 2 * 1800.0, 1200.0, 4 * HR2MIN, "rho0.5"),
+        # (None, 0.6, 2.0, 1e-4, 1, 2 * 1800.0, 1200.0, 4 * HR2MIN, "rho0.6"),
+        # (None, 0.7, 2.0, 1e-4, 1, 2 * 1800.0, 1200.0, 4 * HR2MIN, "rho0.7"),
+        # (None, 0.8, 2.0, 1e-4, 1, 3 * 1800.0, 1200.0, 4 * HR2MIN, "rho0.8"),
+        # (None, 0.9, 2.0, 1e-4, 1, 3 * 1800.0, 1200.0, 4 * HR2MIN, "rho0.9"),
+        (
+            None,
+            0.9,
+            2.0,
+            1e-4,
+            1,
+            3 * 1800.0,
+            1200.0,
+            1 * HR2MIN,
+            "rho0.9, 2, 120n",
+            "simulation",
+        ),
+        (
+            None,
+            0.9,
+            2.0,
+            1e-4,
+            1,
+            3 * 1800.0,
+            1200.0,
+            1 * HR2MIN,
+            "rho0.9, 2, 120",
+            "none",
+        ),
+        (
+            None,
+            0.9,
+            2.0,
+            1e-4,
+            1,
+            3 * 1800.0,
+            1200.0,
+            1 * HR2MIN,
+            "rho0.9, 2, 240",
+            "none",
+        ),
     ]
     # To do: try with gap_tolerance_target_min = .1 (or remove it)
     # Set the time_limit for the first two to 2 hr.
     # Add more trials (in .5 veh intervals)
     # Try the case with 2piles
-    RUN_NAME = "1pile_75kwh_bp"
+    RUN_NAME = "1pile_75kwh_bp_test"
     configs = [
         dataclasses.replace(
             BASE,
             mean_interarrival=ia,
+            offered_power_load=rho_p,
             delta=d,
             mip_gap=mip_gap,
-            gap_tolerance_target_min=gap_tol,
+            bp_tolerance_min=bp_tol,
             time_limit=t_lim,
             dw_time_limit=dw_t_lim,
             max_time=mx_time,
             label=lab,
+            bp_initial_schedule=bp_sch,
         )
-        for ia, d, mip_gap, gap_tol, t_lim, dw_t_lim, mx_time, lab in combos
+        for ia, rho_p, d, mip_gap, bp_tol, t_lim, dw_t_lim, mx_time, lab, bp_sch in combos
     ]
     print(f"{len(configs)} trial(s) queued\n")
     # for cfg in configs:

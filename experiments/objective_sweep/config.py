@@ -8,8 +8,8 @@ fully described (and reproducible) by the row it writes to ``results.csv``.
 sweep; pass explicit ``TrialConfig`` objects instead when the combinations
 are not a product.
 
-Closed-system trials (``closed_system=True``, the default)
------------------------------------------------------------
+Closed-system trials
+--------------------
 Every source -- the simulation, its grid replay and the offline models --
 is run on the same closed set of vehicles from the same starting state:
 
@@ -25,10 +25,10 @@ is run on the same closed set of vehicles from the same starting state:
    read off the discretized FIFO run -- the slot by which it empties the
    station -- plus ``horizon_slack``.
 
-Mean sojourn is reported over every vehicle in the set. With
-``closed_system=False`` a trial is the older measured *window* instead: the
-simulation stops at ``T``, the models' horizon is ``max_time``, and
-unfinished vehicles are censored there.
+Mean sojourn is reported over every vehicle in the set. The offline models
+are closed-system models (every vehicle served and fully charged within the
+horizon), which is why they need the drained run's horizon rather than
+``max_time``.
 """
 
 from __future__ import annotations
@@ -38,6 +38,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from experiments.core.grid import config_grid
+from metrics.load import mean_interarrival_for_power_load
 from offline_cl_opt.boundary import (
     COHORTS_ALL,
     BoundaryMode,
@@ -65,18 +66,23 @@ class TrialConfig:
     queue_capacity: int = 1000
 
     # --- traffic / simulation ----------------------------------------------
-    mean_interarrival: float = 30.0
-    # Length of the arrival window [t0, T] after warm-up (minutes). In a
-    # closed-system trial the station is then drained, so the measured phase
-    # runs past T; otherwise the run (and the measured window) stops at T.
+    # Arrival rate: give EITHER mean_interarrival (minutes between arrivals,
+    # lambda = 1 / mean_interarrival) OR offered_power_load (rho_P, the
+    # theoretical counterpart of overall power utilization: the fraction of
+    # the station's rated power the arriving demand needs; see
+    # metrics/README.md, 6.3). With mean_interarrival=None it is derived from
+    # offered_power_load as 60 * E[W] / (rho_P * R) (E[W]: mean requested
+    # kWh of the battery/SoC distributions; R = n_piles * n_modules *
+    # p_module); with mean_interarrival set, offered_power_load is ignored.
+    # The value actually used is effective_mean_interarrival, and is what
+    # the mean_interarrival column of results.csv records.
+    mean_interarrival: float | None = 30.0
+    offered_power_load: float | None = None
+    # Length of the arrival window [t0, T] after warm-up (minutes). The
+    # station is then drained, so the measured phase runs past T.
     max_time: float = 2 * HR2MIN
     warmup_period: float = 6 * HR2MIN  # FIFO warm-up before t0
     flush_queue_at_warmup: bool = False
-    # Closed-system trial (see the module docstring): arrivals close at T,
-    # the simulation drains the station, and the models' horizon is read off
-    # the discretized FIFO run. False reproduces the older measured-window
-    # trial (hard stop at T, censoring there).
-    closed_system: bool = True
     battery_cap_kwh: tuple[float, ...] = (75.0,)  # kWh; converted on use
     seed: int = 39  # arrival stream
     policy_seed: int = 12  # queue-policy RNG
@@ -96,14 +102,14 @@ class TrialConfig:
 
     # --- discretization ----------------------------------------------------
     delta: float = 2.0  # slot length (minutes) for both offline models
-    # Closed-system trials only: extra horizon, as a fraction of the FIFO
-    # horizon K_fifo (K = ceil(K_fifo * (1 + horizon_slack))). A finite
-    # horizon lets a model leave a vehicle unfinished at K at the censored
-    # cost delta*K - a_j; any model value is still a valid LOWER bound on
-    # the closed-system optimum, but a schedule only gives the closed-system
-    # value when it completes every vehicle -- reported per model as
-    # *_all_completed. Raise this if a model censors anyone. Larger K grows
-    # every model roughly linearly.
+    # Extra horizon, as a fraction of the FIFO horizon K_fifo
+    # (K = ceil(K_fifo * (1 + horizon_slack))). Every model must finish
+    # every vehicle by K, so K_fifo (which the discretized FIFO schedule
+    # fits) keeps the models feasible; a longer K can only lower the optimum
+    # (more schedules fit), and stops changing it once K reaches the
+    # makespan of some optimal schedule. A model schedule departing at K
+    # (*_n_at_horizon > 0) hints the horizon may bind. Larger K grows every
+    # model roughly linearly.
     horizon_slack: float = 0.0
     # Arrival-time grid. ``"delta"`` snaps arrivals to the model's own grid
     # (what the notebook does); ``None`` keeps continuous exponential times;
@@ -115,6 +121,7 @@ class TrialConfig:
     # mode (OPTIMIZE -- the optimizer controls them -- or FIXED), no flush,
     # and objective_cohorts=COHORTS_ALL; otherwise the models would not see
     # the same vehicle set as the simulation (checked in __post_init__).
+    # The fields stay so the instance builder's options remain visible.
     #
     # Fold the boundary queue in as ordinary a=0 vehicles (cohort QUEUED).
     include_queued: bool = True
@@ -134,8 +141,15 @@ class TrialConfig:
     mip_gap: float | None = 1e-4
     time_limit: float | None = 1200.0  # seconds; None for no limit
     break_symmetry: bool = False  # must stay False with boundary vehicles
-    bound_departures: bool = True
     tie_break: bool = False
+    # Stop as soon as the incumbent is proven within this many minutes of
+    # MEAN sojourn of the optimum (converted per trial to x * n_optimized
+    # minutes of total sojourn, Gurobi's MIPGapAbs). None: prove optimality.
+    # Either way the free tightening applies (objective values are multiples
+    # of delta), so only whole steps of delta / n_optimized count. Needs
+    # tie_break=False. mip_gap (relative) still applies; Gurobi stops at
+    # whichever gap is met first, so keep mip_gap small to let this govern.
+    exact_tolerance_min: float | None = None
 
     # --- DW model ----------------------------------------------------------
     # Objective units: minutes of TOTAL sojourn. A tolerance of g minutes
@@ -180,6 +194,10 @@ class TrialConfig:
     #   "both"       -- the better of the two;
     #   "none"       -- only B&P's own greedy schedule.
     bp_initial_schedule: str = "simulation"
+    # Same as exact_tolerance_min, for branch-and-price: stop as soon as its
+    # schedule is proven within this many minutes of mean sojourn of the
+    # optimum (status "WITHIN_TOLERANCE"). None: prove optimality.
+    bp_tolerance_min: float | None = None
 
     # --- bookkeeping -------------------------------------------------------
     label: str = ""  # optional human-readable tag carried into the results
@@ -187,10 +205,21 @@ class TrialConfig:
 
     # ------------------------------------------------------------------ #
     def __post_init__(self) -> None:
+        # Neither rate input set is allowed here: a sweep's BASE leaves the
+        # swept one to config_grid. effective_mean_interarrival raises if a
+        # config is used with neither.
+        if self.mean_interarrival is not None and self.mean_interarrival <= 0:
+            raise ValueError(f"mean_interarrival must be > 0, got {self.mean_interarrival}")
+        if self.offered_power_load is not None and self.offered_power_load <= 0:
+            raise ValueError(f"offered_power_load must be > 0, got {self.offered_power_load}")
         if self.horizon_slack < 0:
             raise ValueError(f"horizon_slack must be >= 0, got {self.horizon_slack}")
-        if not self.closed_system:
-            return
+        for name in ("exact_tolerance_min", "bp_tolerance_min"):
+            value = getattr(self, name)
+            if value is not None and value < 0:
+                raise ValueError(f"{name} must be >= 0 or None, got {value}")
+        if self.exact_tolerance_min is not None and self.tie_break:
+            raise ValueError("exact_tolerance_min needs tie_break=False (one objective)")
         problems = []
         if not self.include_queued:
             problems.append("include_queued=False drops the queue at t0 from the models")
@@ -202,10 +231,30 @@ class TrialConfig:
             problems.append("objective_cohorts must be COHORTS_ALL so every vehicle is optimized")
         if problems:
             raise ValueError(
-                "closed_system=True runs every source on the same vehicle set, but: "
+                "a closed-system trial runs every source on the same vehicle set, but: "
                 + "; ".join(problems)
-                + ". Fix these or set closed_system=False."
+                + "."
             )
+
+    @property
+    def effective_mean_interarrival(self) -> float:
+        """
+        The mean inter-arrival time (minutes) the trial uses:
+        ``mean_interarrival`` when given, else the one that makes the
+        theoretical offered power load equal ``offered_power_load``
+        (``metrics.load.mean_interarrival_for_power_load``). Computed from
+        the inputs every time, so ``dataclasses.replace`` of either field
+        always takes effect.
+        """
+        if self.mean_interarrival is not None:
+            return float(self.mean_interarrival)
+        if self.offered_power_load is None:
+            raise ValueError("set mean_interarrival or offered_power_load (one of them is needed)")
+        return mean_interarrival_for_power_load(
+            self.offered_power_load,  # type: ignore[arg-type]
+            rated_power=self.n_piles * self.n_modules * self.p_module,
+            battery_cap_options=self.battery_cap_options,
+        )
 
     @property
     def battery_cap_options(self) -> list[float]:
@@ -229,27 +278,11 @@ class TrialConfig:
         """
         return (self.warmup_period + self.max_time) * self.arrival_oversample
 
-    @property
-    def offline_horizon(self) -> float:
-        """
-        Completion horizon for the offline models in a measured-window trial
-        (``closed_system=False``): the measured phase only, not warm-up +
-        measured (the models start at the boundary, t=0).
-
-        A closed-system trial has no fixed horizon -- it is read off that
-        trial's own FIFO run (``trial.closed_system_horizon``) -- so this
-        raises there rather than return a wrong number.
-        """
-        if self.closed_system:
-            raise ValueError(
-                "closed_system=True: the offline horizon is derived per trial from the "
-                "discretized FIFO run (see trial.closed_system_horizon), not from max_time."
-            )
-        return float(self.max_time)
-
     def to_row(self) -> dict[str, Any]:
         """Flat, CSV-friendly view -- one column per knob, enums as strings."""
         row = dataclasses.asdict(self)
+        # The rate actually used, whichever input set it.
+        row["mean_interarrival"] = self.effective_mean_interarrival
         row["battery_cap_kwh"] = ",".join(f"{c:g}" for c in self.battery_cap_kwh)
         row["boundary_mode"] = (
             self.boundary_mode.value if self.boundary_mode is not None else "none"

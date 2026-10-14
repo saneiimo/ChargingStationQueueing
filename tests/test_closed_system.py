@@ -7,8 +7,8 @@ the plugged-in vehicles at t0 plus every arrival in [t0, T] -- drains the
 station instead of stopping at T, and gives the offline models a horizon read
 off the discretized FIFO run. These tests pin down the pieces that make that
 comparison sound: who is admitted, that nothing is censored on the
-simulation side, that the models see exactly the simulated set, and that the
-reported bracket on the closed-system optimum is valid.
+simulation side, that the models see exactly the simulated set, and that
+the two exact solvers agree on the closed-system optimum.
 
     python -m pytest tests/test_closed_system.py -v
 """
@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import math
 
-import pandas as pd
 import pytest
 
 from metrics.metrics_tracker import MetricsTracker
@@ -114,7 +113,7 @@ def test_drain_raises_if_waiting_vehicles_are_never_assigned():
 
 
 # --------------------------------------------------------------------------- #
-# The objective sweep in closed-system mode
+# The objective sweep (closed-system trials)
 # --------------------------------------------------------------------------- #
 
 gp = pytest.importorskip("gurobipy")
@@ -141,17 +140,10 @@ def test_closed_system_config_rejects_mismatched_vehicle_sets():
         dict(flush_queue_at_warmup=True),
         dict(objective_cohorts=COHORTS_MEASUREMENT),
     ):
-        with pytest.raises(ValueError, match="closed_system"):
+        with pytest.raises(ValueError, match="closed-system trial"):
             _cfg(**bad)
-        _cfg(closed_system=False, **bad)  # fine as a measured-window trial
     with pytest.raises(ValueError, match="horizon_slack"):
         _cfg(horizon_slack=-0.1)
-
-
-def test_offline_horizon_is_not_a_config_value_in_a_closed_trial():
-    with pytest.raises(ValueError, match="derived per trial"):
-        _cfg().offline_horizon
-    assert _cfg(closed_system=False).offline_horizon == 60.0
 
 
 def test_closed_trial_runs_every_source_on_the_same_vehicle_set():
@@ -169,7 +161,6 @@ def test_closed_trial_runs_every_source_on_the_same_vehicle_set():
         assert arrived["n_censored"] == 0
         assert arrived["mean_sojourn"] == pytest.approx(completed["mean_sojourn"])
     # ...and the models were given exactly that set, all optimized.
-    assert inst["n_dropped_late_arrivals"] == 0
     assert r.exact["n_vehicles"] == r.dw["n_vehicles"] == n == inst["n_optimized"]
     assert r.exact["arrived_by_cohort"]["all"]["n"] == n
 
@@ -178,18 +169,17 @@ def test_closed_trial_runs_every_source_on_the_same_vehicle_set():
     assert inst["horizon_minutes"] == pytest.approx(inst["K"] * 5.0)
     assert r.exact["K"] == r.dw["K"] == inst["K"]
 
-    # The bracket is valid and the FIFO schedule is one of its upper bounds.
-    c = r.closed
-    assert c["lower_bound"] <= c["upper_bound"] + 1e-6
-    assert c["upper_bound"] <= inst["feasible_fifo_total_sojourn"] + 1e-6
-    assert r.dw["LB"] <= c["upper_bound"] + 1e-6
-    assert c["mean_sojourn_LB"] == pytest.approx(c["lower_bound"] / n)
+    # Every model schedule completes everyone, so both model groups agree;
+    # the optimum is no worse than the discretized FIFO schedule (one of the
+    # model's schedules) and DW's bound lies below it.
+    assert r.exact["arrived_by_cohort"] == r.exact["completed_by_cohort"]
+    assert r.exact["objective"] <= inst["feasible_fifo_total_sojourn"] + 1e-6
+    assert r.dw["LB"] <= r.exact["objective"] + 1e-6
 
 
-def test_closed_trial_bracket_closes_and_both_exact_solvers_agree():
-    """Small enough to solve exactly: the closed-system optimum is proven, and
-    the compact MILP and branch-and-price report the same value, from
-    schedules that complete every vehicle (repaired at K if tied there)."""
+def test_both_exact_solvers_agree_on_the_closed_system_optimum():
+    """Small enough to solve exactly: the compact MILP and branch-and-price
+    prove the same closed-system optimum, no worse than discretized FIFO."""
     from experiments.objective_sweep import run_trial
 
     for ia in (15.0, 25.0):
@@ -197,11 +187,8 @@ def test_closed_trial_bracket_closes_and_both_exact_solvers_agree():
                       run_dw_model=False, verbose=False)
         assert r.exact["status"] == "OPTIMAL" and r.bp["status"] == "OPTIMAL"
         assert r.exact["objective"] == pytest.approx(r.bp["objective"])
-        assert r.exact["all_completed"] and r.bp["all_completed"]
-        assert r.closed["proven_optimal"]
-        assert r.closed["upper_bound"] == pytest.approx(r.exact["objective"])
-        # The optimum cannot be worse than the discretized FIFO it was bounded by.
-        assert r.closed["upper_bound"] <= r.instance["feasible_fifo_total_sojourn"] + 1e-6
+        assert r.bp["best_bound"] == pytest.approx(r.bp["objective"])
+        assert r.exact["objective"] <= r.instance["feasible_fifo_total_sojourn"] + 1e-6
 
 
 def test_horizon_slack_lengthens_the_horizon():
@@ -223,34 +210,67 @@ def test_full_queue_is_rejected_rather_than_compared_on_different_sets():
                   run_dw_model=False, verbose=False)
 
 
-def test_trial_json_without_closed_system_replays_as_a_window():
-    """Trials written before closed_system existed have no such key; they
-    must replay as the hard-stop episode they were."""
+def test_trial_json_replays_drained_unless_marked_as_a_window():
+    """A trial JSON replays drained; one from the older measured-window sweep
+    carries closed_system=False and replays as the hard-stop episode it was."""
     from experiments.objective_sweep import replay_episode, run_episode
 
-    cfg = _cfg(closed_system=False)
+    cfg = _cfg()
     env, _, specs = run_episode(cfg)
     row = cfg.to_row()
-    del row["closed_system"]
     replayed = replay_episode(row, specs)
-    assert not replayed.engine.drain
-    assert replayed.engine.end_time == env.engine.end_time == 180.0
+    assert replayed.engine.drain
+    assert replayed.engine.end_time == env.engine.end_time
+    window = replay_episode({**row, "closed_system": False}, specs)
+    assert not window.engine.drain
+    assert window.engine.end_time == 180.0
 
 
-def test_fixed_boundary_vehicle_that_departed_counts_as_completed():
-    """A FIXED vehicle's pinned power stops at its last whole slot, so its
-    final partial slot's energy is missing -- yet it did finish if it left
-    before the horizon. One still charging at the horizon has not."""
-    from experiments.objective_sweep.trial import _model_groups
+def test_grid_fifo_model_reproduces_the_grid_replay():
+    """grid_fifo_cl_model: the replayed timetable as a solved compact model --
+    its objective is the grid replay's total sojourn, every vehicle completes,
+    and occupancy matches the replay slot for slot."""
+    from experiments.objective_sweep import build_instance, run_episode
+    from offline_cl_opt import grid_fifo_cl_model
+    from offline_cl_opt.solution import extract_solution
 
-    pv = pd.DataFrame([
-        dict(vehicle_id=1, cohort="boundary", boundary_mode="fixed", departure_slot=3.0,
-             energy_kwh=9.0, energy_delivered_before_kwh=5.0, energy_required_kwh=15.0,
-             sojourn_min=15.0),
-        dict(vehicle_id=2, cohort="boundary", boundary_mode="fixed", departure_slot=10.0,
-             energy_kwh=9.0, energy_delivered_before_kwh=5.0, energy_required_kwh=15.0,
-             sojourn_min=50.0),
-    ])
-    _, _, diag = _model_groups(pv, K=10)
-    assert diag["n_completed"] == 1 and diag["n_censored"] == 1
-    assert not diag["all_completed"]
+    cfg = _cfg()
+    env, _, _ = run_episode(cfg)
+    inst, station, summary = build_instance(cfg, env)
+    m = env.engine.metrics
+    cl, info = grid_fifo_cl_model(m, inst, station, cfg.delta, summary["horizon_minutes"])
+    sol = extract_solution(cl)
+    grid = m.arrived_grid_sojourn_by_cohort(cfg.delta, since=m.warmup_period,
+                                            censor_at=env.engine.current_time)
+    assert sol.objective == pytest.approx(grid["all"]["total_sojourn"])
+    assert info["total_abs_deviation_kwh"] >= 0.0
+    intervals = m.grid_replay_intervals(cfg.delta, since=m.warmup_period)
+    for row in sol.per_vehicle.itertuples():
+        delivered = row.energy_kwh + row.energy_delivered_before_kwh
+        if row.boundary_mode != "fixed":
+            assert delivered == pytest.approx(row.energy_required_kwh, abs=1e-5)
+            assert (row.start_slot, row.departure_slot) == intervals[row.vehicle_id]
+
+    # The simulator's rule, slot by slot: before its last slot a vehicle draws
+    # min(P_bar, taper cap, Delta * its modules); with no_idle_modules it also
+    # holds only the modules it needs, and is module-limited only on a full pile.
+    Delta, N = station.p_module, station.n_modules
+    for j, v in cl.vehicles.items():
+        bv = inst.boundary_vehicles.get(j)
+        if bv is not None and bv.mode.value == "fixed":
+            continue
+        S, D = intervals[j]
+        pile, conn = next(lane for lane in cl.lanes if cl.y[j, lane[0], lane[1]].X > 0.5)
+        x = bv.initial_energy_kwh if bv is not None else 0.0
+        for k in range(S, D):
+            p = cl.p[j, k].X
+            r = round(cl.r[pile, conn, k].X)
+            bms = min(v.p_max, N * Delta, (v.R - x) / v.tau_delta_hours(cfg.delta))
+            if k < D - 1:
+                assert p == pytest.approx(min(bms, Delta * r), abs=1e-4), (j, k)
+                if info["no_idle_modules"] and p < bms - 1e-4:
+                    used = sum(round(cl.r[pile, c, k].X) for c in range(station.n_connectors))
+                    assert used == N, (j, k, used)
+            if info["no_idle_modules"]:
+                assert r <= math.ceil(p / Delta - 1e-6), (j, k, r, p)
+            x += cfg.delta / 60.0 * p

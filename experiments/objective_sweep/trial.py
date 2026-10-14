@@ -2,11 +2,10 @@
 One benchmark trial: simulate, then solve the same instance offline.
 
 A trial is the ``sim_benchmark.ipynb`` walkthrough, run headless and
-recorded. By default it is a **closed-system** trial (``TrialConfig.
-closed_system``, see ``config.py``'s module docstring): FIFO warms the
-station up to ``t0``, the state there is snapshotted, vehicles arrive over
-``[t0, T]`` and none after, and the simulation drains the station instead
-of stopping at ``T``. Every source below is then run on exactly that closed
+recorded, as a **closed-system** trial (see ``config.py``'s module
+docstring): FIFO warms the station up to ``t0``, the state there is
+snapshotted, vehicles arrive over ``[t0, T]`` and none after, and the
+simulation drains the station instead of stopping at ``T``. Every source below is then run on exactly that closed
 set of vehicles -- the queue and the plugged-in vehicles at ``t0`` plus
 every arrival in ``[t0, T]`` -- and the offline models' horizon ``K`` is read
 off the discretized FIFO run (``closed_system_horizon``). Nothing is
@@ -33,29 +32,22 @@ and ``offline_cl_opt.boundary`` for the cohort definitions):
                (continuous-module relaxation).
 
 All three offline models minimize the same objective, total sojourn
-``sum_j (delta*D_j - a_j)`` in minutes over ``objective_cohorts``, so every
+``sum_j delta*(D_j - k_j)`` in minutes (``k_j = ceil(a_j/delta)``, the
+release slot) over ``objective_cohorts``, so every
 ``objective`` / ``best_bound`` / ``LB`` / ``UB`` field is total sojourn in
 minutes; ``*_mean_sojourn*`` divides it by ``n_optimized``.
 
-What the model numbers mean in a closed-system trial. A model with a finite
-horizon may leave a vehicle unfinished at ``K``, scoring it the censored
-``delta*K - a_j``. Truncating any complete schedule at ``K`` gives a model
-schedule that costs no more, so every model **lower bound** (``best_bound``,
-``LB``) is a valid lower bound on the closed-system optimum for any ``K``.
-A model **schedule** (``objective``, ``UB``) is the closed-system value
-only if it completes every vehicle -- ``all_completed`` on that stage. (A vehicle can be left
-unfinished even at the model optimum: charging through the last slot
-gives ``D_j = K`` whether or not it completes, so the model is indifferent
-between the two; ``_repair_completion`` then checks, holding every start,
-departure and lane fixed, whether such vehicles can be fully charged
-anyway -- if so, the same value belongs to a complete schedule.)
-``closed_system_bracket`` combines the stages into what
-is actually proven about the closed-system optimum ``z*``: the best lower
-bound from any model, the best value of any schedule that completes every
-vehicle (the feasible discretized FIFO schedule always qualifies), and
-whether the two meet. ``z*`` here is the optimum of the discrete model --
-slot grid, whole modules -- over the closed set, the like-for-like
-counterpart of ``grid``, not of the continuous-time ``sim``.
+What the model numbers mean. Every offline model is the closed-system
+model: each vehicle is served and receives its full energy by the horizon
+``K``, so every model schedule (``objective``, ``UB``) completes every
+vehicle and every model lower bound (``best_bound``, ``LB``) bounds the
+optimum over such schedules. ``K`` comes from the discretized FIFO run,
+whose whole-module schedule fits inside it, so the models are always
+feasible. Lengthening ``K`` (``horizon_slack``) can only lower the optimum,
+and stops changing it once ``K`` reaches the makespan of some optimal
+schedule. The optimum here is that of the discrete model -- slot grid,
+whole modules -- over the closed set, the like-for-like counterpart of
+``grid``, not of the continuous-time ``sim``.
 
 The DES episode always runs, whatever ``run_sim`` says: both offline models
 are built from the *realized* arrival stream and the boundary snapshot it
@@ -70,12 +62,11 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-import gurobipy as gp
 import numpy as np
-from gurobipy import GRB
 
 from config import C_RATE, S_THRESH
 from env.charging_env import ChargingStationEnv
+from metrics.load import ArrivalModel, station_load_summary
 from models.ev import EV
 from offline_cl_dw import solve_by_decomposition
 from offline_cl_opt import (
@@ -85,6 +76,7 @@ from offline_cl_opt import (
     solve_cl_model,
 )
 from offline_cl_opt.boundary import BoundaryMode, Cohort
+from offline_cl_opt.model import lattice_round_up
 from offline_cl_opt.solution import extract_solution as extract_exact
 from offline_cl_PB import (
     BranchAndPrice,
@@ -115,9 +107,9 @@ GROUP_NAMES = ("completed", "arrived")
 
 NAN = float("nan")
 
-# Tolerance on the model-side completion test. ``energy_kwh`` is a sum of
+# Tolerance on the model-side completion check. ``energy_kwh`` is a sum of
 # continuous solver variables, so exact equality against W_j never holds;
-# Gurobi's own default feasibility tolerance is 1e-6.
+# the models' own validation tolerances are 1e-6.
 COMPLETION_EPS_KWH = 1e-6
 
 
@@ -130,9 +122,6 @@ class TrialResult:
     was switched off, and carry an ``"error"`` key for one that was
     attempted and failed (a solve can hit an infeasibility or an assertion;
     a failed stage must not take the whole sweep down with it).
-
-    ``closed`` is ``closed_system_bracket``'s summary (closed-system trials
-    only, else ``None``).
     """
 
     config: TrialConfig
@@ -147,7 +136,6 @@ class TrialResult:
     exact: dict[str, Any] | None = None
     bp: dict[str, Any] | None = None
     dw: dict[str, Any] | None = None
-    closed: dict[str, Any] | None = None
 
 
 # --------------------------------------------------------------------------- #
@@ -234,10 +222,10 @@ def _make_env(config: dict[str, Any], evs: list[EV]) -> ChargingStationEnv:
 
     ``config`` is a ``TrialConfig.to_row()`` dict (or anything with the same
     keys). ``mean_interarrival`` is forced to ``None`` so the saved list is
-    what the engine uses, not a fresh Poisson draw. ``closed_system`` turns
-    on the engine's ``drain`` mode (arrivals close at ``T``, then the
-    station is emptied); a trial JSON written before that field existed has
-    no such key and replays as the measured-window episode it was.
+    what the engine uses, not a fresh Poisson draw. The engine runs in
+    ``drain`` mode (arrivals close at ``T``, then the station is emptied).
+    A trial JSON from the older measured-window sweep carries
+    ``closed_system: false`` and replays as the window it was.
     """
     return ChargingStationEnv(
         n_piles=int(config["n_piles"]),
@@ -253,7 +241,7 @@ def _make_env(config: dict[str, Any], evs: list[EV]) -> ChargingStationEnv:
         delta_arr=_resolved_delta_arr(config),
         warmup_period=float(config["warmup_period"]),
         flush_queue_at_warmup=bool(config.get("flush_queue_at_warmup", False)),
-        drain=bool(config.get("closed_system", False)),
+        drain=bool(config.get("closed_system", True)),
     )
 
 
@@ -261,9 +249,8 @@ def run_episode(cfg: TrialConfig) -> tuple[ChargingStationEnv, float, list[dict[
     """
     Run one FIFO / proportional-power episode over warm-up + measured phase.
 
-    With ``cfg.closed_system`` arrivals close at ``T = warmup_period +
-    max_time`` and the episode continues until the station is empty
-    (``env.engine.end_time``); otherwise it stops at ``T``.
+    Arrivals close at ``T = warmup_period + max_time`` and the episode
+    continues until the station is empty (``env.engine.end_time``).
 
     The arrival stream is drawn once, over ``cfg.draw_horizon`` (a one-shot
     draw, not resampled per phase), and handed to the env with
@@ -279,7 +266,7 @@ def run_episode(cfg: TrialConfig) -> tuple[ChargingStationEnv, float, list[dict[
     ``mean_interarrival``. See ``simulation.arrivals``'s module docstring.
     """
     evs = generate_arrivals(
-        mean_interarrival=cfg.mean_interarrival,
+        mean_interarrival=cfg.effective_mean_interarrival,
         max_time=cfg.draw_horizon,
         rng=np.random.default_rng(cfg.seed),
         battery_cap_options=cfg.battery_cap_options,
@@ -319,19 +306,41 @@ def replay_episode(
     return env
 
 
-def episode_utilization(
-    env: ChargingStationEnv, *, post_warmup: bool = False
+def station_load(
+    env: ChargingStationEnv, *, since: float, mean_interarrival: float | None = None
 ) -> dict[str, float]:
     """
-    Theoretical and simulated connector utilization for a finished episode.
+    ``metrics.load.station_load_summary`` for a finished episode: connector
+    occupancy (per connector and overall) and power utilization (per pile
+    and overall) over ``[since, end of run]``; offered power / connector
+    loads from the arrivals in ``[since, engine.max_time]`` (``*_realized``)
+    and, given ``mean_interarrival`` (the env itself has none -- it is fed
+    an arrival list), from the arrival generator (``*_theory``). Every key
+    is explained in ``metrics/README.md``.
+    """
+    eng = env.engine
+    now = float(eng.current_time)
+    return station_load_summary(
+        eng.metrics, eng.station, now, since=since,
+        arrivals_until=min(float(eng.max_time), now),
+        arrival_model=ArrivalModel.from_env(env, mean_interarrival=mean_interarrival),
+    )
+
+
+def episode_utilization(
+    env: ChargingStationEnv, *, post_warmup: bool = False, mean_interarrival: float | None = None
+) -> dict[str, float]:
+    """
+    Theoretical and simulated connector utilization for a finished episode,
+    plus every ``station_load`` metric over the same window.
 
     ``rho_sim`` is the time-average fraction of connectors that were
     occupied. ``rho_theory`` is ``lambda_eff / (c * mu)`` with
     ``lambda_eff = n_finished / T`` and ``mu = 1 / E[S]``, over the same
     window. ``post_warmup=True`` restricts both to ``[warmup_period, end]``,
     the measured phase the objective sweep reports sojourns on (``end`` is
-    when the run stopped: ``T``, or in a closed-system trial when the
-    station emptied, so the drain is included).
+    when the station emptied, so the drain is included). See
+    ``metrics/README.md`` for every key.
     """
     metrics = env.engine.metrics
     sim_time = float(env.engine.current_time)
@@ -347,6 +356,7 @@ def episode_utilization(
         "c": float(summary["c"]),
         "rho_sim": float(summary["rho_sim"]),
         "rho_theory": float(summary["rho_theory"]),
+        **station_load(env, since=since, mean_interarrival=mean_interarrival),
     }
 
 
@@ -363,8 +373,8 @@ def episode_counts(env: ChargingStationEnv) -> dict[str, Any]:
         "n_finished_total": len(m.finished_evs),
         "n_dropped_total": len(m.dropped_evs),
         "n_flushed_at_warmup": len(m.flushed_evs),
-        # When arrivals closed (T) and when the run ended; they differ only
-        # in a closed-system trial, by how long draining the station took.
+        # When arrivals closed (T) and when the run ended; they differ by how
+        # long draining the station took.
         "arrivals_close_at": float(env.engine.max_time),
         "sim_clock_end": float(env.engine.current_time),
         "drain_minutes": float(env.engine.current_time - env.engine.max_time),
@@ -386,74 +396,43 @@ def _model_groups(per_vehicle, K: int) -> tuple[dict, dict, dict]:
     """
     Split a solved model's ``per_vehicle`` table into the two report groups.
 
-    A vehicle counts as **completed** iff it received its full energy
-    requirement -- for a boundary vehicle that means the in-window
-    ``energy_kwh`` *plus* the ``energy_delivered_before_kwh`` it arrived
-    with, since ``energy_required_kwh`` is always the full ``W_j`` (testing
-    ``energy_kwh`` alone would read every completed boundary vehicle as
-    short by exactly its pre-window energy).
+    Every model is the closed-system model, so every vehicle is served and
+    complete and the ``completed`` and ``arrived`` groups coincide; both are
+    kept so a model's figures line up with the simulation's
+    (``simulation_metrics``) column for column. Completion is checked here
+    anyway -- a schedule short of some vehicle's energy is a solver bug, not
+    a result -- for every vehicle except FIXED boundary ones, whose pinned
+    power stops at the last whole slot before their real departure (the
+    model exempts them from completion for that reason). A boundary
+    vehicle's energy counts what it had at ``t0``
+    (``energy_delivered_before_kwh``).
 
-    Why energy and not ``departure_slot < K``: that test is sound in one
-    direction only. Constraint (19) forces ``x_j >= W_j`` at any departure
-    edge strictly inside the horizon, so ``D_j < K`` does imply completion.
-    The converse fails -- ``D_j = S_j + sum_k u_jk`` is an *exclusive*
-    boundary, so a vehicle charging through the final slot ``K-1`` also
-    lands on ``D_j = K``, precisely where an unserved vehicle sits
-    (``S_j = K``, no occupancy). (19) has no row at ``k = K`` (Section
-    6.3's deliberate censoring), so the departure slot cannot separate a
-    buzzer-beater from a censored vehicle. ``served`` is no help either: it
-    is ``any(u_jk > 0.5)``, i.e. "held a connector", and a censored vehicle
-    can hold one while drawing zero power.
-
-    ``D_j >= K`` is still worth reporting, as a *horizon-binding*
-    diagnostic rather than a completion test -- see ``n_at_horizon``.
-
-    A FIXED boundary vehicle is also completed when it departs before the
-    horizon (``departure_slot < K``): its pinned power stops at the last
-    whole slot before its real departure, so the energy of that final
-    partial slot is missing from ``energy_kwh`` even though, in the
-    simulation it was pinned to, it did finish.
-
-    ``all_completed`` (no vehicle censored) is what makes a schedule's value
-    the closed-system value in a closed-system trial -- see the module
-    docstring.
+    ``n_at_horizon`` counts vehicles departing exactly at ``K``: nonzero
+    means the horizon may bind the optimum (see ``horizon_slack``).
 
     Returns ``(completed_by_cohort, arrived_by_cohort, diagnostics)``.
     """
     pv = per_vehicle
     delivered = pv["energy_kwh"].fillna(0.0) + pv["energy_delivered_before_kwh"].fillna(0.0)
-    at_horizon = pv["departure_slot"] >= K - 1e-9
     # Every solution table carries boundary_mode; a bare table without it has
     # no FIXED vehicle.
     is_fixed = pv["boundary_mode"] == BoundaryMode.FIXED.value if "boundary_mode" in pv else False
-    fixed_departed = is_fixed & ~at_horizon
-    is_completed = (delivered >= pv["energy_required_kwh"] - COMPLETION_EPS_KWH) | fixed_departed
+    short = ~is_fixed & (delivered < pv["energy_required_kwh"] - COMPLETION_EPS_KWH)
+    if short.any():
+        raise RuntimeError(
+            f"model schedule leaves vehicles {pv.loc[short, 'vehicle_id'].tolist()[:10]} short of "
+            "their energy; the closed-system model forbids that."
+        )
 
     completed: dict[str, dict[str, float]] = {}
-    arrived: dict[str, dict[str, float]] = {}
     for level, tags in COHORT_LEVEL_TAGS.items():
-        in_level = pv["cohort"].isin(tags)
-        sub_all = pv[in_level]
-        sub_done = pv[in_level & is_completed]
-        completed[level] = _cohort_stats(sub_done["sojourn_min"].tolist())
-        arrived[level] = _cohort_stats(sub_all["sojourn_min"].tolist())
-        arrived[level]["n_censored"] = float(len(sub_all) - len(sub_done))
-
-    diagnostics = {
-        "n_completed": int(is_completed.sum()),
-        "n_censored": int((~is_completed).sum()),
-        "all_completed": bool(is_completed.all()),
-        # Completed, but only just: finished exactly at the horizon edge.
-        # A nonzero count means the horizon is binding on the optimum.
-        "n_completed_at_horizon": int((is_completed & at_horizon).sum()),
-        "n_at_horizon": int(at_horizon.sum()),
-    }
+        completed[level] = _cohort_stats(pv.loc[pv["cohort"].isin(tags), "sojourn_min"].tolist())
+    arrived = {level: dict(stats) for level, stats in completed.items()}
+    diagnostics = {"n_at_horizon": int((pv["departure_slot"] >= K - 1e-9).sum())}
     return completed, arrived, diagnostics
 
 
-def simulation_metrics(
-    env: ChargingStationEnv, delta: float, *, exclude_ids: set[int] | None = None
-) -> tuple[dict, dict]:
+def simulation_metrics(env: ChargingStationEnv, delta: float) -> tuple[dict, dict]:
     """
     Measured-window sojourns per cohort, continuous-time and grid-replayed,
     each in both reporting groups.
@@ -463,31 +442,23 @@ def simulation_metrics(
     not from its real arrival, which is what makes these comparable with an
     optimizer that places the same vehicle at ``a=0``.
 
-    ``exclude_ids`` drops vehicles absent from the offline instance (the
-    closing-edge arrivals ``_arrivals_inside_horizon`` filters out) so the
-    ``arrived`` group covers exactly the population the models were given.
-
-    Unfinished vehicles are censored at the end of the run. In a
-    closed-system trial the station was drained, so there are none and the
-    ``completed`` and ``arrived`` groups coincide.
+    The station was drained, so every vehicle finished and the
+    ``completed`` and ``arrived`` groups coincide (``arrived`` would censor
+    an unfinished vehicle at the end of the run; there is none).
 
     Returns ``(sim, grid)``, each ``{"completed_by_cohort": ...,
     "arrived_by_cohort": ...}``.
     """
     m = env.engine.metrics
     since = m.warmup_period
-    censor_at = float(env.engine.current_time)  # the run's end: T, or after the drain
+    censor_at = float(env.engine.current_time)  # the run's end, after the drain
     sim = {
         "completed_by_cohort": m.sojourn_by_cohort(since=since),
-        "arrived_by_cohort": m.arrived_sojourn_by_cohort(
-            since=since, censor_at=censor_at, exclude_ids=exclude_ids
-        ),
+        "arrived_by_cohort": m.arrived_sojourn_by_cohort(since=since, censor_at=censor_at),
     }
     grid = {
         "completed_by_cohort": m.grid_sojourn_by_cohort(delta, since=since),
-        "arrived_by_cohort": m.arrived_grid_sojourn_by_cohort(
-            delta, since=since, censor_at=censor_at, exclude_ids=exclude_ids
-        ),
+        "arrived_by_cohort": m.arrived_grid_sojourn_by_cohort(delta, since=since, censor_at=censor_at),
     }
     return sim, grid
 
@@ -558,7 +529,7 @@ def closed_system_horizon(
     cfg: TrialConfig, env: ChargingStationEnv, station: StationSpec
 ) -> dict[str, Any]:
     """
-    The offline models' horizon for a closed-system trial, read off FIFO.
+    The offline models' horizon, read off the drained FIFO run.
 
     Two discretizations of the drained FIFO run give the slot by which it
     empties the station:
@@ -570,16 +541,13 @@ def closed_system_horizon(
     * ``K_feasible_fifo`` -- the whole-module schedule
       ``offline_cl_PB.schedule_from_simulation`` builds from the same run
       (simulated plug-in order and piles, rebuilt on the grid), validated
-      here against the exact model with every vehicle completed. It is
-      built on a provisional horizon long enough to fit it, doubled until
-      nothing is left unserved or at the edge.
+      here against the exact model (every vehicle served and completed). It
+      is built on a provisional horizon, doubled until every vehicle fits.
 
     ``K = ceil(max(K_grid_fifo, K_feasible_fifo) * (1 + horizon_slack))``.
-    Taking the larger guarantees the models contain at least one schedule
-    that completes every vehicle (the feasible FIFO one), so B&P's
-    ``"simulation"`` seed is complete. It does not stop a model from
-    leaving a vehicle unfinished at ``K`` when that is cheaper -- see the
-    module docstring and ``all_completed``.
+    Taking the larger guarantees the closed-system models are feasible --
+    the feasible FIFO schedule is one of their schedules -- and it is the
+    starting schedule of B&P (``"simulation"`` seed) and of DW.
 
     Returns the horizon (``K``, ``horizon_minutes``), both makespans and
     the feasible FIFO schedule's total sojourn.
@@ -602,14 +570,12 @@ def closed_system_horizon(
             m.arrived_evs, inst.vehicles, station, delta, K_try, inst.boundary_vehicles,
             warmup_period=t0,
         )
-        # Served and strictly inside the horizon: by the departure rule each
-        # such plan delivered its full energy, so the schedule is complete.
-        if all(not p.is_null and p.departure < K_try for p in sched.values()):
+        if sched is not None:  # every vehicle placed and complete
             break
     else:
         raise RuntimeError(
-            f"the discretized FIFO schedule still leaves vehicles unserved at K={K_try} slots "
-            f"(delta={delta:g}); cannot derive a closed-system horizon."
+            f"the discretized FIFO schedule still cannot finish every vehicle by K={K_try} "
+            f"slots (delta={delta:g}); cannot derive a closed-system horizon."
         )
     check = validate_schedule(
         sched, inst.vehicles, station, delta, K_try, inst.boundary_vehicles,
@@ -630,40 +596,6 @@ def closed_system_horizon(
     }
 
 
-def _arrivals_inside_horizon(
-    env: ChargingStationEnv, delta: float, K: int
-) -> tuple[list, set[int]]:
-    """
-    Drop measured-window arrivals that have no slot to be released in.
-
-    The offline model releases vehicle j at ``k_j = ceil(a_j / delta)`` and
-    the horizon holds slots ``0..K-1``, so an arrival with ``k_j >= K`` has
-    no slot at all and the model rejects the whole instance ("release slot
-    falls outside the horizon"). That is not a misconfigured horizon here,
-    it is the window's own closing edge: the DES runs to exactly
-    ``warmup_period + max_time`` and records an EV arriving at that instant,
-    which spends zero time inside the window. A continuous arrival stream
-    (``delta_arr=None``) widens the same edge to anything after
-    ``(K-1)*delta``.
-
-    Returns the surviving EVs and the ids of those dropped (the sim-side
-    report must exclude the same ones, or its ``arrived`` group would cover
-    a population the models never saw).
-
-    Only the measured-window trial has a closing edge: a closed-system
-    horizon lies past every vehicle's FIFO departure, so nothing is dropped
-    there (``build_instance`` checks).
-    """
-    m = env.engine.metrics
-    kept, dropped = [], set()
-    for ev in m.arrived_post_warmup:
-        k_j = math.ceil(
-            round((float(ev.arrival_time) - env.engine.warmup_period) / delta, 9)
-        )
-        (kept.append(ev) if k_j < K else dropped.add(ev.id))
-    return kept, dropped
-
-
 def _n_optimized(cfg: TrialConfig, inst) -> int:
     """Vehicles inside ``cfg.objective_cohorts`` -- the J in (total sojourn)/J."""
     return sum(1 for c in inst.cohorts.values() if c in cfg.objective_cohorts)
@@ -678,11 +610,8 @@ def build_instance(cfg: TrialConfig, env: ChargingStationEnv):
     ``cfg.boundary_mode``. Passing the station runs the whole-module check on
     FIXED vehicles here, where it can name the offending pile-slot.
 
-    The horizon is ``closed_system_horizon`` in a closed-system trial (the
-    instance is then exactly the closed vehicle set -- checked here), else
-    ``cfg.max_time``, with arrivals at the window's closing edge dropped
-    first (see ``_arrivals_inside_horizon``) and counted as
-    ``n_dropped_late_arrivals``. The horizon actually used is in the
+    The horizon is ``closed_system_horizon``'s, and the instance is
+    exactly the closed vehicle set (checked here). The horizon is in the
     returned summary as ``horizon_minutes`` / ``K``; pass it to the stage
     functions.
     """
@@ -692,31 +621,19 @@ def build_instance(cfg: TrialConfig, env: ChargingStationEnv):
         n_modules=cfg.n_modules,
         p_module=cfg.p_module,
     )
-    horizon: dict[str, Any] = {}
-    if cfg.closed_system:
-        horizon = closed_system_horizon(cfg, env, station)
-        horizon_minutes = horizon["horizon_minutes"]
-    else:
-        horizon_minutes = cfg.offline_horizon
-    K = math.ceil(round(horizon_minutes / cfg.delta, 9))
-    arrivals, late_ids = _arrivals_inside_horizon(env, cfg.delta, K)
-    inst = _measurement_instance(cfg, env, station, arrivals, horizon_minutes)
-    if cfg.closed_system:
-        expected = _closed_set_ids(env)
-        modelled = {v.id for v in inst.vehicles} | set(inst.discarded)
-        if late_ids or modelled != expected:
-            raise RuntimeError(
-                "closed-system instance does not match the simulated vehicle set: "
-                f"late arrivals {sorted(late_ids)[:10]}, missing "
-                f"{sorted(expected - modelled)[:10]}, extra {sorted(modelled - expected)[:10]}."
-            )
+    horizon = closed_system_horizon(cfg, env, station)
+    horizon_minutes = horizon["horizon_minutes"]
+    inst = _measurement_instance(cfg, env, station, env.engine.metrics.arrived_post_warmup, horizon_minutes)
+    expected = _closed_set_ids(env)
+    modelled = {v.id for v in inst.vehicles} | set(inst.discarded)
+    if modelled != expected:
+        raise RuntimeError(
+            "closed-system instance does not match the simulated vehicle set: missing "
+            f"{sorted(expected - modelled)[:10]}, extra {sorted(modelled - expected)[:10]}."
+        )
     summary = {
-        "horizon_minutes": float(horizon_minutes),
-        "K": int(K),
-        **{k: v for k, v in horizon.items() if k not in ("horizon_minutes", "K")},
+        **horizon,
         "n_vehicles": len(inst.vehicles),
-        "n_dropped_late_arrivals": len(late_ids),
-        "late_arrival_ids": sorted(late_ids),
         "n_optimized": _n_optimized(cfg, inst),
         "n_boundary_vehicles": len(inst.boundary_vehicles),
         "n_discarded": len(inst.discarded),
@@ -733,109 +650,22 @@ def build_instance(cfg: TrialConfig, env: ChargingStationEnv):
 # --------------------------------------------------------------------------- #
 
 
-# Wall clock for one completion-repair solve (see _repair_completion).
-_REPAIR_TIME_LIMIT_S = 120.0
-
-
-def _repair_completion(
-    cfg: TrialConfig, inst, station: StationSpec, horizon_minutes: float, per_vehicle
-):
+def fifo_schedule(cfg: TrialConfig, inst, station: StationSpec, env, horizon_minutes: float):
     """
-    Can a schedule's unfinished vehicles be fully charged without moving it?
-
-    A model with horizon ``K`` is indifferent between a vehicle that charges
-    through the last slot and completes and one that charges through it and
-    does not: both have ``D_j = K`` and the same cost. A solver may return
-    either. This rebuilds the compact model, pins every vehicle's occupancy
-    (``u``) and lane (``y``) to the schedule's, and maximizes the energy the
-    unfinished vehicles end with, leaving power, module routing and
-    sequencing free. Every start and departure is unchanged, so every
-    sojourn -- and the objective -- is too. If all of them reach ``W_j`` the
-    schedule's value belongs to a complete schedule.
-
-    A vehicle the schedule never serves stays unserved (pinned to zero
-    occupancy), so it cannot be repaired here.
-
-    Returns ``(per_vehicle, n_repaired)``: on success a copy of
-    ``per_vehicle`` whose repaired vehicles carry their completed energy;
-    otherwise ``(per_vehicle, 0)`` unchanged.
+    The drained FIFO run rebuilt on the slot grid as a whole-module schedule
+    (``offline_cl_PB.schedule_from_simulation``) at this trial's horizon --
+    the same schedule ``closed_system_horizon`` measured, so it completes
+    every vehicle by ``K``. The starting schedule of DW and the
+    ``"simulation"`` seed of B&P.
     """
-    pv = per_vehicle
-    delivered = pv["energy_kwh"].fillna(0.0) + pv["energy_delivered_before_kwh"].fillna(0.0)
     K = math.ceil(round(horizon_minutes / cfg.delta, 9))
-    fixed = pv["boundary_mode"] == BoundaryMode.FIXED.value
-    unfinished = pv[
-        (delivered < pv["energy_required_kwh"] - COMPLETION_EPS_KWH)
-        & ~(fixed & (pv["departure_slot"] < K - 1e-9))
-    ]
-    if unfinished.empty or not unfinished["served"].all() or fixed[unfinished.index].any():
-        return pv, 0
-
-    cl = build_cl_model(
-        inst.vehicles,
-        station,
-        delta=cfg.delta,
-        horizon_minutes=horizon_minutes,
-        boundary_vehicles=inst.boundary_vehicles,
-        cohorts=inst.cohorts,
-        objective_cohorts=cfg.objective_cohorts,
-        bound_departures=cfg.bound_departures,
+    sched, _counts = schedule_from_simulation(
+        env.engine.metrics.arrived_evs, inst.vehicles, station, cfg.delta, K,
+        inst.boundary_vehicles, warmup_period=env.engine.warmup_period,
     )
-    try:
-        m = cl.model
-        for row in pv.itertuples():
-            j = int(row.vehicle_id)
-            bv = inst.boundary_vehicles.get(j)
-            if bv is not None and bv.mode is BoundaryMode.FIXED:
-                continue  # already pinned by the model itself
-            S, D = int(round(row.start_slot)), int(round(row.departure_slot))
-            for k in range(cl.releases[j], cl.K):
-                on = 1.0 if (row.served and S <= k < D) else 0.0
-                cl.u[j, k].LB = cl.u[j, k].UB = on
-            if row.served:
-                for lane in cl.lanes:
-                    on = 1.0 if lane == (row.pile, row.connector) else 0.0
-                    cl.y[j, lane[0], lane[1]].LB = cl.y[j, lane[0], lane[1]].UB = on
-        ids = [int(j) for j in unfinished["vehicle_id"]]
-        target = sum(cl.vehicles[j].W for j in ids)
-        m.setObjective(gp.quicksum(cl.x[j, cl.K] for j in ids), GRB.MAXIMIZE)
-        m.Params.TimeLimit = _REPAIR_TIME_LIMIT_S
-        m.Params.BestObjStop = target - COMPLETION_EPS_KWH * len(ids)
-        m.optimize()
-        if m.SolCount == 0:
-            return pv, 0
-        final = {j: cl.x[j, cl.K].X for j in ids}
-        if any(final[j] < cl.vehicles[j].W - COMPLETION_EPS_KWH for j in ids):
-            return pv, 0
-    finally:
-        cl.model.dispose()
-
-    repaired = pv.copy()
-    for idx in unfinished.index:
-        repaired.at[idx, "energy_kwh"] = (
-            repaired.at[idx, "energy_required_kwh"] - repaired.at[idx, "energy_delivered_before_kwh"]
-        )
-    return repaired, len(ids)
-
-
-def _completion_groups(cfg: TrialConfig, inst, station, horizon_minutes, per_vehicle, K):
-    """
-    ``_model_groups`` for a model schedule, after ``_repair_completion`` in
-    a closed-system trial. Adds ``n_completion_repaired`` to the diagnostics
-    (0 when nothing needed or could be repaired; absent outside a
-    closed-system trial).
-    """
-    extra: dict[str, Any] = {}
-    if cfg.closed_system:
-        per_vehicle, n = _repair_completion(cfg, inst, station, horizon_minutes, per_vehicle)
-        extra["n_completion_repaired"] = n
-    completed, arrived, diag = _model_groups(per_vehicle, K)
-    return completed, arrived, {**diag, **extra}
-
-
-def _horizon(cfg: TrialConfig, horizon_minutes: float | None) -> float:
-    """The horizon passed in (``build_instance``'s), else ``cfg.offline_horizon``."""
-    return float(horizon_minutes) if horizon_minutes is not None else cfg.offline_horizon
+    if sched is None:
+        raise RuntimeError(f"the discretized FIFO schedule does not fit the horizon K={K}")
+    return sched
 
 
 def run_exact(
@@ -843,24 +673,29 @@ def run_exact(
     inst,
     station: StationSpec,
     *,
-    horizon_minutes: float | None = None,
+    horizon_minutes: float,
     solver_progress: bool = False,
 ) -> dict[str, Any]:
     """
     Build and solve the connector-lane MILP; report incumbent *and* bound.
 
-    ``horizon_minutes`` is ``build_instance``'s ``horizon_minutes`` (required
-    in a closed-system trial; defaults to ``cfg.max_time`` otherwise).
-    ``all_completed`` says whether the incumbent finishes every vehicle --
-    see the module docstring for why that decides whether ``objective`` is a
-    closed-system value.
+    ``horizon_minutes`` is ``build_instance``'s ``horizon_minutes``.
 
     ``objective`` is the solver's incumbent (total sojourn in minutes, an
-    upper bound on the optimum); ``best_bound`` is Gurobi's ``ObjBound`` (a
-    lower bound, same units; ``mean_sojourn_LB`` is it per optimized
-    vehicle), so a time-limited run still brackets the optimum.
-    ``status``/``mip_gap`` say whether the limit was what stopped it --
-    ``mip_gap`` is relative to total sojourn.
+    upper bound on the optimum); ``best_bound`` is Gurobi's ``ObjBound``
+    rounded up to a multiple of ``delta`` (the free tightening; the raw
+    value is ``best_bound_raw``) -- a lower bound, same units;
+    ``mean_sojourn_LB`` is it per optimized vehicle -- so a time-limited run
+    still brackets the optimum. ``status``/``mip_gap`` say whether the limit
+    was what stopped it -- ``mip_gap`` is relative to total sojourn.
+
+    ``cfg.exact_tolerance_min`` (``x``, mean-sojourn minutes) becomes a
+    total-sojourn tolerance ``x * n_optimized`` (``tolerance_used``); the
+    solve stops once the incumbent is proven that close. ``mean_gap_min``
+    is ``(objective - best_bound) / n_optimized``, the proven distance from
+    the optimum in mean-sojourn minutes, and ``within_tolerance`` says
+    whether it is within ``x`` (with no tolerance: whether optimality was
+    proven).
 
     ``solver_progress=True`` turns on Gurobi's own solve log (branch-and-bound
     node counts, incumbent/bound as they improve) -- see ``run_trial``'s
@@ -878,7 +713,7 @@ def _solve_exact(
     inst,
     station: StationSpec,
     *,
-    horizon_minutes: float | None = None,
+    horizon_minutes: float,
     solver_progress: bool,
 ):
     """``run_exact``'s work; also returns the solved model (for seeding B&P)."""
@@ -887,19 +722,22 @@ def _solve_exact(
         inst.vehicles,
         station,
         delta=cfg.delta,
-        horizon_minutes=_horizon(cfg, horizon_minutes),
+        horizon_minutes=horizon_minutes,
         boundary_vehicles=inst.boundary_vehicles,
         cohorts=inst.cohorts,
         objective_cohorts=cfg.objective_cohorts,
         break_symmetry=cfg.break_symmetry,
-        bound_departures=cfg.bound_departures,
         tie_break=cfg.tie_break,
     )
     build_s = time.perf_counter() - t0
 
+    n_opt = _n_optimized(cfg, inst)
+    tolerance = cfg.exact_tolerance_min * n_opt if cfg.exact_tolerance_min is not None else None
+
     t1 = time.perf_counter()
     solve_cl_model(
-        cl, mip_gap=cfg.mip_gap, time_limit=cfg.time_limit, verbose=solver_progress
+        cl, mip_gap=cfg.mip_gap, time_limit=cfg.time_limit, tolerance=tolerance,
+        verbose=solver_progress,
     )
     solve_s = time.perf_counter() - t1
 
@@ -907,18 +745,19 @@ def _solve_exact(
     # ObjBound is unavailable once a tie-break objective is set (Gurobi
     # raises), the same reason extract_solution reports mip_gap as nan there.
     try:
-        best_bound = float(cl.model.ObjBound)
+        best_bound_raw = float(cl.model.ObjBound)
     except Exception:
-        best_bound = NAN
+        best_bound_raw = NAN
+    best_bound = sol.best_bound  # rounded up to a multiple of delta
 
-    completed, arrived, diag = _completion_groups(
-        cfg, inst, station, _horizon(cfg, horizon_minutes), sol.per_vehicle, sol.K
-    )
+    completed, arrived, diag = _model_groups(sol.per_vehicle, sol.K)
     row = {
         "status": sol.status,
         "objective": sol.objective,  # incumbent total sojourn, minutes
-        "best_bound": best_bound,  # solver's own lower bound, minutes
+        "best_bound": best_bound,  # proven lower bound, rounded up to a multiple of delta, minutes
+        "best_bound_raw": best_bound_raw,  # Gurobi's ObjBound as reported
         "mip_gap_achieved": sol.mip_gap,  # relative to total sojourn
+        **_tolerance_report(sol.objective, best_bound, n_opt, cfg.exact_tolerance_min),
         "total_sojourn": sol.total_sojourn,
         "mean_sojourn": sol.mean_sojourn,
         "mean_sojourn_LB": best_bound / sol.n_optimized if sol.n_optimized else NAN,
@@ -936,6 +775,22 @@ def _solve_exact(
     return row, cl
 
 
+def _tolerance_report(objective: float, bound: float, n_opt: int, tolerance_min: float | None) -> dict[str, Any]:
+    """
+    ``tolerance_used`` (total-sojourn minutes, ``nan`` without a tolerance),
+    ``mean_gap_min`` (proven distance from the optimum, mean-sojourn
+    minutes) and ``within_tolerance`` (that distance is within the
+    tolerance; with none, that optimality was proven).
+    """
+    gap = (objective - bound) / n_opt if n_opt and math.isfinite(bound) else NAN
+    allowed = tolerance_min if tolerance_min is not None else 0.0
+    return {
+        "tolerance_used": tolerance_min * n_opt if tolerance_min is not None else NAN,
+        "mean_gap_min": gap,
+        "within_tolerance": bool(math.isfinite(gap) and gap <= allowed + 1e-9),
+    }
+
+
 # --------------------------------------------------------------------------- #
 # Stage 4 -- branch-and-price (the exact model, solved by offline_cl_PB)
 # --------------------------------------------------------------------------- #
@@ -944,7 +799,7 @@ BP_INITIAL_SCHEDULES = ("simulation", "exact", "both", "none")
 
 
 def _bp_seed(
-    cfg: TrialConfig, inst, station: StationSpec, env, exact_model, horizon_minutes: float | None = None
+    cfg: TrialConfig, inst, station: StationSpec, env, exact_model, horizon_minutes: float
 ) -> tuple[dict | None, str, float]:
     """
     The initial incumbent for B&P, per ``cfg.bp_initial_schedule``.
@@ -957,15 +812,11 @@ def _bp_seed(
     choice = cfg.bp_initial_schedule
     if choice not in BP_INITIAL_SCHEDULES:
         raise ValueError(f"bp_initial_schedule must be one of {BP_INITIAL_SCHEDULES}, got {choice!r}")
-    K = math.ceil(round(_horizon(cfg, horizon_minutes) / cfg.delta, 9))
+    K = math.ceil(round(horizon_minutes / cfg.delta, 9))
     weights = _objective_weights(cfg, inst)
     candidates: list[tuple[str, dict]] = []
     if choice in ("simulation", "both"):
-        sched, _counts = schedule_from_simulation(
-            env.engine.metrics.arrived_evs, inst.vehicles, station, cfg.delta, K,
-            inst.boundary_vehicles, warmup_period=env.engine.warmup_period,
-        )
-        candidates.append(("simulation", sched))
+        candidates.append(("simulation", fifo_schedule(cfg, inst, station, env, horizon_minutes)))
     if choice in ("exact", "both") and exact_model is not None and exact_model.model.SolCount > 0:
         sched, _conns = schedule_from_compact(exact_model)
         candidates.append(("exact", sched))
@@ -997,10 +848,7 @@ def _bp_bound_history(sol, offset_s: float) -> list[dict[str, Any]]:
     lower bound of ``-inf`` (before the root is first priced) is stored as
     NaN.
 
-    These bracket the optimum of the horizon-``K`` model. In a
-    closed-system trial ``lower_bound`` also bounds the closed-system
-    optimum; ``upper_bound`` does only when that incumbent completes every
-    vehicle (checked for the final one: ``bp_all_completed``).
+    These bracket the optimum of the horizon-``K`` closed-system model.
     """
     n = sol.n_optimized
     rows = []
@@ -1031,20 +879,24 @@ def run_bp(
     env: ChargingStationEnv,
     *,
     exact_model=None,
-    horizon_minutes: float | None = None,
+    horizon_minutes: float,
     solver_progress: bool = False,
 ) -> dict[str, Any]:
     """
     Solve the exact whole-module model by branch-and-price (``offline_cl_PB``).
 
-    ``horizon_minutes`` and ``all_completed``: as in ``run_exact``.
+    ``horizon_minutes``: as in ``run_exact``.
 
     ``objective`` is the best schedule found (total sojourn in minutes, an
     upper bound on the optimum) and ``best_bound`` a proven lower bound, so a
     time-limited run still brackets the optimum -- the same two fields
-    ``run_exact`` reports, for the same model. ``status`` is ``OPTIMAL``
-    when they coincide, else ``TIME_LIMIT``. ``root_lower_bound`` is the
-    root node's bound (the whole-module Dantzig-Wolfe bound).
+    ``run_exact`` reports, for the same model. ``best_bound`` is rounded up
+    to a multiple of ``delta`` (the free tightening). ``status`` is
+    ``OPTIMAL`` when they coincide, ``WITHIN_TOLERANCE`` when
+    ``cfg.bp_tolerance_min`` stopped it early with the bracket inside the
+    tolerance, else ``TIME_LIMIT``. ``tolerance_used``, ``mean_gap_min``
+    and ``within_tolerance`` are as in ``run_exact``. ``root_lower_bound``
+    is the root node's bound (the whole-module Dantzig-Wolfe bound).
 
     The initial incumbent comes from ``cfg.bp_initial_schedule`` (see
     ``TrialConfig``); ``seed_source``/``seed_objective`` record which one
@@ -1059,9 +911,10 @@ def run_bp(
     ``solver_progress=True`` prints B&P's own per-node log.
     """
     t0 = time.perf_counter()
-    horizon = _horizon(cfg, horizon_minutes)
+    horizon = horizon_minutes
     seed, seed_source, seed_objective = _bp_seed(cfg, inst, station, env, exact_model, horizon)
     seed_s = time.perf_counter() - t0
+    n_opt = _n_optimized(cfg, inst)
     sol = BranchAndPrice(
         inst.vehicles,
         station,
@@ -1072,10 +925,11 @@ def run_bp(
         objective_cohorts=cfg.objective_cohorts,
         initial_schedule=seed,
         time_limit=cfg.bp_time_limit,
+        gap_abs=cfg.bp_tolerance_min * n_opt if cfg.bp_tolerance_min is not None else 0.0,
         progress=solver_progress,
     ).solve()
     elapsed = time.perf_counter() - t0
-    completed, arrived, diag = _completion_groups(cfg, inst, station, horizon, sol.per_vehicle, sol.K)
+    completed, arrived, diag = _model_groups(sol.per_vehicle, sol.K)
     return {
         "status": sol.status,
         "bound_history": _bp_bound_history(sol, seed_s),
@@ -1083,6 +937,7 @@ def run_bp(
         "best_bound": sol.lower_bound,  # proven lower bound, minutes
         "gap": sol.gap,  # objective - best_bound (0 when OPTIMAL)
         "rel_gap": sol.gap / sol.objective if sol.objective else NAN,  # relative to total sojourn
+        **_tolerance_report(sol.objective, sol.lower_bound, n_opt, cfg.bp_tolerance_min),
         "root_lower_bound": sol.root_lower_bound,
         "total_sojourn": sol.total_sojourn,
         "mean_sojourn": sol.mean_sojourn,
@@ -1134,15 +989,16 @@ def run_dw(
     inst,
     station: StationSpec,
     *,
-    horizon_minutes: float | None = None,
+    horizon_minutes: float,
+    initial_schedule: dict | None = None,
     solver_progress: bool = False,
 ) -> dict[str, Any]:
     """
     Run the decomposition and report the whole bound family.
 
-    ``horizon_minutes``: as in ``run_exact``. ``LB`` is a valid lower bound
-    on the closed-system optimum whatever the horizon; a price-and-branch
-    ``UB`` is the closed-system value only when ``all_completed``.
+    ``horizon_minutes``: as in ``run_exact``. ``initial_schedule`` is the
+    complete schedule column generation starts from (``fifo_schedule`` in a
+    trial); ``None`` lets DW build one by list scheduling.
 
     ``LB`` is the certified anytime Lagrangian bound (valid even when column
     generation did not converge); ``z_rmp`` is the final restricted-master LP
@@ -1173,7 +1029,8 @@ def run_dw(
         inst.vehicles,
         station,
         delta=cfg.delta,
-        horizon_minutes=_horizon(cfg, horizon_minutes),
+        horizon_minutes=horizon_minutes,
+        initial_schedule=initial_schedule,
         boundary_vehicles=inst.boundary_vehicles,
         cohorts=inst.cohorts,
         objective_cohorts=cfg.objective_cohorts,
@@ -1187,12 +1044,12 @@ def run_dw(
     )
     elapsed = time.perf_counter() - t0
 
+    dw_lb = lattice_round_up(sol.LB, cfg.delta)
+
     # Only price-and-branch produces a schedule to split into groups.
     dw_completed = dw_arrived = dw_diag = None
     if cfg.solve_integer_ub:
-        dw_completed, dw_arrived, dw_diag = _completion_groups(
-            cfg, inst, station, _horizon(cfg, horizon_minutes), sol.per_vehicle, sol.K
-        )
+        dw_completed, dw_arrived, dw_diag = _model_groups(sol.per_vehicle, sol.K)
 
     return {
         "status": _dw_status(cfg, cg, elapsed),
@@ -1200,14 +1057,17 @@ def run_dw(
         "iterations": sol.iterations,
         "columns_purged": sol.columns_purged,
         "gap_tolerance_used": gap_tolerance,  # minutes of total sojourn, whichever mode set it
-        # Lower bounds, objective units (total sojourn, minutes).
-        "LB": sol.LB,
+        # Lower bounds, objective units (total sojourn, minutes). LB is
+        # rounded up to a multiple of delta (the free tightening: every
+        # schedule's objective is one); LB_raw is column generation's own.
+        "LB": dw_lb,
+        "LB_raw": sol.LB,
         "z_rmp": sol.LB + sol.rmp_gap,  # final restricted-master LP value
         "rmp_gap": sol.rmp_gap,
         "sojourn_floor": cg.sojourn_floor,  # cheap sanity floor
         # The same lower bound per optimized vehicle.
-        "total_sojourn_LB": sol.total_sojourn_LB,
-        "mean_sojourn_LB": sol.mean_sojourn_LB,
+        "total_sojourn_LB": dw_lb,
+        "mean_sojourn_LB": dw_lb / sol.n_optimized if sol.n_optimized else NAN,
         # Upper-bound side: nan unless price-and-branch ran.
         "UB": sol.UB,
         "gap": sol.gap,
@@ -1227,74 +1087,6 @@ def run_dw(
         **(dw_diag or {}),
         "completed_by_cohort": dw_completed,
         "arrived_by_cohort": dw_arrived,
-    }
-
-
-# --------------------------------------------------------------------------- #
-# The closed-system bracket
-# --------------------------------------------------------------------------- #
-
-
-def _usable(stage: dict[str, Any] | None) -> bool:
-    return stage is not None and "error" not in stage
-
-
-def closed_system_bracket(result: TrialResult) -> dict[str, Any]:
-    """
-    What a closed-system trial proves about the closed-system optimum ``z*``.
-
-    Lower bound: the largest of the models' lower bounds -- ``exact``'s
-    ``best_bound``, ``bp``'s ``best_bound``, ``dw``'s ``LB``. Each is a valid
-    lower bound on ``z*`` whatever the horizon (see the module docstring).
-
-    Upper bound: the smallest value of a schedule that completes every
-    vehicle -- ``exact``/``bp``'s ``objective`` and ``dw``'s ``UB`` when that
-    stage's schedule has ``all_completed`` (and, for DW, is whole-module
-    feasible), plus the feasible discretized FIFO schedule from
-    ``closed_system_horizon``, which always completes everyone. A schedule
-    with an unfinished vehicle is left out: its value is no upper bound.
-
-    ``proven_optimal`` is ``upper - lower <= 1e-6``. Totals are minutes of
-    total sojourn over ``objective_cohorts`` (every vehicle, in a
-    closed-system trial); ``mean_sojourn_LB``/``_UB`` divide by
-    ``n_optimized``. ``*_source`` names the stage each bound came from.
-    """
-    lowers: list[tuple[float, str]] = []
-    uppers: list[tuple[float, str]] = []
-    exact, bp, dw = result.exact, result.bp, result.dw
-    if exact is not None and _usable(exact):
-        if math.isfinite(exact["best_bound"]):
-            lowers.append((exact["best_bound"], "exact"))
-        if exact["all_completed"]:
-            uppers.append((exact["objective"], "exact"))
-    if bp is not None and _usable(bp):
-        if math.isfinite(bp["best_bound"]):
-            lowers.append((bp["best_bound"], "bp"))
-        if bp["all_completed"]:
-            uppers.append((bp["objective"], "bp"))
-    if dw is not None and _usable(dw):
-        if math.isfinite(dw["LB"]):
-            lowers.append((dw["LB"], "dw"))
-        if dw.get("all_completed") and dw.get("whole_module_feasible"):
-            uppers.append((dw["UB"], "dw"))
-    fifo = result.instance.get("feasible_fifo_total_sojourn")
-    if fifo is not None and math.isfinite(fifo):
-        uppers.append((fifo, "feasible_fifo"))
-
-    lb, lb_src = max(lowers) if lowers else (NAN, "none")
-    ub, ub_src = min(uppers) if uppers else (NAN, "none")
-    n = result.instance.get("n_optimized") or 0
-    gap = ub - lb
-    return {
-        "lower_bound": lb,
-        "lower_bound_source": lb_src,
-        "upper_bound": ub,
-        "upper_bound_source": ub_src,
-        "gap": gap,
-        "rel_gap": gap / ub if ub else NAN,
-        "proven_optimal": bool(math.isfinite(gap) and gap <= 1e-6),
-        "mean_sojourn_LB": lb / n if n else NAN,
-        "mean_sojourn_UB": ub / n if n else NAN,
     }
 
 
@@ -1338,10 +1130,10 @@ def run_trial(
     for every trial.
 
     A solve that raises is recorded as ``{"error": ...}`` on its stage and
-    the trial still returns, so one infeasible point cannot abort a sweep.
-    Building the instance is not a solve: a closed-system trial whose
-    vehicle set cannot be matched (e.g. a full queue turned vehicles away)
-    raises, since every number it produced would compare different sets.
+    the trial still returns, so one failed point cannot abort a sweep.
+    Building the instance is not a solve: a trial whose vehicle set cannot
+    be matched (e.g. a full queue turned vehicles away) raises, since every
+    number it produced would compare different sets.
     """
     env, sim_runtime, arrivals = run_episode(cfg)
     result = TrialResult(config=cfg, counts=episode_counts(env), arrivals=arrivals)
@@ -1350,31 +1142,29 @@ def run_trial(
     result.counts["sim_runtime_s"] = sim_runtime
 
     # Built up front (cheap, no solver) even when only the sim is reported:
-    # its late-arrival exclusion set is what keeps the sim's `arrived` group
-    # over the same population the models would be given.
+    # it checks that the models and the simulation share one vehicle set and
+    # records the horizon.
     inst, station, result.instance = build_instance(cfg, env)
-    late_ids = set(result.instance.get("late_arrival_ids", ()))
     horizon = result.instance["horizon_minutes"]
 
     if run_sim:
-        sim, grid = simulation_metrics(env, cfg.delta, exclude_ids=late_ids)
-        result.sim = {"runtime_s": sim_runtime, **sim}
+        sim, grid = simulation_metrics(env, cfg.delta)
+        # Station load over the measured phase (see metrics/README.md): its
+        # keys become sim_* columns in results.csv.
+        load = station_load(env, since=float(env.engine.warmup_period), mean_interarrival=cfg.effective_mean_interarrival)
+        result.sim = {"runtime_s": sim_runtime, **load, **sim}
         result.grid = dict(grid)
 
     if not (run_exact_model or run_bp_model or run_dw_model):
-        if cfg.closed_system:
-            result.closed = closed_system_bracket(result)
         return result
 
     if verbose:
-        drain = ""
-        if cfg.closed_system:
-            drain = (
-                f", drained {result.counts['drain_minutes']:.1f} min past T, "
-                f"K={result.instance['K']} (grid FIFO {result.instance['K_grid_fifo']}, "
-                f"feasible FIFO {result.instance['K_feasible_fifo']}, "
-                f"slack {cfg.horizon_slack:g})"
-            )
+        drain = (
+            f", drained {result.counts['drain_minutes']:.1f} min past T, "
+            f"K={result.instance['K']} (grid FIFO {result.instance['K_grid_fifo']}, "
+            f"feasible FIFO {result.instance['K_feasible_fifo']}, "
+            f"slack {cfg.horizon_slack:g})"
+        )
         print(
             f"  instance: J={result.instance['n_vehicles']} "
             f"({result.instance['cohort_sizes']}), "
@@ -1402,11 +1192,18 @@ def run_trial(
             horizon_minutes=horizon_minutes, solver_progress=solver_progress,
         )
 
+    def solve_dw(cfg, inst, station, *, horizon_minutes, solver_progress):
+        return run_dw(
+            cfg, inst, station, horizon_minutes=horizon_minutes,
+            initial_schedule=fifo_schedule(cfg, inst, station, env, horizon_minutes),
+            solver_progress=solver_progress,
+        )
+
     try:
         for enabled, name, fn in (
             (run_exact_model, "exact", solve_exact),
             (run_bp_model, "bp", solve_bp),
-            (run_dw_model, "dw", run_dw),
+            (run_dw_model, "dw", solve_dw),
         ):
             if not enabled:
                 continue
@@ -1426,16 +1223,6 @@ def run_trial(
     finally:
         if exact_model is not None:
             exact_model.model.dispose()
-
-    if cfg.closed_system:
-        result.closed = c = closed_system_bracket(result)
-        if verbose:
-            print(
-                f"  closed system: z* in [{c['lower_bound']:.2f} ({c['lower_bound_source']}), "
-                f"{c['upper_bound']:.2f} ({c['upper_bound_source']})], mean sojourn in "
-                f"[{c['mean_sojourn_LB']:.3f}, {c['mean_sojourn_UB']:.3f}] min"
-                + (" -- proven optimal" if c["proven_optimal"] else "")
-            )
     return result
 
 
@@ -1443,18 +1230,7 @@ def _stage_line(stage: dict[str, Any]) -> str:
     """One-line progress summary for a finished stage."""
     if "error" in stage:
         return f"FAILED {stage['error']}"
-    return _stage_summary(stage) + _censoring_note(stage)
-
-
-def _censoring_note(stage: dict[str, Any]) -> str:
-    """Flag a schedule that leaves vehicles unfinished at the horizon."""
-    n = stage.get("n_censored")
-    if not n:
-        return ""
-    return (
-        f" -- note: this schedule leaves {n} vehicle(s) unfinished at K, so its value "
-        "is not a closed-system upper bound (its lower bound still is)"
-    )
+    return _stage_summary(stage)
 
 
 def _stage_summary(stage: dict[str, Any]) -> str:
