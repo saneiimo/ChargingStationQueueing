@@ -11,7 +11,7 @@ import pandas as pd
 from gurobipy import GRB
 
 from .boundary import Cohort, cohort_totals
-from .model import ConnectorLaneModel, sojourn_minutes
+from .model import ConnectorLaneModel, lattice_round_up, sojourn_minutes
 
 _STATUS_NAMES = {
     getattr(GRB, name): name
@@ -37,10 +37,15 @@ class ConnectorLaneSolution:
     each mapping to ``{"n", "total_sojourn", "mean_sojourn"}``. These come
     from summing per-vehicle sojourns, since the objective only covers
     ``objective_cohorts``.
+
+    ``best_bound`` is Gurobi's proven lower bound on ``objective``
+    (``ObjBound``) rounded up to the next multiple of ``delta`` -- the free
+    tightening, valid because every attainable objective value is one (see
+    ``offline_cl_opt.model``, "Objective"). ``nan`` with ``tie_break``.
     """
 
     status: str
-    objective: float  # total sojourn sum_j (delta*D_j - a_j) over objective_cohorts, minutes
+    objective: float  # total sojourn sum_j delta*(D_j - k_j) over objective_cohorts, minutes
     total_sojourn: float  # == objective
     mean_sojourn: float  # total_sojourn / n_optimized, minutes
     mip_gap: float
@@ -53,6 +58,7 @@ class ConnectorLaneSolution:
     per_vehicle: pd.DataFrame  # vehicle_id, cohort, boundary_mode, in_objective,
     # arrival, served, pile, connector, start_slot, departure_slot, sojourn_min,
     # energy_kwh, energy_delivered_before_kwh, energy_required_kwh
+    best_bound: float = float("nan")  # lattice-rounded ObjBound, minutes
 
 
 def extract_solution(cl_model: ConnectorLaneModel) -> ConnectorLaneSolution:
@@ -63,12 +69,10 @@ def extract_solution(cl_model: ConnectorLaneModel) -> ConnectorLaneSolution:
     ``start_slot`` / ``departure_slot`` are read straight off ``S[j]`` /
     ``D[j]`` -- dependent linear expressions, evaluated via ``getValue()``
     since they were never materialised as Gurobi variables (see
-    ``ConnectorLaneModel``'s docstring). A vehicle with ``served=False``
-    (Section 6.3: never plugged in within the horizon) has
-    ``start_slot = departure_slot = K``; its nominal lane assignment from
-    (10) is not reported (``pile``/``connector`` are ``None``), since the
-    source document notes that assignment has no physical meaning for an
-    unserved vehicle.
+    ``ConnectorLaneModel``'s docstring). The model is a closed system, so
+    every vehicle is served (``served`` is always True, kept as a column so
+    the table matches the other packages') and receives its full energy
+    by ``departure_slot <= K``.
 
     ``objective`` and ``mip_gap`` need to account for ``cl_model.tie_break``:
     with two objectives set, plain ``model.ObjVal`` reports the *last*
@@ -137,9 +141,13 @@ def extract_solution(cl_model: ConnectorLaneModel) -> ConnectorLaneSolution:
         m.Params.ObjNumber = 0
         objective = float(m.ObjNVal)
         mip_gap = float("nan")
+        best_bound = float("nan")
     else:
         objective = float(m.ObjVal)
         mip_gap = float(m.MIPGap) if m.IsMIP else 0.0
+        best_bound = (
+            min(objective, lattice_round_up(float(m.ObjBound), delta)) if m.IsMIP else objective
+        )
 
     # The objective is total sojourn over exactly the `optimized` vehicles.
     total_sojourn = objective
@@ -160,4 +168,5 @@ def extract_solution(cl_model: ConnectorLaneModel) -> ConnectorLaneSolution:
         K=K,
         by_cohort=by_cohort,
         per_vehicle=per_vehicle,
+        best_bound=best_bound,
     )

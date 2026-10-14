@@ -120,7 +120,7 @@ class PBMaster:
 
     # ------------------------------------------------------------------ #
     def column_cost(self, plan: PBPlan) -> float:
-        """``w_j * (delta*D - a_j)``: the vehicle's sojourn in minutes (0 outside the objective)."""
+        """``w_j * delta*(D - k_j)``: the vehicle's sojourn in minutes (0 outside the objective)."""
         j = plan.vehicle_id
         return self.weights[j] * sojourn_minutes(plan.departure, self.arrivals[j], self.delta)
 
@@ -131,14 +131,13 @@ class PBMaster:
             return self.by_key[key], False
         col = gp.Column()
         col.addTerms(1.0, self.convexity[plan.vehicle_id])
-        if not plan.is_null:
-            for k in plan.occupied_slots():
-                if (plan.pile, k) not in self.connector_rows:
-                    raise ValueError(f"Column for vehicle {plan.vehicle_id} occupies slot {k} outside [k_lo, K).")
-                col.addTerms(1.0, self.connector_rows[plan.pile, k])
-                q = plan.q(k)
-                if q:
-                    col.addTerms(float(q), self.module_rows[plan.pile, k])
+        for k in plan.occupied_slots():
+            if (plan.pile, k) not in self.connector_rows:
+                raise ValueError(f"Column for vehicle {plan.vehicle_id} occupies slot {k} outside [k_lo, K).")
+            col.addTerms(1.0, self.connector_rows[plan.pile, k])
+            q = plan.q(k)
+            if q:
+                col.addTerms(float(q), self.module_rows[plan.pile, k])
         obj = self.column_cost(plan) if self.phase == 2 else 0.0
         var = self.model.addVar(lb=0.0, ub=ACTIVE_UB if active else 0.0, obj=obj, column=col, name=f"lambda[{plan.vehicle_id}]")
         index = len(self.columns)
@@ -162,7 +161,7 @@ class PBMaster:
         self.columns[index].var.UB = ACTIVE_UB if active else 0.0
 
     def set_phase(self, phase: int) -> None:
-        """Phase 1: minimise the artificial total. Phase 2: minimise total sojourn sum_j w_j (delta*D_j - a_j)."""
+        """Phase 1: minimise the artificial total. Phase 2: minimise total sojourn sum_j w_j delta*(D_j - k_j)."""
         if phase not in (1, 2):
             raise ValueError(phase)
         self.model.update()

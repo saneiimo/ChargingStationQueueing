@@ -6,14 +6,9 @@ Every restriction is on an attribute of the *plan itself* (departure,
 start, pile, a slot's module count), never on a master variable, so the
 same restriction can be (a) tested against any stored column
 (``NodeRestrictions.column_satisfies``) and (b) imposed inside that
-vehicle's pricing MILP (``pricer.PBPricer.apply``). Together (a) and (b)
-make the pricer's feasible set, plus the closed-form null plan, exactly the
-set of columns the node allows.
-
-Null-plan semantics (the censoring convention): ``S = D = K``, no pile, and
-``q_k = 0`` in every slot. So the null plan satisfies a restriction iff
-``K`` is inside both the departure and start ranges, no pile is required,
-and no slot has a positive module lower bound.
+vehicle's pricers (``pricer.PBPricer.apply``, ``labeling.LabelingPricer.apply``).
+Together (a) and (b) make the pricers' feasible sets exactly the set of
+columns the node allows.
 """
 
 from __future__ import annotations
@@ -43,16 +38,12 @@ class VehicleRestriction:
         return (lo is None or value >= lo) and (hi is None or value <= hi)
 
     def satisfied_by(self, plan: PBPlan, K: int) -> bool:
-        """Whether ``plan`` meets every restriction (null plan: S = D = K, q = 0)."""
-        start = plan.start_slot(K)
+        """Whether ``plan`` meets every restriction."""
         if not self._in_range(plan.departure, self.d_min, self.d_max):
             return False
-        if not self._in_range(start, self.s_min, self.s_max):
+        if not self._in_range(plan.start, self.s_min, self.s_max):
             return False
-        if plan.is_null:
-            if self.pile_only is not None:
-                return False
-        elif not self.allows_pile(plan.pile):  # type: ignore[arg-type]
+        if not self.allows_pile(plan.pile):
             return False
         for k, lo in self.q_min.items():
             if plan.q(k) < lo:
@@ -61,11 +52,6 @@ class VehicleRestriction:
             if plan.q(k) > hi:
                 return False
         return True
-
-    def allows_null(self, K: int, vehicle_id: int = -1) -> bool:
-        from .columns import null_pb_plan
-
-        return self.satisfied_by(null_pb_plan(vehicle_id, K), K)
 
     # --- tightening (each returns a new, stricter restriction) --------------
     def with_d_max(self, t: int) -> "VehicleRestriction":

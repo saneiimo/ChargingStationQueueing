@@ -20,6 +20,14 @@ column count -- and hence every subsequent ``solve_lp``'s size -- only ever
 grows across a column generation run unless something periodically sweeps
 it. See that function's own docstring for the removal rule and, in
 particular, why it also clears the removed column's ``seen_keys`` entry.
+
+Feasibility. The compact model is a closed system (every vehicle served and
+complete), so there is no "never served" column to fall back on. The master
+is built around one complete starting schedule (``build_master``'s
+``initial_schedule``, one column per vehicle that jointly satisfy every
+capacity row); those columns are never purged, so the restricted master LP
+and the integer master (``solve_integer``) are feasible from the first
+iteration to the last.
 """
 
 from __future__ import annotations
@@ -50,7 +58,7 @@ class RestrictedMaster:
     module_cap: dict[tuple[int, int], gp.Constr]  # (pile, k) -> row (26)
     convexity: dict[int, gp.Constr]  # vehicle_id -> row (27)
     # vehicle_id -> a_j (minutes): a column's cost is its sojourn
-    # delta*D_omega - a_j (see column_cost).
+    # delta*(D_omega - k_j) (see column_cost).
     arrivals: dict[int, float] = field(default_factory=dict)
     # Vehicles whose sojourn carries objective weight. Everyone else's
     # columns are added with coefficient 0: they still occupy connectors
@@ -63,14 +71,14 @@ class RestrictedMaster:
     # cycling, not a harmless waste, so add_column silently skips it
     # rather than growing the master with redundant variables.
     seen_keys: dict[int, set[tuple]] = field(default_factory=dict)
+    # (vehicle_id, key) of the starting schedule's columns (build_master's
+    # initial_schedule), never purged: together they are a feasible point of
+    # every restricted master, LP or integer.
+    protected_keys: set[tuple[int, tuple]] = field(default_factory=set)
 
 
 def _column_key(plan: Plan, ndigits: int = 3) -> tuple:
-    """Section 8.3: ``(pile, start, departure, rounded power profile)`` --
-    the null plan's key is simply ``(None, None, K)`` (it's the same
-    column for every vehicle by construction)."""
-    if plan.is_null:
-        return (None, None, plan.departure)
+    """Section 8.3: ``(pile, start, departure, rounded power profile)``."""
     power_key = tuple(sorted((k, round(p, ndigits)) for k, p in plan.power.items() if p > 1e-9))
     return (plan.pile, plan.start, plan.departure, power_key)
 
@@ -97,23 +105,29 @@ def build_master(
     k_lo: int,
     initial_columns: dict[int, list[Plan]],
     *,
+    initial_schedule: dict[int, Plan],
     arrivals: dict[int, float],
     objective_ids: set[int] | None = None,
     conservative_modules: bool = False,
     model_name: str = "connector_lane_dw_master",
 ) -> RestrictedMaster:
     """
-    Build the restricted master LP with ``initial_columns`` (must include
-    at least one column per vehicle, so the convexity row (27) has
-    something to be feasible with from iteration one -- see
-    ``preprocess.seed_columns`` for ordinary vehicles, which always
-    includes the null plan, and ``preprocess.boundary_seed_plan``/
-    ``fixed_plan`` for boundary vehicles, which never get a null plan --
-    see ``colgen.run_column_generation``'s own docstring, "Boundary
-    conditions") and no others; column generation adds the rest.
+    Build the restricted master LP with ``initial_schedule`` plus
+    ``initial_columns`` and no others; column generation adds the rest.
+
+    ``initial_schedule``: ``{vehicle_id: Plan}``, one complete plan for
+    every vehicle, jointly feasible for rows (25)/(26) -- e.g.
+    ``preprocess.initial_schedule``. It is what makes the restricted master
+    feasible from iteration one (the closed system has no "never served"
+    column), and its columns are protected from ``purge_columns`` so it
+    stays feasible. Raises ``ValueError`` if a vehicle is missing or the
+    schedule overfills a connector or module row.
+
+    ``initial_columns``: extra starting columns (``{vehicle_id: [Plan]}``,
+    e.g. ``preprocess.seed_columns``); they need not fit together.
 
     ``arrivals``: ``{vehicle_id: a_j}`` in minutes, for every vehicle. The
-    master minimizes total sojourn: a column costs ``delta*D_omega - a_j``
+    master minimizes total sojourn: a column costs ``delta*(D_omega - k_j)``
     (``column_cost``), the same per-vehicle cost as
     ``offline_cl_opt.model.build_cl_model``'s objective.
 
@@ -154,9 +168,8 @@ def build_master(
 
     convexity: dict[int, gp.Constr] = {}
     for j in vehicle_ids:
-        # (27): exactly one plan per vehicle. Built as == 0 initially (no
-        # columns yet) and satisfied as soon as the null plan is added
-        # below via add_column, which is required for every vehicle.
+        # (27): exactly one plan per vehicle. Built with no columns yet;
+        # the initial schedule below gives every vehicle its first one.
         convexity[j] = m.addConstr(gp.LinExpr(0.0) == 1, name=f"convexity[{j}]")
 
     rm = RestrictedMaster(
@@ -175,20 +188,40 @@ def build_master(
         seen_keys={j: set() for j in vehicle_ids},
     )
 
+    missing = [j for j in vehicle_ids if j not in initial_schedule]
+    if missing:
+        raise ValueError(
+            f"initial_schedule has no plan for vehicles {missing[:10]} -- it must give every "
+            "vehicle one complete plan (see preprocess.initial_schedule)."
+        )
+    _check_joint_capacity([initial_schedule[j] for j in vehicle_ids], station, module_rhs)
+    for j in vehicle_ids:
+        plan = initial_schedule[j]
+        add_column(rm, plan)
+        rm.protected_keys.add((j, _column_key(plan)))
     for j, plans in initial_columns.items():
         for plan in plans:
             add_column(rm, plan)
 
-    missing = [j for j in vehicle_ids if not rm.columns.get(j)]
-    if missing:
-        raise ValueError(
-            f"initial_columns must include at least one column for every vehicle -- missing "
-            f"for {missing}. Use preprocess.seed_columns for ordinary vehicles (guarantees the "
-            "null plan) and preprocess.boundary_seed_plan/fixed_plan for boundary vehicles."
-        )
-
     m.update()
     return rm
+
+
+def _check_joint_capacity(plans: list[Plan], station: StationSpec, module_rhs: float) -> None:
+    """Raise ``ValueError`` unless ``plans`` together satisfy every row (25)/(26)."""
+    count: dict[tuple[int, int], int] = {}
+    power: dict[tuple[int, int], float] = {}
+    for plan in plans:
+        for k in plan.occupied_slots():
+            count[plan.pile, k] = count.get((plan.pile, k), 0) + 1
+            power[plan.pile, k] = power.get((plan.pile, k), 0.0) + plan.power.get(k, 0.0)
+    over_c = [key for key, c in count.items() if c > station.n_connectors]
+    over_p = [key for key, p in power.items() if p > module_rhs + 1e-6]
+    if over_c or over_p:
+        raise ValueError(
+            "initial_schedule is not jointly feasible: connector rows (25) overfilled at "
+            f"{sorted(over_c)[:5]}, module rows (26) at {sorted(over_p)[:5]} (pile, slot)."
+        )
 
 
 def add_column(rm: RestrictedMaster, plan: Plan) -> gp.Var | None:
@@ -213,15 +246,12 @@ def add_column(rm: RestrictedMaster, plan: Plan) -> gp.Var | None:
 
     col = gp.Column()
     col.addTerms(1.0, rm.convexity[j])  # (27): this plan counts toward vehicle j's total
-    if not plan.is_null:
-        pile = plan.pile
-        assert pile is not None  # guaranteed by `not plan.is_null`
-        for k in plan.occupied_slots():
-            if (pile, k) in rm.connector_cap:
-                col.addTerms(1.0, rm.connector_cap[pile, k])  # (25)
-                p_val = plan.power.get(k, 0.0)
-                if p_val > 1e-9:
-                    col.addTerms(p_val, rm.module_cap[pile, k])  # (26)
+    for k in plan.occupied_slots():
+        if (plan.pile, k) in rm.connector_cap:
+            col.addTerms(1.0, rm.connector_cap[plan.pile, k])  # (25)
+            p_val = plan.power.get(k, 0.0)
+            if p_val > 1e-9:
+                col.addTerms(p_val, rm.module_cap[plan.pile, k])  # (26)
     # Objective coefficient is this plan's own sojourn -- or 0 for a vehicle
     # outside the objective, which still contributes its capacity terms above.
     var = rm.model.addVar(lb=0.0, obj=column_cost(rm, plan), column=col, name=f"lambda[{j}]")
@@ -232,8 +262,7 @@ def add_column(rm: RestrictedMaster, plan: Plan) -> gp.Var | None:
 def column_cost(rm: RestrictedMaster, plan: Plan) -> float:
     """
     A column's objective coefficient: the vehicle's sojourn
-    ``delta*D_omega - a_j`` in minutes (``D_omega = K`` for the null plan),
-    or 0 for a vehicle outside ``rm.objective_ids``. The pricer's objective
+    ``delta*(D_omega - k_j)`` in minutes, or 0 for a vehicle outside ``rm.objective_ids``. The pricer's objective
     (``pricer.price``) and the reduced costs in ``colgen`` use the same
     cost, so the three stay consistent.
     """
@@ -249,8 +278,8 @@ def purge_columns(rm: RestrictedMaster, *, threshold: float | None = None) -> in
     master's own last LP solve, exceeds ``threshold`` (in the master's own
     objective units, minutes of total sojourn). ``None`` (default) is
     Section 8.2's suggested ``PURGE_THRESHOLD = 10`` departure slots, i.e.
-    ``10 * delta`` minutes. Never removes the null plan
-    (mandatory for feasibility from iteration one, Section 7.2) or a basic
+    ``10 * delta`` minutes. Never removes a column of the starting schedule
+    (``rm.protected_keys``: they keep every restricted master feasible) or a basic
     column (still load-bearing for the current solution -- removing it
     would invalidate the very basis the reduced costs were just read from).
 
@@ -294,8 +323,9 @@ def purge_columns(rm: RestrictedMaster, *, threshold: float | None = None) -> in
     for j, entries in rm.columns.items():
         kept: list[tuple[Plan, gp.Var]] = []
         for plan, var in entries:
-            if not plan.is_null and var.VBasis != 0 and var.RC > threshold:
-                rm.seen_keys[j].discard(_column_key(plan))
+            key = _column_key(plan)
+            if (j, key) not in rm.protected_keys and var.VBasis != 0 and var.RC > threshold:
+                rm.seen_keys[j].discard(key)
                 rm.model.remove(var)
                 removed += 1
             else:
@@ -334,9 +364,9 @@ def solve_lp(rm: RestrictedMaster, *, check_dual_signs: bool = True) -> LPResult
     m.optimize()
     if m.Status != GRB.OPTIMAL:
         raise RuntimeError(
-            f"Master LP did not solve to optimality (status={m.Status}) -- the null plan for "
-            "every vehicle should always keep this feasible and bounded; this indicates a bug "
-            "in how the master or its columns were built."
+            f"Master LP did not solve to optimality (status={m.Status}) -- the starting "
+            "schedule's columns (never purged) should always keep this feasible and bounded; "
+            "this indicates a bug in how the master or its columns were built."
         )
 
     pi = {key: c.Pi for key, c in rm.connector_cap.items()}
@@ -371,8 +401,8 @@ def solve_integer(
     """
     Section 9.1's price-and-branch: re-solve the *current* restricted
     master (whatever columns column generation has generated so far) with
-    every lambda forced to ``{0,1}``. Always feasible (the null plans are
-    present), so its optimum is a genuine feasible schedule -- a valid
+    every lambda forced to ``{0,1}``. Always feasible (the starting
+    schedule's columns are never purged), so its optimum is a genuine feasible schedule -- a valid
     upper bound on the true optimum, not in general the true optimum
     itself, since the best integer solution may need a column that was
     never generated.
@@ -389,8 +419,8 @@ def solve_integer(
     if m.SolCount == 0:
         raise RuntimeError(
             f"Price-and-branch found no feasible integer solution (status={m.Status}) -- "
-            "the null plan for every vehicle should always make lambda=null-only feasible; "
-            "this indicates a bug, not a genuinely infeasible instance."
+            "the starting schedule's columns should always make it feasible; this indicates "
+            "a bug or a time limit, not a genuinely infeasible instance."
         )
 
     chosen: dict[int, Plan] = {}

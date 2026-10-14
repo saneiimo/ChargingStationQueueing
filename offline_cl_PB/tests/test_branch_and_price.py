@@ -13,8 +13,8 @@ What each group establishes
 3. Nodes: under random branching restrictions the node's bound never
    exceeds the full master LP filtered by the same restrictions; a child
    whose columns were all filtered out is revived by Phase I rather than
-   pruned; a truly empty node is proved infeasible; the pricer is never
-   fooled by the null plan when the node forbids it.
+   pruned; a truly empty node is proved infeasible; a node pinning a
+   vehicle's pile is priced exactly.
 4. Branching: every branch partitions the enumerated column set; support
    disagreement is detected even when the averaged value is integral;
    continuous power profiles are averaged instead of branched on.
@@ -24,6 +24,9 @@ What each group establishes
    without boundary vehicles (FIXED and OPTIMIZE), with objective cohorts,
    with or without an external incumbent and the restricted-integer-master
    heuristic, sequential or parallel pricing.
+6. Closed system: every vehicle is served and completes; a horizon too
+   short for that is proved infeasible, exactly as the compact model
+   reports it.
 
 Run: python -m pytest offline_cl_PB/tests -s -v
 """
@@ -45,7 +48,6 @@ from offline_cl_PB import (
     BranchAndPrice,
     PBPlan,
     greedy_list_schedule,
-    null_pb_plan,
     schedule_from_compact,
     solve_branch_and_price,
     validate_schedule,
@@ -66,6 +68,8 @@ def _veh(i, a, Q, s_i, s_f, p_max=60.0, s_th=0.4):
 
 
 # A tiny instance family: 10-minute slots, K = 5, piles owning 3 x 25 kW.
+# Batteries are small enough that every vehicle can finish within K = 5
+# (closed system); seeds are chosen so each instance is feasible.
 TINY_DELTA = 10.0
 TINY_HORIZON = 50.0
 TINY_K = 5
@@ -76,7 +80,7 @@ def _tiny_instance(seed: int, n_vehicles: int = 3, n_piles: int = 1, n_connector
     vehicles = []
     for i in range(n_vehicles):
         a = rng.choice([0.0, 0.0, 5.0, 10.0, 20.0])
-        Q = rng.choice([20.0, 30.0, 40.0])
+        Q = rng.choice([10.0, 15.0, 20.0])
         s_i = rng.choice([0.1, 0.2, 0.3])
         s_f = rng.choice([0.7, 0.8, 0.9])
         vehicles.append(_veh(i, a, Q, s_i, s_f, p_max=rng.choice([40.0, 60.0, 90.0])))
@@ -104,6 +108,7 @@ def _no_incumbents(bp):
     drop the incumbent and stop the solver from adopting new ones."""
     bp.upper_bound = math.inf
     bp._offer = lambda *args, **kwargs: False
+    bp.early_branching = False  # compare fully converged node LPs
 
 
 # ---------------------------------------------------------------------------
@@ -126,8 +131,10 @@ def test_priced_columns_are_valid_and_reduced_costs_match():
             if res.plan is None:
                 continue
             assert not validate_plan(res.plan, bp.by_id[j], None, station, TINY_DELTA, TINY_K)
-            # The objective cost, written out independently: sojourn in minutes.
-            cost = bp.weights[j] * (TINY_DELTA * res.plan.departure - bp.by_id[j].a)
+            # The objective cost, written out independently: sojourn in minutes
+            # from the release slot k_j = ceil(a_j / delta).
+            k_j = math.ceil(round(bp.by_id[j].a / TINY_DELTA, 9))
+            cost = bp.weights[j] * TINY_DELTA * (res.plan.departure - k_j)
             recomputed = reduced_cost(res.plan, cost, pi, mu, sigma)
             assert recomputed == pytest.approx(res.reduced_cost, abs=1e-9)
             # clean-up can only lower module counts (mu <= 0), never raise the RC
@@ -141,10 +148,8 @@ def test_priced_columns_are_valid_and_reduced_costs_match():
 def _labeling_vs_milp(vehicles, station, delta, horizon, boundary, rng, n_trials, restrict):
     from offline_cl_PB.labeling import LabelingPricer
     from offline_cl_PB.pricer import PBPricer
-    from offline_cl_opt.model import earliest_departures
 
     K = math.ceil(round(horizon / delta, 9))
-    E = earliest_departures(vehicles, station, delta, horizon)
     compared = 0
     for v in vehicles:
         bv = boundary.get(v.id)
@@ -153,9 +158,8 @@ def _labeling_vs_milp(vehicles, station, delta, horizon, boundary, rng, n_trials
         piles = [bv.pile] if bv is not None else range(station.n_piles)
         for m in piles:
             kw = dict(initial_energy=bv.initial_energy_kwh if bv else 0.0, forced_start=bv is not None)
-            ed = 0 if bv is not None else E[v.id]
-            lab = LabelingPricer(v, m, station, delta, K, ed, **kw)
-            mil = PBPricer(v, m, station, delta, K, ed, **kw)
+            lab = LabelingPricer(v, m, station, delta, K, **kw)
+            mil = PBPricer(v, m, station, delta, K, **kw)
             for _ in range(n_trials):
                 pi = {(mm, k): -(rng.random() * 3 if rng.random() < 0.6 else 0.0) for mm in range(station.n_piles) for k in range(K)}
                 mu = {(mm, k): -(rng.random() * 2 if rng.random() < 0.5 else 0.0) for mm in range(station.n_piles) for k in range(K)}
@@ -186,16 +190,21 @@ def test_labeling_pricer_matches_milp_pricer(seed):
     vehicles, station = _tiny_instance(40 + seed, n_vehicles=3, n_piles=2)
     assert _labeling_vs_milp(vehicles, station, TINY_DELTA, TINY_HORIZON, {}, rng, 15, restrict=True) > 30
     vehicles, station = _contended_instance(seed, 4, 1)
-    assert _labeling_vs_milp(vehicles, station, 5.0, 60.0, {}, rng, 10, restrict=True) > 20
+    assert _labeling_vs_milp(vehicles, station, 5.0, 60.0, {}, rng, 10, restrict=True) > 15
     vehicles, station, delta, horizon, boundary, _ = _boundary_instance()
     assert _labeling_vs_milp(vehicles, station, delta, horizon, boundary, rng, 8, restrict=False) > 10
 
 
 def test_greedy_list_schedule_is_feasible():
+    built = 0
     for seed in range(6):
         vehicles, station = _tiny_instance(seed, n_vehicles=4, n_piles=2)
         sched = greedy_list_schedule(vehicles, station, TINY_DELTA, TINY_K, {})
+        if sched is None:
+            continue  # list scheduling could not finish everyone: no schedule, not a wrong one
         validate_schedule(sched, vehicles, station, TINY_DELTA, TINY_K, {}, {v.id: 1.0 for v in vehicles})
+        built += 1
+    assert built >= 3
 
 
 # ---------------------------------------------------------------------------
@@ -224,7 +233,7 @@ def test_root_colgen_matches_full_master_lp(seed, n_piles):
 
 
 # ---------------------------------------------------------------------------
-# 3. Nodes: restricted LPs, Phase I, the null plan
+# 3. Nodes: restricted LPs, Phase I, pile restrictions
 # ---------------------------------------------------------------------------
 
 
@@ -285,10 +294,10 @@ def test_phase1_revives_node_whose_columns_were_all_filtered():
     bp = _bp(vehicles, station, TINY_DELTA, TINY_HORIZON)
     _no_incumbents(bp)
     v0 = vehicles[0]
-    departures = {c.plan.departure for c in bp.master.columns if c.plan.vehicle_id == v0.id and not c.plan.is_null}
+    departures = {c.plan.departure for c in bp.master.columns if c.plan.vehicle_id == v0.id}
     t = max(departures)
-    assert t < TINY_K  # a later, served departure exists and is not in the pool yet
-    restr = NodeRestrictions().with_vehicle(v0.id, VehicleRestriction().with_d_min(t + 1).with_s_max(TINY_K - 1))
+    assert t < TINY_K  # a later departure exists and is not in the pool yet
+    restr = NodeRestrictions().with_vehicle(v0.id, VehicleRestriction().with_d_min(t + 1))
     bp.master.activate(restr)
     assert not any(bp.master.is_active(c.index) for c in bp.master.columns if c.plan.vehicle_id == v0.id)
     out = bp._solve_node(Node(1, 0, 1, restr, -math.inf))
@@ -306,24 +315,25 @@ def test_phase1_proves_true_infeasibility():
     bp = _bp(vehicles, station, TINY_DELTA, TINY_HORIZON)
     _no_incumbents(bp)
     v0 = vehicles[0]
-    # Served (S <= K-1) but departing before its own earliest possible departure.
-    E = min(c.plan.departure for c in bp.master.columns if c.plan.vehicle_id == v0.id and not c.plan.is_null)
-    restr = NodeRestrictions().with_vehicle(v0.id, VehicleRestriction().with_s_max(TINY_K - 1).with_d_max(E - 1))
+    # Departing before its own earliest possible departure.
+    E = min(c.plan.departure for c in bp.master.columns if c.plan.vehicle_id == v0.id)
+    restr = NodeRestrictions().with_vehicle(v0.id, VehicleRestriction().with_d_max(E - 1))
     out = bp._solve_node(Node(1, 0, 1, restr, -math.inf))
     bp._shutdown()
     assert out.status == "infeasible"
     assert out.phase1_iterations > 0
 
 
-def test_pricer_never_returns_null_and_node_forbidding_null_is_priced_correctly():
-    """pile == m forbids the null plan. The pricer is served-only, so it must
-    find the best served plan even when the convexity dual exceeds the null plan's cost."""
+def test_node_pinning_a_pile_is_priced_correctly():
+    """A large convexity dual still yields the best complete plan on the
+    pinned pile, and nodes pinning a vehicle's pile match the filtered full master."""
     vehicles, station = _tiny_instance(5, n_vehicles=3, n_piles=2)
     bp = _bp(vehicles, station, TINY_DELTA, TINY_HORIZON)
     pr = bp.pricers[(vehicles[0].id, 0)]
     pr.apply(VehicleRestriction().with_pile_only(0))
     res = pr.price({}, {}, sigma=10 * TINY_DELTA * TINY_K, include_departure=True, eps_rc=1e-6)
-    assert res.plan is not None and not res.plan.is_null
+    assert res.plan is not None and res.plan.pile == 0
+    assert not validate_plan(res.plan, vehicles[0], None, station, TINY_DELTA, TINY_K)
     _no_incumbents(bp)
     columns = enumerate_columns(vehicles, station, TINY_DELTA, TINY_K)
     for j in (vehicles[0].id, vehicles[1].id):
@@ -369,13 +379,13 @@ def _plan(j, pile, S, D, q, p):
 def test_support_disagreement_detected_even_when_average_is_integral():
     a = _plan(0, 0, 0, 1, [1], [10.0])
     b = _plan(0, 0, 0, 3, [1, 1, 1], [10.0, 10.0, 10.0])
-    null = null_pb_plan(0, TINY_K)
     # departures 1 and 3 with weights 0.5/0.5 average to 2 -- integral, still mixed
     branch = select_branch({0: [(a, 0.5), (b, 0.5)]}, NodeRestrictions(), TINY_K)
     assert branch is not None and branch.kind == "departure"
-    # null (S = K) vs a served plan with the same D = K: start disagrees
-    c = _plan(0, 0, 2, TINY_K, [1, 1, 1], [5.0, 5.0, 5.0])
-    branch = select_branch({0: [(null, 0.5), (c, 0.5)]}, NodeRestrictions(), TINY_K)
+    # same departure, starts 0 and 2 (average 1, integral): start disagrees
+    c = _plan(0, 0, 0, TINY_K, [1] * TINY_K, [5.0] * TINY_K)
+    d = _plan(0, 0, 2, TINY_K, [1, 1, 1], [5.0, 5.0, 5.0])
+    branch = select_branch({0: [(c, 0.5), (d, 0.5)]}, NodeRestrictions(), TINY_K)
     assert branch is not None and branch.kind == "start"
 
 
@@ -415,7 +425,7 @@ def _assert_matches(sol, z_star, vehicles):
     assert sol.compact_check.objective == pytest.approx(z_star, abs=1e-6)
 
 
-@pytest.mark.parametrize("seed,n_piles,n_vehicles", [(20, 1, 3), (21, 1, 4), (22, 2, 4), (23, 2, 5), (24, 1, 5)])
+@pytest.mark.parametrize("seed,n_piles,n_vehicles", [(20, 1, 3), (21, 1, 4), (22, 2, 4), (23, 2, 5), (28, 1, 5)])
 def test_bp_matches_compact_and_full_integer_master(seed, n_piles, n_vehicles):
     vehicles, station = _tiny_instance(seed, n_vehicles=n_vehicles, n_piles=n_piles)
     z_star, _ = _compact_optimum(vehicles, station, TINY_DELTA, TINY_HORIZON)
@@ -444,21 +454,22 @@ def _contended_instance(seed, n_vehicles, n_piles):
 
 @pytest.mark.parametrize("pricer", ["labeling", "milp"])
 @pytest.mark.parametrize(
-    "seed,n_piles,n_vehicles,min_nodes",
+    "seed,n_piles,n_vehicles,horizon,min_nodes",
     # min_nodes: how much of the tree must be exercised. (4, 1, 4) may close at
-    # the root or branch depending on the pricer's path, so it only checks the answer.
-    [(0, 2, 6, 10), (3, 1, 5, 3), (4, 1, 4, 1), (0, 1, 5, 3)],
+    # the root or branch depending on the pricer's path, so it only checks the
+    # answer. (3, 1, 5) needs 90 minutes for every vehicle to finish.
+    [(0, 2, 6, 60.0, 10), (3, 1, 5, 90.0, 3), (4, 1, 4, 60.0, 1), (12, 1, 5, 60.0, 3)],
 )
-def test_bp_matches_compact_on_instances_that_branch(seed, n_piles, n_vehicles, min_nodes, pricer):
+def test_bp_matches_compact_on_instances_that_branch(seed, n_piles, n_vehicles, horizon, min_nodes, pricer):
     vehicles, station = _contended_instance(seed, n_vehicles, n_piles)
-    z_star, _ = _compact_optimum(vehicles, station, 5.0, 60.0)
+    z_star, _ = _compact_optimum(vehicles, station, 5.0, horizon)
     # Defaults (heuristics on).
-    sol = solve_branch_and_price(vehicles, station, 5.0, 60.0, rim_time_limit=5.0, pricer=pricer)
+    sol = solve_branch_and_price(vehicles, station, 5.0, horizon, rim_time_limit=5.0, pricer=pricer)
     _assert_matches(sol, z_star, vehicles)
     assert sol.root_lower_bound <= z_star + 1e-6
     # Heuristics off: incumbents can only come from the tree itself, so the
     # tree (not just the root) must do the work.
-    sol = solve_branch_and_price(vehicles, station, 5.0, 60.0, rim_time_limit=0.0, dive_every=None, pricer=pricer)
+    sol = solve_branch_and_price(vehicles, station, 5.0, horizon, rim_time_limit=0.0, dive_every=None, pricer=pricer)
     _assert_matches(sol, z_star, vehicles)
     assert sol.nodes_processed >= min_nodes
 
@@ -520,7 +531,8 @@ def test_same_optimum_with_any_incumbent_and_with_or_without_rim():
     vehicles, station = _tiny_instance(30, n_vehicles=5, n_piles=2)
     z_star, cl = _compact_optimum(vehicles, station, TINY_DELTA, TINY_HORIZON)
     good, _ = schedule_from_compact(cl)
-    poor = {v.id: null_pb_plan(v.id, TINY_K) for v in vehicles}
+    poor = greedy_list_schedule(vehicles, station, TINY_DELTA, TINY_K, {})
+    assert poor is not None
     for kw in (
         dict(),
         dict(initial_schedule=good),
@@ -592,6 +604,7 @@ def _cl_model_notebook_instance():
     from policy.queue.fifo import FIFOQueuePolicy
 
     warmup, measure, delta = 12.0, 60.0, 1.0
+    horizon = 180.0  # closed system: long enough for every vehicle to finish
     station = StationSpec(n_piles=1, n_connectors=2, n_modules=6, p_module=25.0)
     specs = [(0, 0.0, 40.0, 0.20, 0.75), (1, 3.0, 40.0, 0.25, 0.75), (2, 11.0, 100.0, 0.20, 0.75),
              (3, 20.0, 40.0, 0.20, 0.80), (4, 30.0, 100.0, 0.25, 0.80), (5, 42.0, 35.0, 0.25, 0.70)]
@@ -607,8 +620,8 @@ def _cl_model_notebook_instance():
     inst = build_measurement_instance(
         arrived_post_warmup=m.arrived_post_warmup, queued_at_warmup_end=m.queued_at_warmup_end,
         in_service_at_warmup_end=m.in_service_at_warmup_end, warmup_period=warmup, delta=delta,
-        horizon_minutes=measure, include_queued=True, boundary_mode=BoundaryMode.OPTIMIZE, station=station)
-    return m, inst, station, delta, measure, warmup
+        horizon_minutes=horizon, include_queued=True, boundary_mode=BoundaryMode.OPTIMIZE, station=station)
+    return m, inst, station, delta, horizon, warmup
 
 
 def test_simulation_incumbent_is_feasible_and_accepted():
@@ -618,6 +631,7 @@ def test_simulation_incumbent_is_feasible_and_accepted():
     K = int(round(horizon / delta))
     sched, counts = schedule_from_simulation(m.arrived_evs, inst.vehicles, station, delta, K,
                                              inst.boundary_vehicles, warmup_period=warmup)
+    assert sched is not None and counts["unplaceable"] == 0
     weights = {v.id: 1.0 for v in inst.vehicles}
     check = validate_schedule(sched, inst.vehicles, station, delta, K, inst.boundary_vehicles, weights)
     cc = compact_model_check(sched, check.connectors, inst.vehicles, station, delta, horizon,
@@ -644,3 +658,36 @@ def test_to_cl_model_is_a_drop_in_compact_model():
         assert by_id.loc[j, "departure_slot"] == pytest.approx(plan.departure)
         for k, p in plan.power.items():
             assert cl.p[j, k].X == pytest.approx(p, abs=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# 7. Closed system
+# ---------------------------------------------------------------------------
+
+
+def test_every_vehicle_is_served_and_complete():
+    vehicles, station = _contended_instance(0, 5, 1)
+    sol = solve_branch_and_price(vehicles, station, 5.0, 60.0, rim_time_limit=5.0)
+    pv = sol.per_vehicle
+    assert pv["served"].all()
+    for _, row in pv.iterrows():
+        assert row["energy_kwh"] == pytest.approx(row["energy_required_kwh"], abs=1e-6)
+        assert row["departure_slot"] <= sol.K
+
+
+def test_horizon_too_short_is_proved_infeasible_like_the_compact_model():
+    """Two vehicles that each need the single connector for E slots cannot
+    both finish within E + 1 slots."""
+    from offline_cl_opt.model import earliest_departures
+
+    station = StationSpec(n_piles=1, n_connectors=1, n_modules=3, p_module=25.0)
+    v0 = _veh(0, 0.0, 30.0, 0.2, 0.8)
+    v1 = _veh(1, 0.0, 30.0, 0.2, 0.8)
+    E = earliest_departures([v0], station, 5.0, 500.0)[0]
+    horizon = 5.0 * (E + 1)
+    assert greedy_list_schedule([v0, v1], station, 5.0, E + 1, {}) is None
+    cl = build_cl_model([v0, v1], station, 5.0, horizon)
+    with pytest.raises(RuntimeError, match="infeasible"):
+        solve_cl_model(cl, mip_gap=0.0)
+    with pytest.raises(RuntimeError, match="infeasible"):
+        solve_branch_and_price([v0, v1], station, 5.0, horizon, rim_time_limit=0.0)

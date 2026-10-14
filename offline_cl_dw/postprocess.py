@@ -26,8 +26,7 @@ from .columns import Plan
 def assign_connectors(chosen: dict[int, Plan], station: StationSpec) -> dict[int, int]:
     """
     Section 10.1: the greedy left-edge sweep, exact for interval graphs.
-    Returns ``{vehicle_id: connector}`` for every *served* vehicle in
-    ``chosen`` (null plans are simply absent from the result).
+    Returns ``{vehicle_id: connector}`` for every vehicle in ``chosen``.
 
     Raises ``AssertionError`` if more than ``C`` vehicles are ever
     simultaneously active on one pile -- this cannot happen if row (25)
@@ -38,9 +37,7 @@ def assign_connectors(chosen: dict[int, Plan], station: StationSpec) -> dict[int
     """
     by_pile: dict[int, list[tuple[int, int, int]]] = {}  # pile -> [(start, departure, vehicle_id)]
     for j, plan in chosen.items():
-        if plan.is_null:
-            continue
-        by_pile.setdefault(plan.pile, []).append((plan.start, plan.departure, j))  # type: ignore[arg-type]
+        by_pile.setdefault(plan.pile, []).append((plan.start, plan.departure, j))
 
     connectors: dict[int, int] = {}
     for pile, entries in by_pile.items():
@@ -75,11 +72,9 @@ def whole_module_failures(
     Delta = station.p_module
     power_by_pile_slot: dict[tuple[int, int], list[float]] = {}
     for plan in chosen.values():
-        if plan.is_null:
-            continue
         for k, p_val in plan.power.items():
             if p_val > 1e-9:
-                power_by_pile_slot.setdefault((plan.pile, k), []).append(p_val)  # type: ignore[arg-type]
+                power_by_pile_slot.setdefault((plan.pile, k), []).append(p_val)
 
     failures: list[tuple[int, int]] = []
     for (pile, k), powers in power_by_pile_slot.items():
@@ -103,12 +98,10 @@ def rounded_module_routing(
     Delta = station.p_module
     routing: dict[tuple[int, int, int], int] = {}
     for j, plan in chosen.items():
-        if plan.is_null:
-            continue
         cc = connectors[j]
         for k, p_val in plan.power.items():
             if p_val > 1e-9:
-                routing[plan.pile, cc, k] = math.ceil(p_val / Delta - 1e-9)  # type: ignore[index]
+                routing[plan.pile, cc, k] = math.ceil(p_val / Delta - 1e-9)
     return routing
 
 
@@ -131,7 +124,9 @@ def validate_schedule(
 
     ``boundary_vehicles``: the same mapping passed to
     ``colgen.run_column_generation`` (see ``offline_cl_opt.boundary``).
-    Their energy-completion check (below) is relaxed to account for energy
+    Every other vehicle must receive exactly its full ``W_j`` by its
+    departure (the closed system's completion requirement). Boundary
+    vehicles' energy-completion check is relaxed to account for energy
     already delivered before t=0, which ``plan.power`` never reflects: a
     FIXED-mode vehicle's trajectory is exogenous and skipped entirely (it
     is never re-verified against an energy target -- see
@@ -140,7 +135,7 @@ def validate_schedule(
     comparing to ``v.W``.
 
     ``best_lower_bound`` is checked against the schedule's total sojourn
-    ``sum_j (delta*D_j - a_j)`` over ``objective_ids`` (``None``: every
+    ``sum_j delta*(D_j - k_j)`` over ``objective_ids`` (``None``: every
     vehicle in ``chosen``) -- pass the same vehicle set the objective was
     summed over. A superset is still a sound check (each extra sojourn is
     ``>= 0``), just a looser one.
@@ -155,10 +150,8 @@ def validate_schedule(
         v = vehicles[j]
         if objective_ids is None or j in objective_ids:
             objective += sojourn_minutes(plan.departure, v.a, delta)
-        if plan.is_null:
-            continue
 
-        assert plan.start is not None and plan.start >= _release_slot(v.a, delta), (
+        assert plan.start >= _release_slot(v.a, delta), (
             f"Vehicle {j} starts at slot {plan.start}, before its own release slot -- "
             "constraint (2)."
         )
@@ -166,16 +159,16 @@ def validate_schedule(
 
         bv = boundary_vehicles.get(j)
         energy = h * sum(plan.power.values())
-        if plan.departure < K and (bv is None or bv.mode is BoundaryMode.OPTIMIZE):
+        if bv is None or bv.mode is BoundaryMode.OPTIMIZE:
             # FIXED-mode boundary vehicles are skipped: their plan.power is
             # only the post-t=0 tail of a trajectory the model never chose,
             # so it need not sum to W_j on its own. OPTIMIZE-mode ones add
             # back the energy they already had at t=0 before comparing.
             already = bv.initial_energy_kwh if bv is not None else 0.0
             assert abs(energy + already - v.W) < 1e-4, (
-                f"Vehicle {j} departs at slot {plan.departure} < K={K} with "
+                f"Vehicle {j} departs at slot {plan.departure} (K={K}) with "
                 f"{energy + already:.4f} kWh delivered (of which {already:.4f} pre-t=0), "
-                f"not its full W_j={v.W:.4f} -- constraint (19)/completion at departure was "
+                f"not its full W_j={v.W:.4f} -- completion / departure rule (19) was "
                 "violated by whichever plan was selected."
             )
         p_bar = min(v.p_max, station.n_modules * station.p_module)
@@ -204,8 +197,8 @@ def validate_schedule(
                     f"({tau_d * p_val + cum:.4f} > R_j={v.R:.4f})."
                 )
             cum += h * p_val
-            occupancy.setdefault((plan.pile, k), []).append(j)  # type: ignore[index]
-            power_by_pile_slot[plan.pile, k] = power_by_pile_slot.get((plan.pile, k), 0.0) + p_val  # type: ignore[index]
+            occupancy.setdefault((plan.pile, k), []).append(j)
+            power_by_pile_slot[plan.pile, k] = power_by_pile_slot.get((plan.pile, k), 0.0) + p_val
 
     for (pile, k), occs in occupancy.items():
         assert len(occs) <= station.n_connectors, (

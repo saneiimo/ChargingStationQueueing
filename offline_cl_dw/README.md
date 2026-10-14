@@ -1,8 +1,10 @@
 # `offline_cl_dw` — Dantzig-Wolfe decomposition for the connector-lane MILP
 
 Implements `dantzig_wolfe_decomposition.html`: a decomposition-by-vehicle of
-`offline_cl_opt`'s compact model (`connector_lane_model.html`, equations
-(1)-(19), identical to what `offline_cl_opt/model.py` implements). Where
+`offline_cl_opt`'s compact model -- the **closed-system** model
+`offline_cl_opt/model.py` implements, in which every vehicle is served and
+fully charged within the horizon (so there is no "never served" plan, and
+every plan delivers its vehicle's full request by its departure `D <= K`). Where
 `offline_cl_opt` solves that model directly, this package splits it into a
 **master problem** (which whole-schedule "plan" each vehicle uses) and a
 **pricing subproblem** per (vehicle, pile) pair (generating good plans on
@@ -30,9 +32,7 @@ weak in two specific, fixable places:
   fraction of the requested energy at each step — so the relaxation can
   report a departure time far below anything physically achievable.
   Departure times *are* the objective, so this directly destroys the bound.
-  This is exactly the same phenomenon `offline_cl_opt`'s own
-  `bound_departures` (constraint (26)) exists to blunt — decomposition
-  removes it structurally instead of patching around it.
+  Decomposition removes it structurally.
 
 Decomposing by vehicle deletes the big-*M* rows entirely (replaced by a
 plain packing constraint) and makes every column a genuine, physically
@@ -64,7 +64,7 @@ valid even if `solution.converged` is `False` (an *anytime* bound, see
 "Column generation" below). `solution.upper_bound` is `price-and-branch`'s
 own objective — a genuine feasible schedule, always valid regardless of
 convergence. Both are total sojourn in minutes, the same objective as
-`offline_cl_opt` (a column costs its vehicle's sojourn `delta*D - a_j`), so a
+`offline_cl_opt` (a column costs its vehicle's sojourn `delta*(D - k_j)`, `k_j = ceil(a_j/delta)`), so a
 gap of `g` is `g/n_optimized` minutes of mean-sojourn-time uncertainty.
 
 `colgen` (a `ColGenResult`) keeps the full iteration history
@@ -81,15 +81,27 @@ one convexity row (27) per vehicle ("exactly one plan"). Columns
 object, the standard idiom.
 
 The pricing subproblem (`pricer.py`) is, for one vehicle and one *fixed*
-pile, exactly the compact model's own Groups A/D/E + (13) restricted to
-that vehicle alone — no lane/module/sequencing constructs at all, since
+pile, exactly the compact model's own Groups A/D/E + (13) + the completion
+row `x_K >= W_j` restricted to that vehicle alone (exactly one start) — no
+lane/module/sequencing constructs at all, since
 Propositions 1-2 move that coupling entirely into the master's price
 signal. One live `VehiclePricer` (a persistent gurobipy `Model`) is built
 per (vehicle, pile) pair and reused for the whole run; only its objective
 coefficients change between rounds (the document's own implementation
 checklist, item 4: "the single largest speed factor in the loop"), which
 also gets Gurobi's own LP basis warm-start for free — same principle
-`offline_cl_opt.adaptive` already relies on.
+`offline_cl_opt.adaptive` already relies on. A pricer whose vehicle cannot
+finish on that pile within the horizon is infeasible (`zeta = inf`, no
+column).
+
+**Starting schedule.** With no "never served" column, the restricted master
+needs a feasible point from iteration one: `initial_schedule`, one complete
+plan per vehicle that fit every connector and module row together. Pass one
+(e.g. `offline_cl_PB.heuristics.schedule_from_simulation` on a drained
+simulation), or let `preprocess.initial_schedule` build one by list
+scheduling — which raises if it cannot finish every vehicle within the
+horizon. Its columns are never purged, so the restricted master LP and the
+integer master stay feasible throughout.
 
 **Pricers are solved concurrently** across a thread pool (`max_workers`),
 not sequentially. Pricing every `(vehicle, pile)` pair is embarrassingly
@@ -146,7 +158,7 @@ backstop; `converged=False` there still leaves `best_lower_bound` valid.
 
 Section 9.1: re-solve the *current* restricted master (whatever columns
 column generation produced) with every `lambda` forced to `{0,1}`. Always
-feasible (the null plan is present for every vehicle), so its objective is
+feasible (the starting schedule's columns are never purged), so its objective is
 a genuine feasible schedule — a valid upper bound, but **not in general the
 true optimum**: the best integer solution may need a column that was never
 generated, since column generation only ever chased the *continuous*
@@ -160,9 +172,9 @@ uses (true compact-model optimum: 113.0 minutes of total sojourn), column
 generation (2000 iterations, not formally converged) ends with a certified
 lower bound of 105.42 and a restricted-master LP value of 106.09 — correctly
 below 113.0, since it's a continuous-module relaxation — but
-price-and-branch's own upper bound comes out at 152.0,
-dropping one vehicle entirely (choosing its null plan) rather than serving
-all three. This is exactly the failure mode the source document names: the
+price-and-branch's own upper bound comes out at 152.0 (this example
+predates the closed-system model, when it did so by dropping one vehicle
+entirely). This is exactly the failure mode the source document names: the
 LP-optimal columns can rely on a *fractional blend* across several plans
 per vehicle that no single whole plan replicates, and price-and-branch
 can't fall back to anything better than what was already generated. The
@@ -195,11 +207,12 @@ document's Section 0 says to build full branch-and-price (Section 9.2) for
 
 ## Seeding (`preprocess.py`)
 
-`seed_columns` (used automatically) gives every vehicle the null plan
-(mandatory — this is what makes the restricted master feasible from
-iteration one, no artificial variables or Farkas pricing ever needed) plus
-one "charge at the acceptance limit from `k_j`" plan per pile — cheap (no
-MILP), individually optimal for that (vehicle, pile) pair alone.
+`initial_schedule` (see "Starting schedule" above) makes the restricted
+master feasible from iteration one, with no artificial variables or Farkas
+pricing. `seed_columns` (used automatically) adds one "charge at the
+acceptance limit from `k_j`" plan per pile when it finishes within the
+horizon — cheap (no MILP), individually optimal for that (vehicle, pile)
+pair alone.
 `columns_from_evs` is the document's other suggested source: convert a
 real simulation's own output into plans, the same idea as
 `offline_cl_opt.adaptive`'s `warm_start_evs`, passed in via

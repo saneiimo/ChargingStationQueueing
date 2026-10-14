@@ -3,12 +3,12 @@ Exact pricing by forward labelling (no MILP), with the MILP as fallback.
 
 The pricing problem for (vehicle j, pile m) with duals ``pi, mu <= 0`` is
 
-    min  w*(delta*D - a_j) + sum_{k=S}^{D-1} (a_k + b_k * q_k),   a_k = -pi_mk >= 0, b_k = -mu_mk >= 0
+    min  w*delta*(D - k_j) + sum_{k=S}^{D-1} (a_k + b_k * q_k),   a_k = -pi_mk >= 0, b_k = -mu_mk >= 0
 
-(``w*(delta*D - a_j)`` is the vehicle's sojourn in minutes; it depends only on D.)
+(``w*delta*(D - k_j)`` is the vehicle's sojourn in minutes; it depends only on D.)
 
-over served plans (``S < D``, ``q_k`` integer in the node's bounds) whose
-power can deliver ``W`` by ``D`` (no requirement if ``D = K``: censoring).
+over plans (``S < D <= K``, ``q_k`` integer in the node's bounds) whose
+power can deliver ``W`` by ``D`` (every vehicle completes: closed system).
 
 Why labelling is exact here
 ---------------------------
@@ -19,7 +19,7 @@ Why labelling is exact here
    because ``tau_d >= h``). So charging as fast as the modules allow is
    optimal: it reaches every energy level no later than any other profile,
    and never exceeds ``W``. The signature is feasible iff this greedy
-   trajectory reaches ``W`` by ``D`` (or ``D = K``).
+   trajectory reaches ``W`` by ``D``.
 2. Hence the state after slot ``k`` is just the delivered energy ``x``; the
    start slot matters only through the restrictions already applied when
    the label was created. A label ``(x1, c1)`` dominates ``(x2, c2)`` at the
@@ -67,7 +67,6 @@ class LabelingPricer:
         station: StationSpec,
         delta: float,
         K: int,
-        earliest_departure: int,
         *,
         initial_energy: float = 0.0,
         forced_start: bool = False,
@@ -97,7 +96,7 @@ class LabelingPricer:
         self.restriction: VehicleRestriction = EMPTY_RESTRICTION
         self.active = True
         # Built on first need only (labelling almost always suffices).
-        self._milp_args = (v, pile, station, delta, K, earliest_departure)
+        self._milp_args = (v, pile, station, delta, K)
         self._milp_kwargs = dict(
             initial_energy=initial_energy, forced_start=forced_start, weight=weight, env=env, threads=threads
         )
@@ -107,7 +106,7 @@ class LabelingPricer:
 
     # ------------------------------------------------------------------ #
     def plan_cost(self, departure: int, weight: float) -> float:
-        """A plan's objective cost: ``weight * (delta*D - a)``, its sojourn in minutes (0 for weight 0)."""
+        """A plan's objective cost: ``weight * delta*(D - k_j)``, its sojourn in minutes (0 for weight 0)."""
         return weight * sojourn_minutes(departure, self.vehicle.a, self.delta) if weight else 0.0
 
     def apply(self, restriction: VehicleRestriction) -> None:
@@ -240,7 +239,7 @@ class LabelingPricer:
             D = k + 1
             if first_departure <= D <= self.d_hi:
                 for lid in kept:
-                    if D == K or X[lid] >= W - _COMPLETE_TOL:
+                    if X[lid] >= W - _COMPLETE_TOL:
                         candidates.append((C[lid] + self.plan_cost(D, w), lid, D))
 
         if not candidates:

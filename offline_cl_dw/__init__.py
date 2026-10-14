@@ -2,9 +2,9 @@
 Dantzig-Wolfe decomposition by vehicle for the connector-lane offline MILP
 -- ``dantzig_wolfe_decomposition.html``.
 
-Where ``offline_cl_opt`` solves the compact model (equations (1)-(19) of
-``connector_lane_model.html``) directly, this package decomposes it by
-vehicle: a master problem picks one whole-schedule "plan" per vehicle from
+Where ``offline_cl_opt`` solves the compact closed-system model (every
+vehicle served and fully charged within the horizon) directly, this package
+decomposes it by vehicle: a master problem picks one whole-schedule "plan" per vehicle from
 a pool generated on demand by per-(vehicle, pile) pricing subproblems
 (column generation), then a small integer program over the generated
 columns ("price-and-branch") gives a genuine feasible schedule. See
@@ -33,7 +33,7 @@ Typical usage::
 from __future__ import annotations
 
 from .colgen import ColGenResult, run_column_generation
-from .columns import Plan, null_plan
+from .columns import Plan
 from .master import (
     IntegerResult,
     LPResult,
@@ -50,6 +50,7 @@ from .preprocess import (
     columns_from_evs,
     earliest_departures,
     fixed_plan,
+    initial_schedule,
     seed_columns,
 )
 from .pricer import VehiclePricer, build_pricer, price
@@ -58,7 +59,6 @@ from .warm_start import apply_mip_start, refine_plan, refine_solution, refinemen
 
 __all__ = [
     "Plan",
-    "null_plan",
     "VehiclePricer",
     "build_pricer",
     "price",
@@ -72,6 +72,7 @@ __all__ = [
     "solve_integer",
     "earliest_departures",
     "seed_columns",
+    "initial_schedule",
     "columns_from_evs",
     "boundary_seed_plan",
     "fixed_plan",

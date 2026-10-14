@@ -61,7 +61,7 @@ import math
 from offline_cl_opt.instance import StationSpec
 from offline_cl_opt.model import ConnectorLaneModel
 
-from .columns import Plan, null_plan
+from .columns import Plan
 from .postprocess import assign_connectors
 
 
@@ -92,10 +92,10 @@ def refinement_ratio(delta_coarse: float, delta_fine: float) -> int:
 def refine_plan(plan: Plan, r: int, K_fine: int) -> Plan:
     """One vehicle's coarse-grid plan, replicated onto the fine grid at
     ratio ``r`` -- see this module's own docstring for why this is exact,
-    not approximate. The null plan simply becomes the fine-grid null plan."""
-    if plan.is_null:
-        return null_plan(plan.vehicle_id, K_fine)
-    start = plan.start * r  # type: ignore[operator]
+    not approximate. ``K_fine`` is kept for the call signature; a coarse
+    plan departing by ``K_coarse`` departs by ``K_coarse*r`` on the fine
+    grid."""
+    start = plan.start * r
     departure = plan.departure * r
     power = {
         fine_k: p
@@ -159,32 +159,29 @@ def apply_mip_start(
 
     for j, plan in chosen.items():
         k0 = cl_model.releases[j]
-        served = not plan.is_null
         cum = 0.0
         for k in range(k0, cl_model.K):
-            occupied = served and plan.start <= k < plan.departure  # type: ignore[operator]
+            occupied = plan.start <= k < plan.departure
             p_val = plan.power.get(k, 0.0) if occupied else 0.0
             cl_model.u[j, k].Start = 1.0 if occupied else 0.0
             cl_model.p[j, k].Start = p_val
-            cl_model.eta[j, k].Start = 1.0 if (served and k == plan.start) else 0.0
+            cl_model.eta[j, k].Start = 1.0 if k == plan.start else 0.0
             cum += h * p_val
             if (j, k + 1) in cl_model.x:
                 cl_model.x[j, k + 1].Start = cum
 
         conn = connectors.get(j)
         for (mm, cc) in cl_model.lanes:
-            cl_model.y[j, mm, cc].Start = 1.0 if (served and plan.pile == mm and conn == cc) else 0.0
+            cl_model.y[j, mm, cc].Start = 1.0 if (plan.pile == mm and conn == cc) else 0.0
 
     # r[mm,cc,k]: whole modules routed -- best-effort ceil(p/Delta) per
     # occupied connector, same convention as postprocess.rounded_module_routing.
     occ_by_lane_slot: dict[tuple[int, int, int], float] = {}
     for j, plan in chosen.items():
-        if plan.is_null:
-            continue
         conn = connectors[j]
         for k, p_val in plan.power.items():
             if p_val > 1e-9:
-                occ_by_lane_slot[plan.pile, conn, k] = p_val  # type: ignore[index]
+                occ_by_lane_slot[plan.pile, conn, k] = p_val
     for mm in range(station.n_piles):
         for cc in range(station.n_connectors):
             for k in range(cl_model.K):
@@ -196,8 +193,8 @@ def apply_mip_start(
     # assign_connectors, so "who started first" is a well-defined order.
     for (i, jv) in cl_model.b:
         pi_, pj = chosen.get(i), chosen.get(jv)
-        if pi_ is None or pj is None or pi_.is_null or pj.is_null:
+        if pi_ is None or pj is None:
             continue
         if pi_.pile != pj.pile or connectors.get(i) != connectors.get(jv):
             continue
-        cl_model.b[i, jv].Start = 1.0 if pi_.start <= pj.start else 0.0  # type: ignore[operator]
+        cl_model.b[i, jv].Start = 1.0 if pi_.start <= pj.start else 0.0

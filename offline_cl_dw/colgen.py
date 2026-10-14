@@ -71,24 +71,28 @@ loop even starts) plus ``pricer.build_pricer``'s own ``initial_energy``/
 
 * ``FIXED`` (no optimizer control): its whole trajectory is already known
   -- ``preprocess.fixed_plan`` builds the one Plan matching it exactly,
-  seeded as this vehicle's *only* column (no null plan, no pricer built
-  for it at all -- there is nothing left to search for or price).
+  this vehicle's *only* column (no pricer built for it at all -- there is
+  nothing left to search for or price).
 * ``OPTIMIZE`` (optimizer controls power/departure, never the lane): a
   pricer is built for its one already-fixed pile only (not all M), with
   ``force_occupied_at_start=True`` and ``initial_energy=bv.
-  initial_energy_kwh``; its earliest-departure valid inequality is passed
-  as ``0`` (the standard ``E_j`` assumes starting from ``s_i`` and would
-  be invalid here). It gets no null plan either -- a vehicle already
-  mid-charge cannot be "never served" -- so ``preprocess.
-  boundary_seed_plan`` seeds its first feasible column instead, playing
-  the same "guarantee RMP feasibility from iteration one" role the null
-  plan plays for ordinary vehicles (see ``master.build_master``'s own
-  relaxed validation: "at least one column per vehicle", not specifically
-  a null one).
+  initial_energy_kwh``; ``preprocess.boundary_seed_plan`` adds one extra
+  starting column when it can.
 
 Everything else (the master's rows, the objective, purging, dual
 smoothing) needs no boundary-specific handling: a boundary vehicle's
 columns are ordinary ``Plan`` objects like any other's.
+
+Closed system
+-------------
+Every column serves its vehicle and delivers its full request by ``K``
+(``pricer.build_pricer``'s completion row); there is no "never served"
+column. The restricted master is instead made feasible by a complete
+starting schedule (``initial_schedule``; by default
+``preprocess.initial_schedule``), whose columns are never purged -- see
+``master.build_master``. A (vehicle, pile) pricer that cannot finish the
+vehicle within the horizon is infeasible; it reports ``zeta = inf`` and
+contributes no column.
 """
 
 from __future__ import annotations
@@ -109,8 +113,15 @@ from offline_cl_opt.model import sojourn_minutes
 
 from .columns import Plan
 from .master import RestrictedMaster, add_column, build_master, column_cost, purge_columns, solve_lp
+from .postprocess import validate_schedule
 from .pricer import VehiclePricer, _release_slot, build_pricer, price
-from .preprocess import boundary_seed_plan, earliest_departures, fixed_plan, seed_columns
+from .preprocess import (
+    boundary_seed_plan,
+    earliest_departures,
+    fixed_plan,
+    initial_schedule as greedy_initial_schedule,
+    seed_columns,
+)
 
 
 @dataclass
@@ -125,7 +136,8 @@ class ColGenResult:
     best_lower_bound: float
     converged: bool  # True iff an exact pricing pass found no improving column
     # sum_{j in objective} (delta*E_j - a_j): every objective vehicle's own
-    # earliest possible sojourn, a cheap sanity floor on the optimum (minutes)
+    # earliest possible sojourn, a cheap sanity floor on the optimum (minutes;
+    # boundary vehicles count 0)
     sojourn_floor: float
     columns_purged: int  # cumulative count removed by purge_columns (Section 8.3), 0 if disabled
     boundary_vehicles: dict[int, BoundaryVehicle]  # echoed back, {} if none were passed in
@@ -156,13 +168,11 @@ def _plan_reduced_cost(
     directly and to re-check a smoothed-dual plan against the true ones.
 
     ``cost`` must be ``master.column_cost(rm, plan)`` -- the plan's sojourn
-    ``delta*D_omega - a_j``, or 0 for a vehicle outside the objective --
+    ``delta*(D_omega - k_j)``, or 0 for a vehicle outside the objective --
     matching both ``master.add_column``'s coefficient and ``pricer.price``'s
     objective; getting this out of step with them would make every reduced
     cost -- and the Lagrangian bound built from them -- inconsistent with
     the master they are supposed to describe."""
-    if plan.is_null:
-        return cost
     total = cost
     for k in plan.occupied_slots():
         total -= pi.get((pile, k), 0.0)
@@ -176,6 +186,7 @@ def run_column_generation(
     delta: float,
     horizon_minutes: float,
     *,
+    initial_schedule: dict[int, Plan] | None = None,
     extra_seed_columns: dict[int, list[Plan]] | None = None,
     boundary_vehicles: dict[int, BoundaryVehicle] | None = None,
     cohorts: dict[int, Cohort] | None = None,
@@ -210,14 +221,25 @@ def run_column_generation(
 
     Parameters
     ----------
+    initial_schedule :
+        ``{vehicle_id: Plan}``: one complete plan per vehicle, jointly
+        feasible -- the restricted master's guaranteed-feasible starting
+        point, never purged (see ``master.build_master``). Checked with
+        ``postprocess.validate_schedule`` first; an invalid one raises
+        ``ValueError``. Any ``Plan`` works, including the
+        ``offline_cl_PB.PBPlan`` objects of
+        ``offline_cl_PB.heuristics.schedule_from_simulation`` on a drained
+        simulation. ``None`` (default): ``preprocess.initial_schedule``
+        (list scheduling); if that cannot finish every vehicle within the
+        horizon, raises ``ValueError`` -- pass a schedule, or lengthen the
+        horizon.
     extra_seed_columns :
         Additional starting columns beyond ``preprocess.seed_columns``'s
-        own defaults (null plan + per-pile greedy solo plan for every
-        vehicle) -- e.g. from ``preprocess.columns_from_evs`` on a real
-        simulation. Merged in before the loop starts; better seeds mean
-        fewer iterations, never a different answer. Ignored for any
-        vehicle in ``boundary_vehicles`` (they get their own seeding --
-        see below).
+        own defaults (per-pile greedy solo plan for every vehicle) -- e.g.
+        from ``preprocess.columns_from_evs`` on a real simulation. Merged
+        in before the loop starts; better seeds mean fewer iterations,
+        never a different answer. Ignored for any vehicle in
+        ``boundary_vehicles`` (they get their own seeding -- see below).
     boundary_vehicles :
         ``{vehicle_id: BoundaryVehicle}`` for any vehicle in ``vehicles``
         already plugged in (mid-charge) when the modeled horizon began --
@@ -339,24 +361,43 @@ def run_column_generation(
         )
 
     E = earliest_departures(vehicles, station, delta, horizon_minutes)
-    # Boundary conditions: the standard E_j assumes starting from s_i and
-    # would be an invalid (too-large) lower bound for a vehicle that
-    # already has a head start -- see this module's own docstring,
-    # "Boundary conditions", and pricer.build_pricer's earliest_departure
-    # parameter doc. Zeroing it here (rather than a separate code path)
-    # makes the eventual `D_lin >= 0` constraint trivially true, i.e. no
-    # constraint at all.
+    # The standard E_j assumes starting from s_i and is not a floor for a
+    # vehicle that already has a head start; boundary vehicles count 0 in
+    # the floor (their release slot is 0, so that is sojourn 0).
     for j in boundary_vehicles:
         E[j] = 0
     sojourn_floor = float(sum(sojourn_minutes(E[j], by_id[j].a, delta) for j in objective_ids))
 
-    # Seeding: ordinary vehicles get the standard null + per-pile greedy
-    # solo pool. Boundary vehicles get none of that -- see the module
-    # docstring, "Boundary conditions" -- FIXED-mode ones get their single
+    # The guaranteed-feasible starting point: one complete plan per vehicle
+    # that fit together (the closed system has no "never served" column).
+    if initial_schedule is None:
+        initial_schedule = greedy_initial_schedule(vehicles, station, delta, K, boundary_vehicles)
+        if initial_schedule is None:
+            raise ValueError(
+                f"List scheduling cannot serve and complete every vehicle within the horizon "
+                f"(K={K} slots of {delta:g} min). Pass initial_schedule (e.g. from a drained "
+                "simulation via offline_cl_PB.heuristics.schedule_from_simulation) or lengthen "
+                "the horizon."
+            )
+    else:
+        initial_schedule = dict(initial_schedule)
+    # A FIXED boundary vehicle has exactly one column, its pinned trajectory.
+    for j, bv in boundary_vehicles.items():
+        if bv.mode is BoundaryMode.FIXED:
+            initial_schedule[j] = fixed_plan(bv)
+    try:
+        validate_schedule(
+            initial_schedule, by_id, station, delta, K, boundary_vehicles=boundary_vehicles
+        )
+    except (AssertionError, KeyError) as exc:
+        raise ValueError(f"initial_schedule is not a feasible schedule: {exc}") from exc
+
+    # Extra seeds: ordinary vehicles get the per-pile greedy solo pool.
+    # Boundary vehicles get none of that -- see the module docstring,
+    # "Boundary conditions" -- FIXED-mode ones get their single
     # known-trajectory Plan (preprocess.fixed_plan); OPTIMIZE-mode ones get
-    # one guaranteed-feasible starting column confined to their own pile
-    # (preprocess.boundary_seed_plan), since a vehicle already mid-charge
-    # can never be "never served".
+    # one extra column confined to their own pile when it finishes in time
+    # (preprocess.boundary_seed_plan).
     ordinary_vehicles = [v for v in vehicles if v.id not in boundary_vehicles]
     seeds: dict[int, list[Plan]] = (
         seed_columns(ordinary_vehicles, station, delta, K) if ordinary_vehicles else {}
@@ -375,13 +416,14 @@ def run_column_generation(
             seeds[j] = [plan]
             fixed_boundary[j] = (plan, bv.pile)
         else:
-            seeds[j] = [boundary_seed_plan(v, bv, station, delta, K)]
+            seed = boundary_seed_plan(v, bv, station, delta, K)
+            seeds[j] = [seed] if seed is not None else []
     if extra_seed_columns:
         for j, plans in extra_seed_columns.items():
             if j in boundary_vehicles:
                 continue  # boundary vehicles use only their own seeding above
             seeds.setdefault(j, [])
-            seeds[j].extend(p for p in plans if not p.is_null)  # null already seeded
+            seeds[j].extend(plans)
 
     k_lo = min(_release_slot(v.a, delta) for v in vehicles)
     rm = build_master(
@@ -391,6 +433,7 @@ def run_column_generation(
         K,
         k_lo,
         seeds,
+        initial_schedule=initial_schedule,
         arrivals={v.id: v.a for v in vehicles},
         objective_ids=objective_ids,
         conservative_modules=conservative_modules,
@@ -413,7 +456,6 @@ def run_column_generation(
                 station,
                 delta,
                 K,
-                E[v.id],
                 initial_energy=bv.initial_energy_kwh if bv is not None else 0.0,
                 force_occupied_at_start=bv is not None,
                 in_objective=v.id in objective_ids,
@@ -465,14 +507,19 @@ def run_column_generation(
             for future in futures:
                 (j, mm), z, plan = future.result()
                 if exact:
-                    rc = z - lp.sigma[j]
+                    # An infeasible pricer (the vehicle cannot finish on
+                    # this pile in time) has zeta = inf and no plan.
                     zeta[j][mm] = z
+                if plan is None:
+                    continue
+                if exact:
+                    rc = z - lp.sigma[j]
                 else:
                     true_z = _plan_reduced_cost(
                         plan, cost=column_cost(rm, plan), pi=lp.pi, mu=lp.mu, pile=mm
                     )
                     rc = true_z - lp.sigma[j]
-                if not plan.is_null and rc < -eps_rc:
+                if rc < -eps_rc:
                     candidates.append((rc, j, plan))
             if exact:
                 # FIXED-mode boundary vehicles have no pricer (nothing to

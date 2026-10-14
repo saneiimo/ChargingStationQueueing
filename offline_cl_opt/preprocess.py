@@ -6,14 +6,12 @@ Preprocessing -- Section 9 of ``connector_lane_model.html``.
     to itself, charging at its own acceptance limit throughout. A pure
     per-vehicle calculation via the model's own discrete greedy recursion
     -- no MILP solve needed. Lives in ``model.py`` (``earliest_departures``,
-    re-exported here) rather than being duplicated in this module, since
-    ``build_cl_model`` itself also needs ``E_j`` internally for the optional
-    departure lower bound (24, Section 9.3) -- see ``model.py``'s module
-    docstring. The document is explicit that this must use the *discrete*
-    recursion, not a continuous closed form, or the resulting bound need
-    not be valid for the discrete model being preprocessed.
+    re-exported here). It is not a constraint of the model, only a cheap
+    per-vehicle floor for diagnostics. It must use the *discrete*
+    recursion, not a continuous closed form, or it need not be a valid
+    floor for the discrete model.
   - **UB** (9.2): the objective value (total sojourn
-    ``sum_j (delta*D_j - a_j)``, minutes) of *any* known feasible schedule.
+    ``sum_j delta*(D_j - k_j)``, minutes) of *any* known feasible schedule.
     The document suggests two sources, and both are supported here via
     ``incumbent_departures``:
       - a reference schedule you already have -- e.g. a finished causal
@@ -66,9 +64,8 @@ def _departures_from_conservative(
     """
     Fallback UB source when no ``incumbent_departures`` is supplied:
     solve Section 8.4's conservative shortcut and read departure times
-    (minutes) off its solution. Only served vehicles are included --
-    ``incumbent_objective`` treats anything absent the same way (9)
-    does for a vehicle that never departs: departs at slot ``K``.
+    (minutes) off its solution. In the closed model every vehicle is
+    served and departs, so every vehicle is included.
     """
     cons = conservative_feasible_solution(
         vehicles,
@@ -84,7 +81,6 @@ def _departures_from_conservative(
     return {
         int(row.vehicle_id): float(row.departure_slot) * delta
         for row in sol.per_vehicle.itertuples()
-        if row.served
     }
 
 
@@ -101,7 +97,7 @@ def incumbent_objective(
     verbose: bool = False,
 ) -> float:
     """
-    UB (Section 9.2): total sojourn ``sum_j (delta*D_j - a_j)`` in
+    UB (Section 9.2): total sojourn ``sum_j delta*(D_j - k_j)`` in
     minutes, from a supplied reference schedule or, if
     ``incumbent_departures`` is ``None``, Section 8.4's conservative
     shortcut. Directly usable as ``solve_cl_model(..., cutoff=...)`` /
@@ -118,8 +114,8 @@ def incumbent_objective(
         Optional ``{vehicle_id: departure_time_minutes}`` from any known
         feasible schedule -- e.g. build it from a finished simulation with
         ``{ev.id: ev.departure_time for ev in env.engine.metrics.finished_evs}``.
-        A vehicle missing from the dict is treated as never served/never
-        finished, departing at slot ``K`` -- the same convention (9) uses.
+        It must cover every vehicle in ``vehicles`` (a closed-system
+        schedule serves and completes everyone; a missing vehicle raises).
         Departure times are converted to slot boundaries by rounding *up*
         (``ceil``): a real schedule that finishes at continuous time ``t``
         can always be read as "done" by the next slot boundary at or after
@@ -146,9 +142,19 @@ def incumbent_objective(
             verbose=verbose,
         )
 
+    missing = sorted(v.id for v in vehicles if v.id not in incumbent_departures)
+    if missing:
+        raise ValueError(
+            f"incumbent_departures has no departure for vehicles {missing[:10]}: a cutoff must "
+            "come from a schedule that serves and completes every vehicle."
+        )
     total = 0.0
     for v in vehicles:
-        dep = incumbent_departures.get(v.id)
-        D = K if dep is None else min(K, math.ceil(round(dep / delta, 9)))
+        D = math.ceil(round(incumbent_departures[v.id] / delta, 9))
+        if D > K:
+            raise ValueError(
+                f"vehicle {v.id} departs at {incumbent_departures[v.id]:g} min, after the "
+                f"horizon ({K} slots of {delta:g} min): not a schedule of this model."
+            )
         total += sojourn_minutes(D, v.a, delta)
     return total

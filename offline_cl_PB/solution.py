@@ -29,11 +29,17 @@ if TYPE_CHECKING:
 class PBSolution:
     """
     ``status``: ``"OPTIMAL"`` (the tree was exhausted: ``objective`` is the
-    proven optimum of the whole-module compact model), ``"TIME_LIMIT"`` or
-    ``"NODE_LIMIT"`` (``[lower_bound, objective]`` is still a valid bracket).
+    proven optimum of the whole-module compact model), ``"WITHIN_TOLERANCE"``
+    (exhausted with ``gap_abs``: ``objective - lower_bound <= gap_abs``),
+    ``"TIME_LIMIT"`` or ``"NODE_LIMIT"`` (``[lower_bound, objective]`` is
+    still a valid bracket). ``lower_bound`` is always rounded up to the next
+    attainable objective value (a multiple of ``delta``) -- the free
+    tightening.
+    An instance with no schedule that serves and completes every vehicle
+    within the horizon raises instead (``build_solution``).
 
     ``objective`` / ``lower_bound`` / ``gap`` are in the compact model's own
-    units: total sojourn ``sum_j (delta*D_j - a_j)`` over
+    units: total sojourn ``sum_j delta*(D_j - k_j)`` over
     ``objective_cohorts``, in minutes. ``total_sojourn`` / ``total_sojourn_LB``
     repeat ``objective`` / ``lower_bound``, and ``mean_sojourn`` /
     ``mean_sojourn_LB`` divide them by ``n_optimized``.
@@ -95,20 +101,34 @@ class PBSolution:
 
 def build_solution(bp: "BranchAndPrice", status: str, *, run_compact_check: bool = True) -> PBSolution:
     if bp.incumbent is None:
-        raise RuntimeError("branch-and-price finished without any feasible schedule (should be impossible)")
+        if status == "OPTIMAL":
+            raise RuntimeError(
+                f"Branch-and-price proved the model infeasible: no schedule serves and completes "
+                f"every vehicle within the horizon (K={bp.K} slots of {bp.delta:g} min). "
+                "Lengthen the horizon."
+            )
+        raise RuntimeError(
+            f"Branch-and-price stopped ({status}) before finding any schedule that serves and "
+            "completes every vehicle; pass initial_schedule or raise the limits."
+        )
     delta, K, h = bp.delta, bp.K, bp.delta / 60.0
     schedule = bp.incumbent
     connectors = bp.incumbent_connectors
     UB = float(bp.upper_bound)
     if status == "OPTIMAL":
-        LB = UB
+        # The tree is exhausted: the optimum is UB, or (with gap_abs) at least
+        # the least bound of a node pruned within the tolerance.
+        LB = min(UB, bp.lattice_up(bp._pruned_min))
+        if LB < UB - 1e-9:
+            status = "WITHIN_TOLERANCE"
     else:
         open_bounds = [b for b in bp.open_bounds_at_stop if math.isfinite(b)]
         LB = min(open_bounds) if open_bounds else -math.inf
         if len(open_bounds) < len(bp.open_bounds_at_stop):
             LB = -math.inf  # an open node was never bounded
+        LB = min(LB, bp._pruned_min)  # nodes pruned within the tolerance
         # Any global bound proven earlier is still valid; keep the best one.
-        LB = min(max(LB, bp._global_lb), UB)
+        LB = min(bp.lattice_up(max(LB, bp._global_lb)), UB)
     bp._note_bounds("end", LB, force=True)
 
     rows: list[dict[str, object]] = []
@@ -118,10 +138,8 @@ def build_solution(bp: "BranchAndPrice", status: str, *, run_compact_check: bool
         plan = schedule[j]
         bv = bp.boundary.get(j)
         cohort = bp.cohorts.get(j, Cohort.MEASUREMENT)
-        served = not plan.is_null
-        if served:
-            for k in plan.occupied_slots():
-                routing[plan.pile, connectors[j], k] = plan.q(k)  # type: ignore[index]
+        for k in plan.occupied_slots():
+            routing[plan.pile, connectors[j], k] = plan.q(k)
         rows.append(
             {
                 "vehicle_id": j,
@@ -129,10 +147,10 @@ def build_solution(bp: "BranchAndPrice", status: str, *, run_compact_check: bool
                 "boundary_mode": bv.mode.value if bv is not None else None,
                 "in_objective": bp.weights[j] > 0,
                 "arrival": v.a,
-                "served": served,
-                "pile": plan.pile if served else None,
-                "connector": connectors.get(j) if served else None,
-                "start_slot": float(plan.start_slot(K)),
+                "served": True,  # closed system; kept so the table matches the other packages'
+                "pile": plan.pile,
+                "connector": connectors.get(j),
+                "start_slot": float(plan.start),
                 "departure_slot": float(plan.departure),
                 "sojourn_min": sojourn_minutes(plan.departure, v.a, delta),
                 "energy_kwh": h * sum(plan.power.values()),

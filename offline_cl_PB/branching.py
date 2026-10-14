@@ -6,8 +6,8 @@ Branching never acts on a master variable. It splits one vehicle's plan
 space on an attribute the pricer can enforce, in this order:
 
 1. departure  ``D_j <= t``  |  ``D_j >= t+1``
-2. start      ``S_j <= t``  |  ``S_j >= t+1``   (null plan: ``S = K``)
-3. pile       ``m_j == m``  |  ``m_j != m``     (null plan: the ``!=`` side)
+2. start      ``S_j <= t``  |  ``S_j >= t+1``
+3. pile       ``m_j == m``  |  ``m_j != m``
 4. modules    ``q_jk <= t`` |  ``q_jk >= t+1``
 
 A vehicle needs branching when its *positive-weight columns disagree* on
@@ -112,7 +112,7 @@ def try_recover(
         items = support.get(v.id, [])
         if not items:
             return Recovery(None, False, set())
-        timetable = {(plan.pile, plan.start_slot(K), plan.departure) for plan, _ in items}
+        timetable = {(plan.pile, plan.start, plan.departure) for plan, _ in items}
         if len(timetable) > 1:
             return Recovery(None, False, set())
         profiles = {plan.q_profile() for plan, _ in items}
@@ -128,11 +128,9 @@ def try_recover(
     count: dict[tuple[int, int], int] = {}
     used: dict[tuple[int, int], int] = {}
     for plan in schedule.values():
-        if plan.is_null:
-            continue
         for k in plan.occupied_slots():
-            count[plan.pile, k] = count.get((plan.pile, k), 0) + 1  # type: ignore[index]
-            used[plan.pile, k] = used.get((plan.pile, k), 0) + plan.q(k)  # type: ignore[index]
+            count[plan.pile, k] = count.get((plan.pile, k), 0) + 1
+            used[plan.pile, k] = used.get((plan.pile, k), 0) + plan.q(k)
     over_connectors = [key for key, c in count.items() if c > station.n_connectors]
     if over_connectors:
         # Every vehicle's occupancy is unanimous, so the master's connector
@@ -186,7 +184,7 @@ def select_branch(
 
     for kind, attr in (
         ("departure", lambda plan: plan.departure),
-        ("start", lambda plan: plan.start_slot(K)),
+        ("start", lambda plan: plan.start),
     ):
         cands = attribute_candidates(attr)
         if cands:
@@ -202,15 +200,12 @@ def select_branch(
                 j, kind, desc, restrictions.with_vehicle(j, left), restrictions.with_vehicle(j, right), left_w, right_w
             )
 
-    # Pile: start/departure now agree for every vehicle, so a vehicle whose
-    # support contains the null plan has only null plans in it.
+    # Pile: start/departure now agree for every vehicle.
     cands = []
     for j, items in support.items():
         weights: dict[int, float] = {}
         for plan, lam in items:
-            if plan.is_null:
-                continue
-            weights[plan.pile] = weights.get(plan.pile, 0.0) + lam  # type: ignore[index]
+            weights[plan.pile] = weights.get(plan.pile, 0.0) + lam
         if len(weights) > 1:
             total = sum(weights.values())
             m_best, w_best = max(weights.items(), key=lambda kv: (kv[1], -kv[0]))
@@ -231,8 +226,6 @@ def select_branch(
     cands = []
     for j, items in support.items():
         first = items[0][0]
-        if first.is_null:
-            continue
         for k in first.occupied_slots():
             weights = {}
             for plan, lam in items:

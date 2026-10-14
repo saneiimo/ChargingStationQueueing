@@ -3,17 +3,18 @@ Inputs the algorithm needs -- Section 8 of ``dantzig_wolfe_decomposition.html``.
 
   - ``earliest_departures`` (8.1, eq. 34): re-exported directly from
     ``offline_cl_opt.model`` -- the identical greedy single-vehicle
-    recursion (eq. 22 there), needed here for the same two reasons Section
-    8.1 gives: as the pricer's own valid inequality ``D_j >= E_j``
-    (``pricer.build_pricer``), and as a cheap sanity-check lower bound
-    ``sum_j E_j`` on the optimum from the outset.
-  - ``seed_columns``: builds the initial column pool column generation
-    needs (Section 7.2) -- the null plan for every vehicle (mandatory, is
-    what makes the restricted master feasible from iteration one with no
-    artificial variables) plus, for every vehicle and pile, the
-    "charge at the acceptance limit from k_j" plan -- individually optimal
-    for that (vehicle, pile) pair alone, and cheap to build (no MILP
-    solve, the same greedy recursion ``earliest_departures`` already uses).
+    recursion (eq. 22 there). Not a constraint anywhere; only the cheap
+    sanity-check floor ``sum_j (delta*E_j - a_j)`` on the optimum
+    (``ColGenResult.sojourn_floor``).
+  - ``initial_schedule``: one complete, jointly feasible plan per vehicle
+    -- what makes the restricted master feasible from iteration one, since
+    the closed system has no "never served" column (see
+    ``master.build_master``).
+  - ``seed_columns``: extra starting columns (Section 7.2) -- for every
+    vehicle and pile, the "charge at the acceptance limit from k_j" plan,
+    individually optimal for that (vehicle, pile) pair alone and cheap to
+    build (no MILP solve, the same greedy recursion ``earliest_departures``
+    already uses), when it finishes within the horizon.
   - ``columns_from_evs``: an optional second seed source, converting a real
     simulation's own output into plans -- the document's other suggested
     source ("simulate first-come-first-served... convert each vehicle's
@@ -23,9 +24,11 @@ Inputs the algorithm needs -- Section 8 of ``dantzig_wolfe_decomposition.html``.
     the same purpose in the compact model.
   - ``boundary_seed_plan``/``fixed_plan``: seeding for boundary vehicles
     (``offline_cl_opt.boundary.BoundaryVehicle``, see that module's own
-    docstring and ``offline_cl_dw.colgen``'s "Boundary conditions") --
-    these never get the ordinary null-plan-based seeding above, since a
-    vehicle already queued/plugged in cannot be "never served".
+    docstring and ``offline_cl_dw.colgen``'s "Boundary conditions").
+
+Every column built here delivers the vehicle's full request by its
+departure ``D <= K`` (the closed system's completion requirement); a
+construction that cannot finish within the horizon yields no column.
 """
 
 from __future__ import annotations
@@ -37,7 +40,7 @@ from offline_cl_opt.boundary import BoundaryMode, BoundaryVehicle
 from offline_cl_opt.instance import StationSpec, VehicleData
 from offline_cl_opt.model import earliest_departures  # noqa: F401  (re-exported)
 
-from .columns import Plan, null_plan
+from .columns import Plan
 from .pricer import _release_slot
 
 if TYPE_CHECKING:
@@ -52,10 +55,10 @@ def _greedy_solo_plan(
     K: int,
     *,
     initial_energy: float = 0.0,
-) -> Plan:
+) -> Plan | None:
     """
     The "charge at the acceptance limit from k_j" plan for vehicle ``v`` on
-    ``pile`` -- almost the same discrete trajectory ``earliest_departures``
+    ``pile`` (``None`` if it cannot deliver ``W_j`` within the horizon) -- almost the same discrete trajectory ``earliest_departures``
     simulates (eq. 34), just also keeping the power profile instead of only
     its stopping slot. Individually optimal for this (vehicle, pile) pair
     alone (no contention assumed), and needs no MILP solve.
@@ -91,36 +94,26 @@ def _greedy_solo_plan(
         power[k] = step_power
         x += h * step_power
         k += 1
-    departure = min(K, k)
-    if not power:
-        return null_plan(v.id, K)
-    return Plan(vehicle_id=v.id, pile=pile, start=k0, departure=departure, power=power)
+    if x < v.W - 1e-9 or not power:
+        return None  # cannot finish within the horizon: not a column
+    return Plan(vehicle_id=v.id, pile=pile, start=k0, departure=k, power=power)
 
 
 def boundary_seed_plan(
     v: VehicleData, bv: BoundaryVehicle, station: StationSpec, delta: float, K: int
-) -> Plan:
+) -> Plan | None:
     """
-    A guaranteed-feasible starting column for an OPTIMIZE-mode boundary
-    vehicle (``offline_cl_opt.boundary.BoundaryVehicle``).
+    An extra starting column for an OPTIMIZE-mode boundary vehicle
+    (``offline_cl_opt.boundary.BoundaryVehicle``), or ``None`` if neither
+    construction below finishes within the horizon.
 
-    These vehicles get no null plan (a vehicle already mid-charge cannot be
-    "never served" -- see ``run_column_generation``'s own docstring,
-    "Boundary conditions"), so the master needs *some* feasible column for
-    them from iteration one, the role the null plan plays for everyone
-    else. Unlike an ordinary vehicle's seed, though, that column is not
-    optional: convexity forces it to lambda=1, so it lands in the capacity
-    rows (25)/(26) whether it fits or not.
-
-    That is why the simulation's own realized trajectory
-    (``BoundaryVehicle.seed_power``) is preferred over the greedy fallback.
-    A greedy solo plan is built as if the vehicle owned the whole pile
-    (``_greedy_solo_plan``'s ``p_bar = min(p_max, N*Delta)``), so two
-    boundary vehicles sharing a pile seed two columns that each demand the
-    full pool -- and with no null plan to fall back on, the restricted
-    master is infeasible before column generation starts. The realized
-    trajectories cannot do that: they actually coexisted, so they satisfy
-    the capacity rows jointly by construction.
+    The simulation's own realized trajectory (``BoundaryVehicle.seed_power``)
+    is preferred over the greedy fallback: the realized trajectories of
+    vehicles that shared a pile actually coexisted, so they fit the capacity
+    rows (25)/(26) together, while a greedy solo plan is built as if the
+    vehicle owned the whole pile (``_greedy_solo_plan``'s
+    ``p_bar = min(p_max, N*Delta)``). Either way the column is only a seed;
+    master feasibility comes from ``initial_schedule``.
 
     The realized profile is also feasible for this vehicle's *own*
     subproblem, which (unlike a FIXED vehicle's) really does enforce
@@ -130,17 +123,18 @@ def boundary_seed_plan(
     ``W_j`` and the departure rule (19) holds -- flooring, as FIXED does,
     would truncate energy and make the column infeasible here.
 
-    Falls back to the greedy construction only when no realized profile was
-    recorded (e.g. a hand-built ``BoundaryVehicle``), which is safe for a
-    single boundary vehicle per pile but not in general.
+    The realized profile is used only when it departs within the horizon
+    (``seed_departure_slot <= K``); cut at ``K`` it would be incomplete.
+    Falls back to the greedy construction otherwise, or when no realized
+    profile was recorded (e.g. a hand-built ``BoundaryVehicle``).
     """
     assert bv.mode is BoundaryMode.OPTIMIZE
-    if bv.seed_power and bv.seed_departure_slot > 0:
+    if bv.seed_power and 0 < bv.seed_departure_slot <= K:
         return Plan(
             vehicle_id=bv.vehicle_id,
             pile=bv.pile,
             start=0,
-            departure=min(K, bv.seed_departure_slot),
+            departure=bv.seed_departure_slot,
             power=dict(bv.seed_power),
         )
     return _greedy_solo_plan(
@@ -173,18 +167,64 @@ def seed_columns(
     K: int,
 ) -> dict[int, list[Plan]]:
     """
-    Section 7.2's initial column pool: the null plan (mandatory) plus, for
-    every vehicle, one "charge at the limit" plan per pile.
+    Section 7.2's extra starting columns: for every vehicle, one "charge at
+    the limit" plan per pile, when it finishes within the horizon. These
+    need not fit together; master feasibility comes from
+    ``initial_schedule``.
     """
     columns: dict[int, list[Plan]] = {}
     for v in vehicles:
-        plans = [null_plan(v.id, K)]
+        plans = []
         for pile in range(station.n_piles):
             plan = _greedy_solo_plan(v, pile, station, delta, K)
-            if not plan.is_null:
+            if plan is not None:
                 plans.append(plan)
         columns[v.id] = plans
     return columns
+
+
+def initial_schedule(
+    vehicles: list[VehicleData],
+    station: StationSpec,
+    delta: float,
+    K: int,
+    boundary_vehicles: dict[int, BoundaryVehicle] | None = None,
+) -> dict[int, Plan] | None:
+    """
+    One complete plan per vehicle that fit every connector and module row
+    together -- the starting point ``master.build_master`` needs, built by
+    list scheduling (``offline_cl_PB.heuristics.greedy_list_schedule``:
+    boundary vehicles first, then every other vehicle in arrival order at
+    the (pile, start) that finishes it earliest in the capacity still
+    free). Its plans use whole modules, so they are feasible for the
+    continuous-module master too. FIXED boundary vehicles get their
+    ``fixed_plan``.
+
+    Returns ``None`` when list scheduling cannot finish some vehicle within
+    the horizon. That does not prove the instance infeasible (list
+    scheduling is a heuristic); pass a complete schedule of your own
+    instead, e.g. a drained simulation's via
+    ``offline_cl_PB.heuristics.schedule_from_simulation``.
+    """
+    # Imported here: offline_cl_PB builds on this package's Plan, so a
+    # module-level import would be circular.
+    from offline_cl_PB.heuristics import greedy_list_schedule
+
+    boundary_vehicles = boundary_vehicles or {}
+    schedule = greedy_list_schedule(vehicles, station, delta, K, boundary_vehicles)
+    if schedule is None:
+        return None
+    out: dict[int, Plan] = {}
+    for j, plan in schedule.items():
+        bv = boundary_vehicles.get(j)
+        if bv is not None and bv.mode is BoundaryMode.FIXED:
+            out[j] = fixed_plan(bv)
+        else:
+            out[j] = Plan(
+                vehicle_id=j, pile=plan.pile, start=plan.start, departure=plan.departure,
+                power=dict(plan.power),
+            )
+    return out
 
 
 def columns_from_evs(
@@ -197,8 +237,10 @@ def columns_from_evs(
     Build one plan per served, finished EV from a real simulation's own
     output (e.g. ``env.engine.metrics.finished_evs``) -- Section 7.2's
     other suggested seed source ("simulate first-come-first-served...").
-    EVs with no real pile assignment, no finite departure, or not present
-    in ``vehicles_by_id`` are simply skipped (nothing meaningful to seed).
+    EVs with no real pile assignment, no finite departure, a departure
+    after the horizon (the plan would be cut off unfinished), or not
+    present in ``vehicles_by_id`` are simply skipped (nothing meaningful to
+    seed).
 
     Unlike ``offline_cl_opt.adaptive._seed_values_from_evs``, this needs no
     symmetry-aware relabelling: the master's rows (25)/(26) don't
@@ -219,8 +261,8 @@ def columns_from_evs(
         pile = ev.pile_tracker.id
         k0 = _release_slot(v.a, delta)
         k_start = max(k0, math.floor(round(ev.service_start_time / delta, 9)))
-        k_departure = min(K, math.ceil(round(ev.departure_time / delta, 9)))
-        if k_departure <= k_start:
+        k_departure = math.ceil(round(ev.departure_time / delta, 9))
+        if k_departure <= k_start or k_departure > K:
             continue
 
         trace = sorted(ev.charge_trace, key=lambda row: row[0])

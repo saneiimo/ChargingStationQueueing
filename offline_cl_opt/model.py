@@ -1,27 +1,39 @@
 """
-Connector-lane offline MILP -- Section 4 ("The optimisation model") of
-``connector_lane_model.html`` -- solved with gurobipy.
+Connector-lane offline MILP for a **closed system**, solved with gurobipy.
 
-Implements the objective and constraints (2)-(19) (Groups A-E), plus
-one strengthening the source document adds once it discusses preprocessing
-(Section 9) and treats as part of the model proper:
+Every vehicle in the instance must be served and must receive its full
+energy requirement within the horizon: the model has no "unserved" or
+"unfinished" option. Constraints, in this module's own numbering (Groups
+A-E):
 
-  - (24) [optional, default on via ``bound_departures`` -- Section 9.3]: a
-    valid lower bound on each vehicle's own departure variable, which
-    speeds up the root LP relaxation at negligible cost.
+  - (3)-(6): one uninterrupted stay per vehicle, starting exactly once
+    (``sum_k eta_jk = 1`` -- every vehicle is connected).
+  - (8)-(9): start slot ``S_j = sum_k k*eta_jk`` and departure boundary
+    ``D_j = S_j + sum_k u_jk``.
+  - (10)-(12): one lane per vehicle, no overlap on a lane (big-M
+    ``K - k_j``, the smallest that keeps an inactive row slack).
+  - (13)-(15): power only while connected, from whole modules on the
+    vehicle's own lane, at most ``N`` modules per pile.
+  - (17)-(19): energy recursion, battery taper with the discrete constant
+    ``tau^delta_j``, departure rule (full energy at a departure inside the
+    horizon).
+  - **completion**: ``x_{j,K} >= W_j`` -- every vehicle holds its full
+    request by the end of the horizon. With ``x <= W_j`` this is an
+    equality, and since power is zero after departure it is the same as
+    "full request at departure". The departure rule (19) is implied by it
+    for integer solutions but kept because it tightens the LP relaxation.
 
-Optional pile/connector symmetry breaking (current Section 10, constraints
-(25)-(26)) is implemented via ``break_symmetry``, off by default -- see its
-parameter docstring below and README.md, "Symmetry breaking".
+The horizon must therefore be long enough for every vehicle to finish
+(otherwise the model is infeasible), and long enough not to restrict the
+optimum; choosing it is the caller's job (the objective sweep reads it off
+the discretized FIFO run).
 
-There is no "complete-service" variant modeled here (an earlier revision of
-the source document had one; the current document removes it -- see
-Section 6.3). The single objective is always the censored one: choose
-``horizon_minutes`` generous enough that no vehicle is left unresolved at
-the optimum (e.g. longer than a simple first-come-first-served schedule's
-makespan on the same arrivals), and verify that afterwards rather than
-enforcing it as a hard constraint -- Section 6.3's own recommended
-practice.
+Optional pile/connector symmetry breaking (constraints (25)-(26)) is
+implemented via ``break_symmetry``, off by default -- see its parameter
+docstring below and README.md, "Symmetry breaking".
+
+"Section N" references below are to the original design note
+(``connector_lane_model.html``); constraint numbers are this module's own.
 
 No per-vehicle right-edge windowing
 -------------------------------------
@@ -37,9 +49,8 @@ happen in the congested regime this model targets ("Carrying a right edge
 that is always the horizon adds notation and a boundary case without
 removing a single variable"). Every vehicle's variables/rows here are
 therefore generated over the *whole* ``[k_j, K)``, exactly the document's
-``Kset_j`` -- see ``earliest_departures``/``preprocess.py`` for what the
-incumbent is used for instead (an objective cutoff and a MIP start, not
-windowing).
+``Kset_j`` -- see ``preprocess.py`` for what an incumbent is used for
+instead (an objective cutoff, not windowing).
 
 No ``theta`` variable
 ----------------------
@@ -66,32 +77,34 @@ cumulative sum out inline would give slot ``k``'s row ``O(k)`` nonzeros,
 minutes" on a realistic instance. Carrying ``x`` as a variable keeps every
 row of (17)/(18)/(19) at a constant few nonzeros regardless of ``k``, since
 the recursion is a chain of equalities rather than a substitution. The
-vehicle's total energy requirement is enforced by ``x``'s own upper bound
-(``W_j``, a per-variable bound, cheaper than a row) rather than by a
-separate summed constraint.
+upper bound ``x <= W_j`` is a per-variable bound (cheaper than a row), and
+the completion row ``x_{j,K} >= W_j`` is one row per vehicle.
 
-Adaptive module integrality (``adaptive.py``, Section 8) and preprocessing
-(``preprocess.py``, Section 9 -- ``earliest_departures``/
-``incumbent_objective``, used for an objective cutoff and a MIP
-start, not windowing) are implemented on top of this model -- see their
-module docstrings. The recommended staged solve (Section 11) is not
-implemented end-to-end -- see README.md, "Scope".
+Adaptive module integrality (``adaptive.py``) and preprocessing
+(``preprocess.py`` -- ``incumbent_objective``, used for an objective
+cutoff, not windowing) are implemented on top of this model -- see their
+module docstrings.
 
-Objective: total sojourn, not sum_j D_j
------------------------------------------
+Objective: total sojourn on the slot grid, not sum_j D_j
+---------------------------------------------------------
 The source document's objective (1) is ``sum_j D_j`` (departure slot
 boundaries). This module minimizes total sojourn time in minutes instead,
+measured on the slot grid like every other decision of the model:
 
-    sum_{j in objective} (delta * D_j - a_j),
+    sum_{j in objective} delta * (D_j - k_j),      k_j = ceil(a_j / delta),
 
-which is (1) scaled by ``delta > 0`` and shifted by the constant
-``sum_j a_j`` (the objective's vehicle set is fixed: an unserved vehicle
-still counts, at ``D_j = K``), so it has exactly the same optimal schedules
-and the same ranking of every feasible schedule. What changes is the
-*value*: ``ObjVal``/``ObjBound`` are total sojourn in minutes, and Gurobi's
-relative ``MIPGap`` is measured against total sojourn rather than against
-a sum inflated by every vehicle's arrival time. Objective values lie on the
-lattice ``delta * n - sum_j a_j`` (``n`` integer); see
+i.e. from the vehicle's release slot (the first slot it may use) to its
+departure slot. That is (1) scaled by ``delta > 0`` and shifted by the
+constant ``delta * sum_j k_j`` (the objective's vehicle set is fixed: every
+vehicle is served), so it has exactly the same optimal schedules and the
+same ranking of every feasible schedule. What changes is the *value*:
+``ObjVal``/``ObjBound`` are total sojourn in minutes, and Gurobi's relative
+``MIPGap`` is measured against total sojourn. With arrivals already on the
+grid (``a_j = delta * k_j``) this is the raw ``delta * D_j - a_j``; with
+continuous arrivals it does not charge a vehicle for the part of a slot
+before its release, which no schedule can use. Every objective value is a
+whole multiple of ``delta`` (with 0/1 objective weights), so any proven
+lower bound rounds up to the next multiple -- see
 ``sojourn_objective_round_up``.
 
 Slot convention: horizon T split into K = ceil(T/delta) half-open slots,
@@ -121,20 +134,18 @@ appears in ``vehicles``/``boundary_vehicles`` with ``a=0``:
      its whole known trajectory; ``BoundaryMode.OPTIMIZE``: only
      ``u_{j,0}=1`` and its lane ``y_{j,pile,connector}=1`` -- everything
      else about it stays a free decision).
-  2. In the Groups D+E loop, a ``FIXED`` vehicle's (17)-(19)/(24) rows are
-     skipped entirely (nothing to decide or verify -- its trajectory is
-     exogenous ground truth, not re-checked against an energy target,
-     which also sidesteps the departure-slot floor-truncation possibly
-     landing a hair short of full W_j). An ``OPTIMIZE`` vehicle's energy
-     recursion (17) starts from its own ``initial_energy_kwh`` instead of
-     0 -- ``x_jk`` keeps meaning "energy delivered since arrival" exactly
-     as for any other vehicle, just seeded at a nonzero value reflecting
-     the head start it already has; R_j/W_j (defined off the vehicle's
-     real original ``s_i``) need no change at all for this to stay
-     correct. (24) is skipped for both modes: the standard ``E_j``
-     (``earliest_departures``) assumes starting from ``s_i`` and would be
-     an invalid (too-large) lower bound for a vehicle that already has a
-     head start.
+  2. In the Groups D+E loop, a ``FIXED`` vehicle's (17)-(19) rows and its
+     completion row are skipped entirely (nothing to decide or verify --
+     its trajectory is exogenous ground truth that did finish in the
+     simulation, and re-checking it against ``W_j`` would trip on the
+     departure-slot floor-truncation, which drops its last partial slot of
+     energy). An ``OPTIMIZE`` vehicle's energy recursion (17) starts from
+     its own ``initial_energy_kwh`` instead of 0 -- ``x_jk`` keeps meaning
+     "energy delivered since arrival" exactly as for any other vehicle,
+     just seeded at a nonzero value reflecting the head start it already
+     has; R_j/W_j (defined off the vehicle's real original ``s_i``) need
+     no change at all, and the completion row asks only for the
+     remainder.
 
 Caution: ``break_symmetry`` forces piles/connectors to be used in
 ascending-vehicle-id order (Section 10) -- a boundary vehicle's pinned
@@ -163,28 +174,37 @@ def _release_slot(a: float, delta: float) -> int:
     return math.ceil(round(a / delta, 9))
 
 
+def release_time(arrival: float, delta: float) -> float:
+    """``delta * k_j``: the arrival rounded up to the slot grid, where the
+    vehicle's first usable slot starts."""
+    return delta * _release_slot(arrival, delta)
+
+
 def sojourn_minutes(departure_slot: float, arrival: float, delta: float) -> float:
     """
-    One vehicle's contribution to the objective: ``delta * D_j - a_j``,
-    minutes from arrival to its departure slot boundary (``D_j = K`` for a
-    vehicle unserved or unfinished at the horizon -- the censored value).
-    Every package (compact model, DW, branch-and-price) prices a vehicle
-    with this, so their objective values are directly comparable.
+    One vehicle's contribution to the objective: ``delta * (D_j - k_j)``
+    with ``k_j = ceil(a_j / delta)``, minutes from its release slot to its
+    departure slot boundary (see this module's docstring, "Objective").
+    Takes the raw arrival ``a_j`` and discretizes it. Every package
+    (compact model, DW, branch-and-price) prices a vehicle with this, so
+    their objective values are directly comparable.
     """
-    return delta * departure_slot - arrival
+    return delta * departure_slot - release_time(arrival, delta)
 
 
 def sojourn_objective_round_up(value: float, delta: float, arrival_total: float, slack: float = 0.0) -> float:
     """
     The smallest attainable objective value ``>= value - slack``.
 
-    With objective weights in {0, 1}, ``sum_j (delta * D_j - a_j)`` over a
+    With objective weights in {0, 1}, ``sum_j delta * (D_j - k_j)`` over a
     fixed vehicle set equals ``delta * n - arrival_total`` for an integer
-    ``n = sum_j D_j``, so any proven lower bound rounds up to that lattice:
-    ``delta * ceil((value - slack + arrival_total) / delta) - arrival_total``.
-    Exact for any ``a_j`` (integer or not); ``slack`` absorbs floating-point
-    noise in ``value`` so a bound sitting exactly on a lattice point is not
-    pushed one step too high. ``-inf``/``inf`` pass through unchanged.
+    ``n = sum_j D_j`` and ``arrival_total = delta * sum_j k_j`` -- a whole
+    multiple of ``delta`` -- so any proven lower bound rounds up to that
+    lattice: ``delta * ceil((value - slack + arrival_total) / delta) -
+    arrival_total``. Pass ``arrival_total=0`` for the plain multiples of
+    ``delta`` (the same lattice). ``slack`` absorbs floating-point noise in
+    ``value`` so a bound sitting exactly on a lattice point is not pushed one
+    step too high. ``-inf``/``inf`` pass through unchanged.
     """
     if not math.isfinite(value):
         return value
@@ -192,20 +212,50 @@ def sojourn_objective_round_up(value: float, delta: float, arrival_total: float,
     return delta * n - arrival_total
 
 
+def lattice_round_up(value: float, delta: float) -> float:
+    """
+    The free tightening: a proven lower bound on total sojourn, rounded up
+    to the next whole multiple of ``delta`` -- every attainable objective
+    value is one (see this module's docstring, "Objective"), so the optimum
+    is at least that. A ``1e-6`` relative slack keeps solver noise just
+    above a multiple from pushing the bound a whole step too high.
+    ``-inf``/``inf``/``nan`` pass through unchanged.
+    """
+    if not math.isfinite(value):
+        return value
+    return sojourn_objective_round_up(value, delta, 0.0, slack=1e-6 * max(1.0, abs(value)))
+
+
+def lattice_abs_gap(tolerance: float | None, delta: float) -> float:
+    """
+    Gurobi ``MIPGapAbs`` that stops exactly when the incumbent is proven
+    within ``tolerance`` minutes (total sojourn) of the optimum, using the
+    free tightening.
+
+    Objective values are multiples of ``delta``, so the tolerance only
+    matters in whole steps: ``g = delta * floor(tolerance / delta)``. Once
+    ``incumbent - bound < g + delta``, rounding the bound up to a multiple
+    of ``delta`` leaves a gap of at most ``g``. So the returned value sits a
+    hair under ``g + delta``; ``tolerance=None``/0 gives just under
+    ``delta``, i.e. "stop as soon as the incumbent is proven optimal".
+    """
+    steps = math.floor(tolerance / delta + 1e-9) if tolerance else 0
+    return delta * (steps + 1) * (1.0 - 1e-6)
+
+
 def _earliest_departure_slot(
     v: VehicleData, p_bar: float, delta: float, k0: int, K: int
 ) -> int:
     """
-    (22), Section 9.1: the earliest departure boundary vehicle ``v`` could
-    possibly achieve, alone on its own connector with the whole module pool
-    to itself, charging at its own acceptance limit throughout.
+    The earliest departure boundary vehicle ``v`` could possibly achieve,
+    alone on its own connector with the whole module pool to itself,
+    charging at its own acceptance limit throughout.
 
     Uses the model's own discrete update (flat cap ``p_bar``, then the
     taper cap via ``tau_delta``), not a continuous closed form -- only the
     discrete recursion is guaranteed to give a bound valid for the
-    discretized model itself (the document is explicit about this).
-    Capped at ``K``: a vehicle unreachable-in-time counts as ``K``, the
-    same sentinel Section 6.3 uses.
+    discretized model itself. Capped at ``K``: ``K`` means "cannot finish
+    inside the horizon even alone" (the closed model is then infeasible).
     """
     h = delta / 60.0
     tau_d = v.tau_delta_hours(delta)
@@ -222,11 +272,10 @@ def earliest_departures(
     vehicles: list[VehicleData], station: StationSpec, delta: float, horizon_minutes: float
 ) -> dict[int, int]:
     """
-    (22), Section 9.1: per-vehicle earliest possible departure boundary
-    ``E_j``, for every vehicle in ``vehicles``. A pure calculation -- no
-    MILP solve needed -- used both by ``preprocess.py`` and internally by
-    ``build_cl_model`` (for the optional departure lower bound (24),
-    ``bound_departures``).
+    Per-vehicle earliest possible departure boundary ``E_j``, for every
+    vehicle in ``vehicles``. A pure calculation -- no MILP solve needed.
+    Not a constraint of the model; used for diagnostics (e.g. a cheap
+    lower bound on total sojourn, ``sum_j (delta*E_j - a_j)``).
     """
     K = math.ceil(round(horizon_minutes / delta, 9))
     N, Delta = station.n_modules, station.p_module
@@ -250,7 +299,6 @@ class ConnectorLaneModel:
     K: int
     releases: dict[int, int]
     break_symmetry: bool
-    bound_departures: bool
     tie_break: bool
     # vehicle_id -> BoundaryVehicle for every already-in-service vehicle at
     # t=0 (see boundary.py); {} if none. Kept for post-hoc inspection --
@@ -276,10 +324,10 @@ class ConnectorLaneModel:
     # x_{j,k_j} = 0 (17) is never materialised, matching the u_{j,-1}=0
     # convention.
     x: gp.tupledict
-    # S_j, D_j (Section 5.2) are dependent linear expressions in eta/u, not
-    # decision variables -- introducing them as Gurobi Vars would only add
-    # branching surface for no benefit, since they're already exactly pinned
-    # by (7)-(9).
+    # S_j, D_j are dependent linear expressions in eta/u, not decision
+    # variables -- introducing them as Gurobi Vars would only add branching
+    # surface for no benefit, since they're already exactly pinned by
+    # (8)-(9).
     S: dict[int, gp.LinExpr]
     D: dict[int, gp.LinExpr]
 
@@ -293,7 +341,6 @@ def build_cl_model(
     relax_modules: bool = False,
     module_pool_cap: int | None = None,
     break_symmetry: bool = False,
-    bound_departures: bool = True,
     tie_break: bool = False,
     boundary_vehicles: dict[int, BoundaryVehicle] | None = None,
     cohorts: dict[int, Cohort] | None = None,
@@ -301,11 +348,11 @@ def build_cl_model(
     model_name: str = "connector_lane_offline",
 ) -> ConnectorLaneModel:
     """
-    Build (but do not solve) the connector-lane MILP: minimize total
-    sojourn ``sum_j (delta*D_j - a_j)`` over ``objective_cohorts`` (minutes;
-    the document's (1) scaled and shifted -- see the module docstring)
-    subject to (2)-(19), plus, by default, (24) (optional,
-    ``bound_departures``).
+    Build (but do not solve) the closed-system connector-lane MILP:
+    minimize total sojourn ``sum_j delta*(D_j - k_j)`` over
+    ``objective_cohorts`` (minutes) subject to (3)-(15), (17)-(19) and the
+    completion constraint -- every vehicle served and fully charged by the
+    end of the horizon (see the module docstring).
 
     Parameters
     ----------
@@ -317,14 +364,12 @@ def build_cl_model(
     delta :
         Slot length in minutes.
     horizon_minutes :
-        T, the horizon length; K = ceil(T / delta) slots. Vehicles that
-        cannot finish by T remain unserved or unfinished and contribute a
-        departure boundary of K, i.e. a sojourn of ``delta*K - a_j`` (the
-        censored objective, Section 6.3) --
-        there is no hard "must finish" variant; choose a horizon generous
-        enough that this doesn't bind at the optimum, and verify that
-        afterwards (check every vehicle has ``D_j < K`` and received its
-        full ``W_j`` -- ``extract_solution``'s ``per_vehicle`` reports both).
+        T, the horizon length; K = ceil(T / delta) slots. Every vehicle
+        must finish by T, so a horizon too short for that makes the model
+        infeasible, and a horizon shorter than the makespan of every optimal
+        schedule restricts the optimum (the value can only decrease, never
+        increase, as T grows). ``per_vehicle['departure_slot'] == K`` in a
+        solution flags a vehicle finishing right at the horizon edge.
     relax_modules :
         If True, declare ``r`` as continuous on ``[0, module_pool_cap]``
         instead of integer -- gives ``CL_R``, the relaxation Section 8's
@@ -338,7 +383,8 @@ def build_cl_model(
         ``station.n_modules - station.n_connectors + 1`` for Section 8.4's
         conservative shortcut, which guarantees a solution roundable into a
         feasible schedule for the exact model without any further repair --
-        see ``adaptive.conservative_feasible_solution``.
+        see ``adaptive.conservative_feasible_solution``. Fewer modules mean
+        slower charging, so this can make a tight horizon infeasible.
     break_symmetry :
         If True, add constraints (25)-(26) (current Section 10): all piles
         are identical and, within a pile, all connectors are identical, so
@@ -353,14 +399,6 @@ def build_cl_model(
         matters more here since ``adaptive.py``'s whole strategy leans on
         warm-starting -- measure the effect on your own instance before
         turning this on for adaptive solves.
-    bound_departures :
-        If True (default), add (24), Section 9.3: a valid lower bound on
-        ``D_j`` derived from ``earliest_departures`` (22) and, for a
-        departing vehicle, the minimum number of slots it must have
-        occupied. Cheap (``J`` extra rows), and the source document
-        recommends it because the LP relaxation can otherwise report a
-        ``D_j`` -- which drives the objective -- well below what's
-        achievable, weakening the root bound.
     tie_break :
         If True, add a secondary, lower-priority objective that prefers
         front-loaded power delivery, purely to break ties among the (often
@@ -440,14 +478,10 @@ def build_cl_model(
         for mm in range(station.n_piles)
         for cc in range(station.n_connectors)
     ]
-    # P_bar_j = min(P_max_j, N*Delta) -- Section 3.4: a vehicle can never be
-    # served by more modules than one pile owns. Used as the tightened
-    # big-M in (13)/(14) rather than P_max_j alone.
+    # P_bar_j = min(P_max_j, N*Delta): a vehicle can never be served by
+    # more modules than one pile owns. Used as the tightened big-M in
+    # (13)/(14) rather than P_max_j alone.
     p_bar = {v.id: min(v.p_max, N * Delta) for v in vehicles}
-
-    # (22), Section 9.1/9.3: only computed when needed for (24) -- a pure,
-    # cheap, per-vehicle calculation, no MILP solve.
-    E = earliest_departures(vehicles, station, delta, horizon_minutes) if bound_departures else {}
 
     m = gp.Model(model_name)
     m.Params.OutputFlag = 0  # solve_cl_model turns this on if requested
@@ -502,9 +536,9 @@ def build_cl_model(
     eta = m.addVars(jk_pairs, lb=0.0, ub=1.0, name="eta")
     # x_jk (17): delivered energy strictly before slot k, kWh. A real Gurobi
     # variable -- see the module docstring, "x is a real variable, not a
-    # running expression" -- with its own per-vehicle upper bound W_j,
-    # which is what enforces the vehicle's total energy requirement (no
-    # separate summed row needed, Section 5.5).
+    # running expression" -- with its own per-vehicle upper bound W_j (a
+    # vehicle never receives more than it asked for); the completion row
+    # below makes it receive exactly that.
     x = m.addVars(
         jk_x_pairs,
         lb=0.0,
@@ -515,7 +549,7 @@ def build_cl_model(
     # ============================================================
     # Boundary conditions -- pin u/y/p for vehicles already plugged in at
     # t=0 (see the module docstring, "Boundary conditions"). Everything
-    # else about them (sequencing (11)-(12), module capacity (14)-(16),
+    # else about them (sequencing (11)-(12), module capacity (14)-(15),
     # the objective) needs no special handling: it already falls out of
     # the ordinary constraints below once these bounds are fixed.
     # ============================================================
@@ -552,17 +586,18 @@ def build_cl_model(
             m.addConstr(eta[j, k] >= u[j, k] - u_prev, name=f"C3_eta_lb[{j},{k}]")
             m.addConstr(eta[j, k] <= u[j, k], name=f"C4_eta_le_u[{j},{k}]")
             m.addConstr(eta[j, k] <= 1 - u_prev, name=f"C5_eta_le_1mprev[{j},{k}]")
+        # (6): exactly one plug-in edge -- every vehicle is served (closed
+        # system: there is no "never connected" option).
         m.addConstr(
-            gp.quicksum(eta[j, k] for k in range(k0, K)) <= 1, name=f"C6_one_start[{j}]"
+            gp.quicksum(eta[j, k] for k in range(k0, K)) == 1, name=f"C6_one_start[{j}]"
         )
 
-    # --- (7)-(9): served indicator, start slot, departure boundary --------------
+    # --- (8)-(9): start slot and departure boundary -----------------------------
     S: dict[int, gp.LinExpr] = {}
     D: dict[int, gp.LinExpr] = {}
     for v in vehicles:
         j, k0 = v.id, releases[v.id]
-        v_lin = gp.quicksum(eta[j, k] for k in range(k0, K))  # (7)
-        S_lin = K * (1 - v_lin) + gp.quicksum(k * eta[j, k] for k in range(k0, K))  # (8)
+        S_lin = gp.quicksum(k * eta[j, k] for k in range(k0, K))  # (8)
         occ_len = gp.quicksum(u[j, k] for k in range(k0, K))
         S[j] = S_lin
         D[j] = S_lin + occ_len  # (9): D_j = S_j + sum_k u_jk
@@ -610,23 +645,28 @@ def build_cl_model(
                     earlier_on_prev_connector = earlier_on_prev_connector + y[j, mm, cc - 1]
 
     # --- (11)-(12): no two vehicles overlap on one lane ---------------------------
+    # Big-M K - k_j (resp. K - k_i): when the bracket is >= 1 the row reads
+    # S_j >= D_i - (K - k_j) * (>=1), and D_i <= K, S_j >= k_j make that
+    # slack -- so this is the smallest coefficient that still switches the
+    # row off when the two vehicles do not share the lane in that order.
     for (i, j) in pair_list:
         Si, Di = S[i], D[i]
         Sj, Dj = S[j], D[j]
         bij = b[i, j]
+        Mj, Mi = K - releases[j], K - releases[i]
         for (mm, cc) in lanes:
             yi, yj = y[i, mm, cc], y[j, mm, cc]
             m.addConstr(
-                Sj >= Di - K * (3 - yi - yj - bij),
+                Sj >= Di - Mj * (3 - yi - yj - bij),
                 name=f"C11_seq[{i},{j},{mm},{cc}]",
             )
             m.addConstr(
-                Si >= Dj - K * (2 - yi - yj + bij),
+                Si >= Dj - Mi * (2 - yi - yj + bij),
                 name=f"C12_seq[{i},{j},{mm},{cc}]",
             )
 
     # ============================================================
-    # Group C -- power delivery and module routing: (13)-(16).
+    # Group C -- power delivery and module routing: (13)-(15).
     # ============================================================
 
     # --- (13): power only while connected, capped at P_bar_j --------------------
@@ -656,18 +696,9 @@ def build_cl_model(
                 name=f"C15_module_pool[{mm},{k}]",
             )
 
-    # --- (16): station-level power bound (valid inequality, tightens the LP) ----
-    for k in range(K):
-        active = [v.id for v in vehicles if releases[v.id] <= k]
-        if active:
-            m.addConstr(
-                gp.quicksum(p[j, k] for j in active) <= station.n_piles * N * Delta,
-                name=f"C16_station_power[{k}]",
-            )
-
     # ============================================================
-    # Groups D+E -- energy accounting, battery acceptance and the departure
-    # rule: (17)-(19), plus (24). One per-vehicle pass, matching the
+    # Groups D+E -- energy accounting, battery acceptance, the departure
+    # rule (17)-(19) and the completion row. One per-vehicle pass, matching the
     # document's own D-then-E order exactly, since every row here is
     # already O(1)-sparse (real x variables, not an inline running sum --
     # see the module docstring) so there's no efficiency reason to
@@ -678,11 +709,12 @@ def build_cl_model(
         bv = boundary_vehicles.get(j)
 
         # FIXED-mode boundary vehicles have nothing to decide or verify:
-        # their whole trajectory is already pinned above, so (17)-(19)/(24)
-        # would only risk a spurious infeasibility (e.g. the departure-slot
-        # floor-truncation in boundary.py landing a hair short of the full
-        # W_j -- see this module's own docstring, "Boundary conditions").
-        # Skip Groups D+E entirely for them.
+        # their whole trajectory is already pinned above (one that did
+        # finish in the simulation), so (17)-(19) and the completion row
+        # would only risk a spurious infeasibility (the departure-slot
+        # floor-truncation in boundary.py drops the energy of its last
+        # partial slot -- see this module's own docstring, "Boundary
+        # conditions"). Skip Groups D+E entirely for them.
         if bv is not None and bv.mode is BoundaryMode.FIXED:
             continue
 
@@ -705,41 +737,24 @@ def build_cl_model(
             m.addConstr(tau_d * p[j, k] + x_prev <= v.R, name=f"C18_taper_cap[{j},{k}]")
             # (19): departure rule -- the raw occupancy difference directly,
             # no falling-edge indicator needed (see the module docstring,
-            # "No theta variable", and Section 5.6's proof). Skipped at
-            # k=k0 itself: u_{j,k0-1}=0 by convention makes the row read
-            # x[j,k0]=0 >= W_j*(0-u[j,k0]) <= 0, always true, so generating
-            # it would be a no-op. Also skipped at k=K (the last iteration
-            # of this loop is k=K-1, whose row is the one at k=K-1+1=K if
-            # generated -- but (19) itself only runs to k=K-1 in the
-            # document, i.e. this loop's own body never reaches k=K for the
-            # departure row): the absence of a row exactly at the horizon
-            # is Section 6.3's deliberate censoring, not an oversight.
+            # "No theta variable"). Rows for k in (k0, K-1]: at k=k0,
+            # u_{j,k0-1}=0 makes the row read x >= W_j*(0-u) <= 0, always
+            # true. A departure exactly at the horizon (k=K) is covered by
+            # the completion row below. For integer solutions (19) is
+            # implied by completion (power is zero after departure, so
+            # x_{j,D_j} = x_{j,K} = W_j); it is kept because it removes
+            # fractional LP points whose occupancy drops before the request
+            # is delivered.
             if k > k0:
                 u_prev = u[j, k - 1]
                 m.addConstr(
                     x[j, k] >= v.W * (u_prev - u[j, k]), name=f"C19_departure_rule[{j},{k}]"
                 )
 
-        # (24) [optional, default on via bound_departures, Section 9.3]: a
-        # valid lower bound on D_j. (v_j - u_{j,K-1}) is 1 exactly when the
-        # vehicle genuinely departed within the horizon (served, and not
-        # still occupying the last slot), 0 otherwise (never served, or
-        # still present at the horizon edge) -- so this only binds for a
-        # vehicle that actually departs, requiring at least n_min_j
-        # occupied slots, the fewest any departing trajectory could have
-        # needed (from E_j, Section 9.1; independent of *when* it starts,
-        # since the taper depends on delivered energy, not wall-clock
-        # time). Skipped for boundary vehicles: the standard E_j assumes
-        # starting from s_i, an invalid (too-large) lower bound for a
-        # vehicle that already has a head start -- see this module's own
-        # docstring, "Boundary conditions".
-        if bound_departures and bv is None:
-            n_min = E[j] - k0
-            v_j = gp.quicksum(eta[j, k] for k in range(k0, K))
-            m.addConstr(
-                gp.quicksum(u[j, k] for k in range(k0, K)) >= n_min * (v_j - u[j, K - 1]),
-                name=f"C24_departure_lower_bound[{j}]",
-            )
+        # Completion: every vehicle holds its full request by the end of the
+        # horizon (closed system -- nobody is left unserved or unfinished).
+        # With x <= W_j this pins x_{j,K} = W_j.
+        m.addConstr(x[j, K] >= v.W, name=f"C_completion[{j}]")
 
     # --- objective -- minimize total sojourn over the selected cohorts ---------
     # (the document's (1), sum_j D_j, times delta minus sum_j a_j -- see the
@@ -761,11 +776,11 @@ def build_cl_model(
             f"{len(vehicles)} vehicles present cover "
             f"{sorted({cohorts.get(v.id, Cohort.MEASUREMENT).value for v in vehicles})}."
         )
-    # Total sojourn, minutes: sum_j (delta * D_j - a_j). The arrival sum is a
-    # constant (Gurobi keeps it in ObjCon), so ObjVal/ObjBound/MIPGap all
-    # read in total-sojourn terms.
+    # Total sojourn on the slot grid, minutes: sum_j delta * (D_j - k_j).
+    # The release sum is a constant (Gurobi keeps it in ObjCon), so
+    # ObjVal/ObjBound/MIPGap all read in total-sojourn terms.
     primary_obj = gp.quicksum(delta * D[j] for j in objective_ids) - sum(
-        by_id[j].a for j in objective_ids
+        release_time(by_id[j].a, delta) for j in objective_ids
     )
 
     if tie_break:
@@ -818,7 +833,6 @@ def build_cl_model(
         K=K,
         releases=releases,
         break_symmetry=break_symmetry,
-        bound_departures=bound_departures,
         tie_break=tie_break,
         boundary_vehicles=boundary_vehicles,
         cohorts=cohorts,
@@ -846,6 +860,7 @@ def solve_cl_model(
     presolve: int | None = None,
     pre_passes: int | None = None,
     cutoff: float | None = None,
+    tolerance: float | None = None,
     verbose: bool = False,
 ) -> None:
     """
@@ -899,6 +914,18 @@ def solve_cl_model(
         status ``GRB.CUTOFF`` with no solution at all -- handled below as
         a distinct ``RuntimeError``, not confused with genuine
         infeasibility.
+    tolerance :
+        Stop as soon as the incumbent is proven within this many minutes of
+        total sojourn of the optimum (for a mean-sojourn tolerance of ``x``
+        minutes pass ``x * n_optimized``). ``None`` (default): solve to
+        proven optimality. Either way Gurobi's ``MIPGapAbs`` is set from
+        ``lattice_abs_gap``, which uses the free tightening (objective
+        values are multiples of ``delta``) to stop as early as that
+        guarantee allows -- without a tolerance, as soon as the incumbent is
+        proven optimal. ``mip_gap`` (relative) still applies too; Gurobi
+        stops at whichever gap is met first. Not applied with
+        ``tie_break`` (two objectives; Gurobi's gaps are then per
+        objective).
     """
     m = cl_model.model
     m.Params.OutputFlag = 1 if verbose else 0
@@ -914,6 +941,10 @@ def solve_cl_model(
         m.Params.PrePasses = pre_passes
     if cutoff is not None:
         m.Params.Cutoff = cutoff
+    if not cl_model.tie_break:
+        m.Params.MIPGapAbs = lattice_abs_gap(tolerance, cl_model.delta)
+    elif tolerance is not None:
+        raise ValueError("tolerance needs tie_break=False (one objective)")
 
     m.optimize()
 

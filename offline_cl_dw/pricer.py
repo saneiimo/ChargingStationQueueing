@@ -2,8 +2,8 @@
 The pricing subproblem -- Section 6.2 of ``dantzig_wolfe_decomposition.html``.
 
 For one vehicle and one (fixed) pile, this is the compact model's Groups A,
-D, E and (13) -- the vehicle's own physics -- restricted to that vehicle
-alone, with no lane/module/sequencing variables at all (Proposition 1/2
+D, E, (13) and the completion row -- the vehicle's own physics -- restricted
+to that vehicle alone, with no lane/module/sequencing variables at all (Proposition 1/2
 move that coupling entirely into the master's capacity rows (25)-(26); the
 pricer only ever sees the *price* of using them, via the objective (30)).
 
@@ -61,7 +61,7 @@ class VehiclePricer:
     S: gp.LinExpr
     D: gp.LinExpr
     delta: float
-    arrival: float  # a_j, minutes
+    arrival: float  # release time delta*k_j, minutes (see offline_cl_opt.model.sojourn_minutes)
     # False when this vehicle is outside the objective (see master.build_master's
     # objective_ids): its sojourn drops out of the pricing objective (30) too,
     # so the pricer minimises pure rent and the reduced costs stay consistent
@@ -75,7 +75,6 @@ def build_pricer(
     station: StationSpec,
     delta: float,
     K: int,
-    earliest_departure: int,
     *,
     initial_energy: float = 0.0,
     force_occupied_at_start: bool = False,
@@ -89,15 +88,11 @@ def build_pricer(
     and a boundary case without removing a single variable" in the regime
     this model targets.
 
-    ``earliest_departure`` is ``E_j`` (eq. 34, ``preprocess.earliest_departures``):
-    added here as the valid inequality ``D_j >= E_j``, which Section 8.1
-    notes "is valid and tightens [the pricer's] relaxation, which matters
-    because the pricer is solved thousands of times." Pass ``0`` for a
-    boundary vehicle (see below) -- the standard ``E_j`` assumes starting
-    from ``s_i`` and would be an invalid (too-large) lower bound for a
-    vehicle that already has a head start; ``D_lin >= 0`` is then trivially
-    true and adds nothing, which is exactly "no constraint" without a
-    separate code path.
+    Closed system: the vehicle plugs in exactly once (``sum_k eta_k = 1``)
+    and holds its full request by the end of the horizon (``x_K >= W_j``),
+    as in ``offline_cl_opt.model``. The subproblem is therefore infeasible
+    when the vehicle cannot finish on this pile within the horizon even
+    alone; ``price`` then reports ``zeta = inf`` and no plan.
 
     ``initial_energy``/``force_occupied_at_start`` : for an OPTIMIZE-mode
     boundary vehicle (``offline_cl_opt.boundary.BoundaryVehicle`` -- see
@@ -109,7 +104,7 @@ def build_pricer(
     plugged in). Both default to the ordinary, non-boundary behaviour.
 
     Mirrors ``offline_cl_opt.model.build_cl_model``'s per-vehicle block
-    (Groups A, D, E, (13)) exactly, restricted to this one vehicle with no
+    (Groups A, D, E, (13), completion) exactly, restricted to this one vehicle with no
     lane/module/sequencing constructs -- see this module's docstring for
     why those aren't needed here at all.
     """
@@ -141,15 +136,14 @@ def build_pricer(
     if force_occupied_at_start:
         u[k0].lb = u[k0].ub = 1.0
 
-    # Group A: (3)-(6) eta pinning / one start, (7)-(9) v_j/S_j/D_j.
+    # Group A: (3)-(6) eta pinning / exactly one start, (8)-(9) S_j/D_j.
     for k in ks:
         u_prev = u[k - 1] if k > k0 else 0.0
         m.addConstr(eta[k] >= u[k] - u_prev, name=f"eta_lb[{k}]")
         m.addConstr(eta[k] <= u[k], name=f"eta_le_u[{k}]")
         m.addConstr(eta[k] <= 1 - u_prev, name=f"eta_le_1mprev[{k}]")
-    m.addConstr(gp.quicksum(eta[k] for k in ks) <= 1, name="one_start")
-    v_lin = gp.quicksum(eta[k] for k in ks)
-    S_lin = K * (1 - v_lin) + gp.quicksum(k * eta[k] for k in ks)
+    m.addConstr(gp.quicksum(eta[k] for k in ks) == 1, name="one_start")
+    S_lin = gp.quicksum(k * eta[k] for k in ks)
     occ_len = gp.quicksum(u[k] for k in ks)
     D_lin = S_lin + occ_len
 
@@ -170,10 +164,8 @@ def build_pricer(
             u_prev = u[k - 1]
             m.addConstr(x[k] >= v.W * (u_prev - u[k]), name=f"departure_rule[{k}]")
 
-    # Section 8.1's valid inequality: D_j >= E_j, tightens the pricer's own
-    # relaxation (matters since it is solved so many times). See the
-    # earliest_departure parameter docstring for the boundary-vehicle case.
-    m.addConstr(D_lin >= earliest_departure, name="earliest_departure_lb")
+    # Completion: the full request is delivered by the end of the horizon.
+    m.addConstr(x[K] >= v.W, name="completion")
 
     m.update()
 
@@ -191,7 +183,7 @@ def build_pricer(
         S=S_lin,
         D=D_lin,
         delta=delta,
-        arrival=v.a,
+        arrival=delta * k0,
         in_objective=in_objective,
     )
 
@@ -204,27 +196,25 @@ def price(
     mip_gap: float | None = 1e-4,
     time_limit: float | None = None,
     threads: int | None = None,
-) -> tuple[float, Plan]:
+) -> tuple[float, Plan | None]:
     """
     (30): re-solve ``pricer`` with the objective built from this round's
-    duals -- ``(delta*D_j - a_j) - sum_k pi[pile,k]*u[k] - sum_k mu[pile,k]*p[k]``
+    duals -- ``delta*(D_j - k_j) - sum_k pi[pile,k]*u[k] - sum_k mu[pile,k]*p[k]``
     (the vehicle's sojourn in minutes, the same cost ``master.add_column``
     gives its columns), using
     only this pricer's own fixed pile's entries of ``pi``/``mu`` (both
     keyed ``(pile, k)``, matching ``master.LPResult``) -- and return
     ``(zeta, plan)``, ``zeta`` being the pricer's own optimal value (used
     for the reduced cost (29) and the Lagrangian bound (32) by the caller)
-    and ``plan`` the ``Plan`` read off the solution (the null-equivalent
-    "vehicle stays unplugged on this pile" plan, i.e. ``u`` all zero, if
-    that's what's optimal here -- callers should not add such a plan as a
-    real column; see ``colgen.py``).
+    and ``plan`` the ``Plan`` read off the solution.
 
     Only the objective changes between calls; the constraint matrix is
     untouched, so Gurobi reuses the previous basis automatically (same
     principle as ``offline_cl_opt.adaptive``'s own iterative solves).
-    Always feasible and bounded (the all-zero-``u`` point is feasible with
-    objective exactly ``delta*K - a_j``, Section 6.2's own note), so this
-    never raises.
+    Returns ``(inf, None)`` when the subproblem is infeasible -- the vehicle
+    cannot finish on this pile within the horizon, which does not depend on
+    the duals (the feasible set never changes). Raises if Gurobi stops
+    without a solution for any other reason (e.g. ``time_limit``).
 
     ``threads``: caps this one solve's own internal Gurobi thread count.
     Left at ``None`` (Gurobi's own default) when pricers are solved one at
@@ -258,25 +248,24 @@ def price(
         m.Params.Threads = threads
     m.optimize()
 
+    # Every variable is bounded, so INF_OR_UNBD can only mean infeasible.
+    if m.Status in (GRB.INFEASIBLE, GRB.INF_OR_UNBD):
+        return math.inf, None
     if m.SolCount == 0:
         raise RuntimeError(
             f"Pricer for vehicle {pricer.vehicle_id}, pile {pricer.pile} found no solution "
-            f"(status={m.Status}) -- this subproblem is always feasible (u=0 everywhere is a "
-            "valid point), so this indicates a numerical or time_limit issue, not infeasibility."
+            f"(status={m.Status}) -- a numerical or time_limit issue, not infeasibility."
         )
 
     zeta = float(m.ObjVal)
     occupied = [k for k in range(k0, K) if pricer.u[k].X > 0.5]
-    if not occupied:
-        plan = Plan(vehicle_id=pricer.vehicle_id, pile=None, start=None, departure=K, power={})
-    else:
-        start, departure = min(occupied), max(occupied) + 1
-        power = {k: pricer.p[k].X for k in occupied if pricer.p[k].X > 1e-9}
-        plan = Plan(
-            vehicle_id=pricer.vehicle_id,
-            pile=pricer.pile,
-            start=start,
-            departure=departure,
-            power=power,
-        )
+    start, departure = min(occupied), max(occupied) + 1
+    power = {k: pricer.p[k].X for k in occupied if pricer.p[k].X > 1e-9}
+    plan = Plan(
+        vehicle_id=pricer.vehicle_id,
+        pile=pricer.pile,
+        start=start,
+        departure=departure,
+        power=power,
+    )
     return zeta, plan

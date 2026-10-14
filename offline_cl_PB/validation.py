@@ -58,19 +58,12 @@ def validate_plan(
             errs.append(f"v{j}: FIXED module profile differs from ceil(p/Delta)")
         return errs
 
-    if plan.is_null:
-        if bv is not None:
-            errs.append(f"v{j}: an in-service boundary vehicle cannot be unserved")
-        if plan.departure != K or plan.power or any(plan.modules.values()):
-            errs.append(f"v{j}: null plan must have departure K={K} and no power/modules")
-        return errs
-
     N, Delta = station.n_modules, station.p_module
     k0 = _release_slot(v.a, delta)
     S, D = plan.start, plan.departure
     if plan.pile is None or not (0 <= plan.pile < station.n_piles):
         errs.append(f"v{j}: pile {plan.pile} out of range")
-    if S is None or not (k0 <= S < D <= K):
+    if S is None or D is None or not (k0 <= S < D <= K):
         return errs + [f"v{j}: need k0={k0} <= S={S} < D={D} <= K={K}"]
     if bv is not None:  # OPTIMIZE
         if S != k0:
@@ -101,8 +94,8 @@ def validate_plan(
         x += h * p
         if x > v.W + tol:
             errs.append(f"v{j} slot {k}: delivered {x:.6f} kWh > W={v.W:.6f}")
-    if D < K and x < v.W - tol:
-        errs.append(f"v{j}: departs at {D} < K with {x:.6f} kWh < W={v.W:.6f} (19)")
+    if x < v.W - tol:
+        errs.append(f"v{j}: departs at {D} with {x:.6f} kWh < W={v.W:.6f} (completion / (19))")
     return errs
 
 
@@ -121,10 +114,8 @@ def assign_connectors(
     C = station.n_connectors
     by_pile: dict[int, list[tuple[int, int, int, int]]] = {}
     for j, plan in schedule.items():
-        if plan.is_null:
-            continue
         pinned = 0 if j in boundary_vehicles else 1
-        by_pile.setdefault(plan.pile, []).append((plan.start, pinned, j, plan.departure))  # type: ignore[arg-type]
+        by_pile.setdefault(plan.pile, []).append((plan.start, pinned, j, plan.departure))
 
     connectors: dict[int, int] = {}
     for pile, entries in by_pile.items():
@@ -155,8 +146,8 @@ def assign_connectors(
 
 @dataclass
 class ScheduleCheck:
-    objective: float  # total sojourn sum_j w_j (delta*D_j - a_j), minutes
-    connectors: dict[int, int]  # vehicle -> connector (served vehicles only)
+    objective: float  # total sojourn sum_j w_j delta*(D_j - k_j), minutes
+    connectors: dict[int, int]  # vehicle -> connector
 
 
 def validate_schedule(
@@ -183,11 +174,9 @@ def validate_schedule(
     count: dict[tuple[int, int], int] = {}
     modules: dict[tuple[int, int], int] = {}
     for plan in schedule.values():
-        if plan.is_null:
-            continue
         for k in plan.occupied_slots():
-            count[plan.pile, k] = count.get((plan.pile, k), 0) + 1  # type: ignore[index]
-            modules[plan.pile, k] = modules.get((plan.pile, k), 0) + plan.q(k)  # type: ignore[index]
+            count[plan.pile, k] = count.get((plan.pile, k), 0) + 1
+            modules[plan.pile, k] = modules.get((plan.pile, k), 0) + plan.q(k)
     for key, c in count.items():
         if c > station.n_connectors:
             errs.append(f"pile-slot {key}: {c} vehicles > C={station.n_connectors}")
@@ -230,14 +219,11 @@ def _compact_values(cl, schedule, connectors, vehicles, delta, boundary_vehicles
         plan = schedule[j]
         k0 = cl.releases[j]
         bv = boundary_vehicles.get(j)
-        S_of[j], D_of[j] = plan.start_slot(K), plan.departure
-        if plan.is_null:
-            lane[j] = (bv.pile, bv.connector) if bv is not None else (0, 0)
-        else:
-            lane[j] = (plan.pile, connectors[j])  # type: ignore[assignment]
+        S_of[j], D_of[j] = plan.start, plan.departure
+        lane[j] = (plan.pile, connectors[j])
         x = bv.initial_energy_kwh if bv is not None else 0.0
         for k in range(k0, K):
-            occ = (not plan.is_null) and plan.start <= k < plan.departure  # type: ignore[operator]
+            occ = plan.start <= k < plan.departure
             p = plan.power.get(k, 0.0) if occ else 0.0
             values[cl.u[j, k].index] = 1.0 if occ else 0.0
             values[cl.p[j, k].index] = p
@@ -250,10 +236,8 @@ def _compact_values(cl, schedule, connectors, vehicles, delta, boundary_vehicles
 
     occupant: dict[tuple[int, int, int], int] = {}
     for j, plan in schedule.items():
-        if plan.is_null:
-            continue
         for k in plan.occupied_slots():
-            occupant[plan.pile, connectors[j], k] = plan.q(k)  # type: ignore[index]
+            occupant[plan.pile, connectors[j], k] = plan.q(k)
     for (mm, cc, k), var in cl.r.items():
         values[var.index] = float(occupant.get((mm, cc, k), 0))
 
@@ -279,8 +263,7 @@ def compact_model_check(
     objective_cohorts=None,
 ) -> CompactCheck:
     """
-    Build the compact model (``bound_departures=True``, ``break_symmetry``
-    and ``tie_break`` off), set every variable from ``schedule``, and
+    Build the compact model (``break_symmetry`` and ``tie_break`` off), set every variable from ``schedule``, and
     evaluate every constraint, variable bound and integrality requirement.
     ``max_violation`` is the largest violation found (0.0 if none).
     """
@@ -294,7 +277,6 @@ def compact_model_check(
         cohorts=cohorts,
         objective_cohorts=objective_cohorts,
         break_symmetry=False,
-        bound_departures=True,
         tie_break=False,
         model_name="pb_compact_check",
     )
@@ -371,7 +353,6 @@ def schedule_to_cl_model(
         cohorts=cohorts,
         objective_cohorts=objective_cohorts,
         break_symmetry=False,
-        bound_departures=True,
         tie_break=False,
         model_name="pb_schedule",
     )

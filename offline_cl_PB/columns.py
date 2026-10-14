@@ -13,10 +13,9 @@ signature* ``(pile, start, departure, q profile)``; the power profile only
 has to exist. Two plans with the same signature are therefore the same
 master column, which is what ``column_key`` encodes.
 
-Null plan: ``pile=None``, ``start=None``, ``departure=K``, no power, no
-modules -- the "never served" column of the censoring convention. Where a
-start slot is needed (restrictions, branching) the null plan's start is
-``K``, matching the compact model's ``S_j = K`` for an unserved vehicle.
+The compact model is a closed system: every plan serves its vehicle and
+delivers the full request by its departure ``D <= K``. There is no "never
+served" column.
 """
 
 from __future__ import annotations
@@ -42,24 +41,15 @@ class PBPlan(Plan):
 
     modules: dict[int, int] = field(default_factory=dict)
 
-    def start_slot(self, K: int) -> int:
-        """``S`` with the compact model's convention: ``K`` for the null plan."""
-        return K if self.is_null else int(self.start)  # type: ignore[arg-type]
-
     def q(self, k: int) -> int:
-        """Modules held in slot ``k`` (0 outside ``[S, D)`` and for the null plan)."""
-        if self.is_null or not (self.start <= k < self.departure):  # type: ignore[operator]
+        """Modules held in slot ``k`` (0 outside ``[S, D)``)."""
+        if not (self.start <= k < self.departure):
             return 0
         return int(self.modules.get(k, 0))
 
     def q_profile(self) -> tuple[int, ...]:
-        """``(q_S, ..., q_{D-1})``; empty for the null plan."""
+        """``(q_S, ..., q_{D-1})``."""
         return tuple(self.q(k) for k in self.occupied_slots())
-
-
-def null_pb_plan(vehicle_id: int, K: int) -> PBPlan:
-    """The never-served column: no pile, no occupancy, no power, ``D = K``."""
-    return PBPlan(vehicle_id=vehicle_id, pile=None, start=None, departure=K, power={}, modules={})
 
 
 def column_key(plan: PBPlan) -> tuple:
@@ -68,8 +58,6 @@ def column_key(plan: PBPlan) -> tuple:
     and cost are functions of exactly this, so two plans with equal keys are
     the same master column however their power profiles differ.
     """
-    if plan.is_null:
-        return (plan.vehicle_id, None)
     return (plan.vehicle_id, plan.pile, plan.start, plan.departure, plan.q_profile())
 
 

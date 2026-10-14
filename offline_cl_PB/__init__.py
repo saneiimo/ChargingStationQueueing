@@ -1,7 +1,8 @@
 """
 Exact branch-and-price for the connector-lane charging model (whole modules).
 
-Solves ``offline_cl_opt``'s compact MILP -- the same instance objects, the
+Solves ``offline_cl_opt``'s compact closed-system MILP (every vehicle served
+and fully charged within the horizon) -- the same instance objects, the
 same boundary vehicles and objective cohorts -- to proven optimality by a
 Dantzig-Wolfe decomposition per vehicle whose columns carry whole-module
 counts, embedded in a branch-and-bound tree over structural plan
@@ -24,7 +25,7 @@ Typical usage::
 from __future__ import annotations
 
 from .bp import BranchAndPrice, BranchAndPriceError, solve_branch_and_price
-from .columns import PBPlan, column_key, fixed_boundary_plan, null_pb_plan
+from .columns import PBPlan, column_key, fixed_boundary_plan
 from .heuristics import greedy_list_schedule, greedy_plan, schedule_from_compact, schedule_from_simulation
 from .restrictions import NodeRestrictions, VehicleRestriction
 from .solution import PBSolution
@@ -44,7 +45,6 @@ __all__ = [
     "PBPlan",
     "column_key",
     "fixed_boundary_plan",
-    "null_pb_plan",
     "greedy_list_schedule",
     "greedy_plan",
     "schedule_from_compact",

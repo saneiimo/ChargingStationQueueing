@@ -10,19 +10,32 @@ Per node
 1. Activate the columns the node's restrictions allow; impose the same
    restrictions in every pricer.
 2. Phase II column generation. If the restricted master is infeasible
-   (e.g. every column of some vehicle was cut by the branch), run Phase I
-   instead of pruning: minimise the artificial total, pricing with the
+   (e.g. at the root before any complete schedule is known -- the closed
+   system has no "never served" column -- or when every column of some
+   vehicle was cut by the branch), run Phase I instead of pruning: minimise the artificial total, pricing with the
    Phase-I duals, until either it reaches zero (feasible; back to Phase II)
    or a Phase-I Lagrangian bound proves it cannot (the node is infeasible).
 3. Each Phase-II round prices every allowed (vehicle, pile) and computes
    the node's Lagrangian bound from the pricers' ``ObjBound``s. The node is
    pruned as soon as its bound, rounded up to the next attainable objective
    value, reaches ``UB`` -- without waiting for convergence. The objective
-   is total sojourn ``sum_j w_j (delta*D_j - a_j)`` (minutes), which with
+   is total sojourn ``sum_j w_j delta*(D_j - k_j)`` (minutes), which with
    0/1 weights is ``delta * n - sum_j w_j a_j`` for an integer ``n``, so
    attainable values are ``delta`` apart (``objective_index``).
 4. At convergence: if the LP solution is integer-recoverable, it is an
    incumbent and the node closes; otherwise branch (``branching``).
+
+If the tree is exhausted without an incumbent, Phase I has proved every
+node infeasible: no schedule serves and completes every vehicle within the
+horizon (``build_solution`` raises).
+
+Tolerance (``gap_abs``). With ``gap_abs = g`` minutes of total sojourn, a
+node is also pruned when its rounded bound is within ``g`` of ``UB``: it may
+hold a better schedule, but by at most ``g``. Every bound pruned that way
+stays part of the reported lower bound, so when the tree is exhausted the
+bracket ``[lower_bound, objective]`` is at most ``g`` wide and the status is
+``"WITHIN_TOLERANCE"`` (``"OPTIMAL"`` if it closed anyway). Only whole steps
+of ``delta`` count: objective values are multiples of ``delta``.
 
 The pruning bound is always a Lagrangian bound, never the restricted
 master's LP value, and every incumbent passes ``validation`` -- see
@@ -41,10 +54,10 @@ import gurobipy as gp
 
 from offline_cl_opt.boundary import COHORTS_ALL, BoundaryMode, BoundaryVehicle, Cohort
 from offline_cl_opt.instance import StationSpec, VehicleData
-from offline_cl_opt.model import _release_slot, earliest_departures
+from offline_cl_opt.model import _release_slot
 
 from .branching import Branch, positive_support, select_branch, try_recover
-from .columns import PBPlan, fixed_boundary_plan, modules_needed, null_pb_plan
+from .columns import PBPlan, fixed_boundary_plan, modules_needed
 from .heuristics import greedy_list_schedule, greedy_plan
 from .labeling import LabelingPricer
 from .master import MasterLP, MasterNumericalError, PBMaster
@@ -128,8 +141,11 @@ class BranchAndPrice:
         (``relax_modules=False``).
     initial_schedule :
         Optional ``{vehicle_id: PBPlan}`` known to be feasible (e.g.
+        ``heuristics.schedule_from_simulation`` on a drained simulation, or
         ``heuristics.schedule_from_compact`` on a time-limited compact
-        solve). Validated first; an invalid one raises.
+        solve). Validated first; an invalid one raises. Without it (and
+        when list scheduling cannot finish every vehicle) the root starts
+        from Phase I.
     time_limit, node_limit :
         Stop early; the returned bracket ``[lower_bound, objective]`` is
         still valid, only ``status`` is no longer ``"OPTIMAL"``.
@@ -158,6 +174,11 @@ class BranchAndPrice:
         whenever that leaves the pricing question open), and up to
         ``columns_per_pricer`` improving columns are taken from its solution
         pool per round.
+    gap_abs :
+        Stop as soon as the incumbent is proven within this many minutes of
+        total sojourn of the optimum (for a mean-sojourn tolerance of ``x``
+        minutes pass ``x * n_optimized``); see the module docstring,
+        "Tolerance". ``0`` (default): prove optimality.
     early_branching :
         Stop a node's column generation as soon as its Lagrangian bound and
         its restricted-master value round up to the same attainable
@@ -167,7 +188,7 @@ class BranchAndPrice:
     dive_every, dive_time_limit, dive_backtracks :
         Primal heuristic: before the root and then every ``dive_every``
         processed nodes, a column-fixing dive from the best open node
-        (repeatedly fix one fractional vehicle to a heavy served column's
+        (repeatedly fix one fractional vehicle to a heavy column's
         timetable and re-price; on an infeasible or hopeless fixing, back
         up and try the next candidate, at most ``dive_backtracks`` times)
         looks for an integer schedule within ``dive_time_limit`` seconds.
@@ -196,6 +217,7 @@ class BranchAndPrice:
         compact_check: bool = True,
         pricing_gap_abs: float | None = None,
         columns_per_pricer: int = 3,
+        gap_abs: float = 0.0,
         early_branching: bool = True,
         dive_every: int | None = 20,
         dive_time_limit: float = 60.0,
@@ -228,9 +250,11 @@ class BranchAndPrice:
         }
         if not any(self.weights.values()):
             raise ValueError("objective_cohorts selects no vehicle; the objective would be empty")
-        # Objective = delta * sum_j w_j D_j - arrival_total (minutes).
-        self.arrival_total = float(sum(self.weights[v.id] * v.a for v in vehicles))
         self.releases = {v.id: _release_slot(v.a, delta) for v in vehicles}
+        # Objective = delta * sum_j w_j (D_j - k_j) = delta * sum_j w_j D_j -
+        # arrival_total (minutes), with arrival_total = delta * sum_j w_j k_j:
+        # every objective value is a whole multiple of delta.
+        self.arrival_total = float(sum(self.weights[v.id] * delta * self.releases[v.id] for v in vehicles))
         for j, k0 in self.releases.items():
             if k0 > self.K - 1:
                 raise ValueError(f"Vehicle {j}: release slot {k0} is outside the horizon (K={self.K}).")
@@ -253,6 +277,14 @@ class BranchAndPrice:
         self.pricing_gap_abs = float(pricing_gap_abs)
         self.columns_per_pricer = int(columns_per_pricer)
         self.early_branching = early_branching
+        if gap_abs < 0:
+            raise ValueError("gap_abs must be >= 0")
+        self.gap_abs = float(gap_abs)
+        # Objective values are multiples of delta: only whole steps count.
+        self.gap_steps = math.floor(self.gap_abs / delta + 1e-9)
+        # Least bound among tree nodes closed by pruning; with a tolerance it
+        # can sit below UB and so stays part of the global lower bound.
+        self._pruned_min = math.inf
         self.dive_every = dive_every if dive_every else None
         self.dive_time_limit = float(dive_time_limit)
         self.dive_backtracks = max(0, int(dive_backtracks))
@@ -286,7 +318,6 @@ class BranchAndPrice:
         self.fixed_plans: dict[int, PBPlan] = {
             j: fixed_boundary_plan(bv, station) for j, bv in self.boundary.items() if bv.mode is BoundaryMode.FIXED
         }
-        E = earliest_departures(self.vehicles, station, delta, horizon_minutes)
         k_lo = min(self.releases.values())
         self.master = PBMaster(
             ids, self.weights, station, self.K, k_lo, delta=delta, arrivals={v.id: v.a for v in vehicles}
@@ -311,7 +342,6 @@ class BranchAndPrice:
                     station,
                     delta,
                     self.K,
-                    0 if bv is not None else E[v.id],
                     initial_energy=bv.initial_energy_kwh if bv is not None else 0.0,
                     forced_start=bv is not None,
                     weight=self.weights[v.id],
@@ -361,7 +391,6 @@ class BranchAndPrice:
                 self._add_column(self.fixed_plans[j], active=True)
                 continue
             if bv is None:
-                self._add_column(null_pb_plan(j, self.K), active=True)
                 for m in range(self.station.n_piles):
                     plan = greedy_plan(v, m, self.releases[j], self.station, self.delta, self.K, lambda k: N)
                     if plan is not None:
@@ -374,9 +403,10 @@ class BranchAndPrice:
                 if plan is not None:
                     self._add_column(plan, active=True)
                 # The simulation's realized trajectory, with the whole modules
-                # it needs, when that is a valid column on its own.
-                if bv.seed_power and bv.seed_departure_slot > 0:
-                    dep = min(self.K, bv.seed_departure_slot)
+                # it needs, when that is a valid column on its own (it must
+                # depart within the horizon: cut at K it would be unfinished).
+                if bv.seed_power and 0 < bv.seed_departure_slot <= self.K:
+                    dep = bv.seed_departure_slot
                     seed = PBPlan(
                         vehicle_id=j,
                         pile=bv.pile,
@@ -389,7 +419,8 @@ class BranchAndPrice:
                         self._add_column(seed, active=True)
 
         greedy = greedy_list_schedule(self.vehicles, self.station, self.delta, self.K, self.boundary)
-        self._offer(greedy, "greedy list schedule", strict=True)
+        if greedy is not None:
+            self._offer(greedy, "greedy list schedule", strict=True)
         if initial_schedule is not None:
             self._offer(dict(initial_schedule), "initial schedule", strict=True)
 
@@ -442,7 +473,7 @@ class BranchAndPrice:
         if lower is not None and lower > self._global_lb:
             self._global_lb = lower
         ub = self.upper_bound
-        lb = min(self._global_lb, ub)
+        lb = min(self.lattice_up(self._global_lb), ub)
         if not force and self.bound_history:
             last = self.bound_history[-1]
             if last["lower_bound"] == lb and last["upper_bound"] == ub:
@@ -473,12 +504,31 @@ class BranchAndPrice:
             return math.ceil(round(n - self.slack / self.delta, 9))
         return round(n)
 
+    def lattice_up(self, value: float) -> float:
+        """The free tightening: a lower bound rounded up to the next
+        attainable objective value (``-inf``/``inf`` unchanged)."""
+        if not math.isfinite(value):
+            return value
+        return self.delta * self.objective_index(value, bound=True) - self.arrival_total
+
     def _prunable(self, lower_bound: float) -> bool:
+        """
+        Whether a node with this bound can be closed: it cannot beat ``UB``
+        by a whole step, or (with ``gap_abs``) by more than ``gap_steps``
+        steps.
+        """
         if lower_bound == math.inf:
             return True
         if not math.isfinite(lower_bound) or not math.isfinite(self.upper_bound):
             return False
-        return self.objective_index(lower_bound, bound=True) >= self.objective_index(self.upper_bound, bound=False)
+        return (
+            self.objective_index(lower_bound, bound=True)
+            >= self.objective_index(self.upper_bound, bound=False) - self.gap_steps
+        )
+
+    def _close_by_bound(self, lower_bound: float) -> None:
+        """Remember a pruned tree node's bound (part of the global bound)."""
+        self._pruned_min = min(self._pruned_min, lower_bound)
 
     # ------------------------------------------------------------------ #
     # pricing
@@ -547,9 +597,6 @@ class BranchAndPrice:
                 total += reduced_cost(plan, cost, lp.pi, lp.mu, 0.0)
                 continue
             best = math.inf
-            r = restrictions.get(j)
-            if j not in self.boundary and r.allows_null(self.K, j):
-                best = self.master.column_cost(null_pb_plan(j, self.K)) if phase == 2 else 0.0
             for m in range(self.station.n_piles):
                 res = results.get((j, m))
                 if res is not None and res.status != INFEASIBLE:
@@ -760,7 +807,7 @@ class BranchAndPrice:
 
         while queue:
             # Every open node is in the heap here, so its least bound is global.
-            self._note_bounds("tree", queue[0].lower_bound)
+            self._note_bounds("tree", min(queue[0].lower_bound, self._pruned_min))
             if self._out_of_time():
                 self.open_bounds_at_stop = [it.lower_bound for it in queue]
                 return "TIME_LIMIT"
@@ -775,10 +822,11 @@ class BranchAndPrice:
             node = item.node
             if self._prunable(node.lower_bound):
                 self.stats.nodes_pruned_before_solve += 1
+                self._close_by_bound(node.lower_bound)
                 continue
 
             t = time.perf_counter()
-            self._open_min = queue[0].lower_bound if queue else math.inf
+            self._open_min = min(queue[0].lower_bound if queue else math.inf, self._pruned_min)
             outcome = self._solve_node(node)
             self.stats.nodes_processed += 1
             status = outcome.status
@@ -796,6 +844,7 @@ class BranchAndPrice:
                 self._record(node, "infeasible", outcome, lp_value, t)
                 continue
             if status == "pruned_bound":
+                self._close_by_bound(outcome.lower_bound)
                 self._record(node, "pruned_bound", outcome, lp_value, t)
                 continue
 
@@ -815,6 +864,7 @@ class BranchAndPrice:
             if recovery.schedule is not None:
                 self._offer(recovery.schedule, f"node {node.node_id} LP", strict=not recovery.averaged)
             if self._prunable(outcome.lower_bound):
+                self._close_by_bound(outcome.lower_bound)
                 self._record(node, "integer" if recovery.schedule is not None else "pruned_bound", outcome, lp_value, t)
                 continue
 
@@ -898,19 +948,18 @@ class BranchAndPrice:
         """
         Up to three ``(vehicle, column, level)`` to fix, best first: vehicles
         whose support is not integral, timetables (level 0) before module
-        profiles (level 1), served columns before the null plan (fixing a
-        vehicle to "never served" costs K), then larger LP weight.
+        profiles (level 1), then larger LP weight.
         """
         K = self.K
         ranked = []
         for j, items in support.items():
-            timetables = {(p.pile, p.start_slot(K), p.departure) for p, _ in items}
+            timetables = {(p.pile, p.start, p.departure) for p, _ in items}
             profiles = {p.q_profile() for p, _ in items}
             if len(timetables) == 1 and len(profiles) == 1:
                 continue
             level = 0 if len(timetables) > 1 else 1
             for plan, lam in items:
-                ranked.append(((-level, 0 if plan.is_null else 1, lam), j, plan, level))
+                ranked.append(((-level, lam), j, plan, level))
         ranked.sort(key=lambda t: t[0], reverse=True)
         return [(j, plan, level) for _, j, plan, level in ranked[:3]]
 
@@ -919,16 +968,13 @@ class BranchAndPrice:
         j, plan, level = candidate
         K = self.K
         r = restrictions.get(j)
-        if plan.is_null:
-            r = r.with_s_min(K)
-        else:
-            S, D = plan.start_slot(K), plan.departure
-            r = r.with_s_min(S).with_s_max(S).with_d_min(D).with_d_max(D)
-            if r.pile_only is None:
-                r = r.with_pile_only(plan.pile)
-            if level == 1:
-                for k in plan.occupied_slots():
-                    r = r.with_q_min(k, plan.q(k)).with_q_max(k, plan.q(k))
+        S, D = plan.start, plan.departure
+        r = r.with_s_min(S).with_s_max(S).with_d_min(D).with_d_max(D)
+        if r.pile_only is None:
+            r = r.with_pile_only(plan.pile)
+        if level == 1:
+            for k in plan.occupied_slots():
+                r = r.with_q_min(k, plan.q(k)).with_q_max(k, plan.q(k))
         return restrictions.with_vehicle(j, r)
 
     def _record(self, node: Node, status: str, outcome: _NodeOutcome, lp_value, t0: float, branch: Branch | None = None):

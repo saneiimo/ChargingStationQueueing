@@ -96,7 +96,7 @@ def _pile_slot_power(cl_model: ConnectorLaneModel) -> dict[tuple[int, int, int],
                 lane = (mm, cc)
                 break
         if lane is None:
-            continue  # vehicle never served (10)'s nominal assignment is meaningless
+            continue  # defensive: (10) gives every vehicle exactly one lane
         mm, cc = lane
         # Only record slots where the vehicle is actually plugged in (u=1);
         # p is 0 (by (13)) everywhere else and would just clutter the dict.
@@ -176,7 +176,6 @@ def conservative_feasible_solution(
     horizon_minutes: float,
     *,
     break_symmetry: bool = False,
-    bound_departures: bool = True,
     mip_gap: float | None = 1e-4,
     time_limit: float | None = None,
     threads: int | None = None,
@@ -197,12 +196,16 @@ def conservative_feasible_solution(
     actual occupancy), so its objective is a valid but generally loose
     *upper* bound, not the optimum.
 
-    ``break_symmetry``/``bound_departures`` are passed straight through to
-    ``build_cl_model`` -- when this is used to seed
-    ``solve_cl_model_adaptive``'s MIP start, both must match the target
-    model's own settings, or the seed's symmetry constraints (if broken
-    only on one side) won't line up with the model being seeded;
-    ``solve_cl_model_adaptive`` handles this automatically.
+    ``break_symmetry`` is passed straight through to ``build_cl_model`` --
+    when this is used to seed ``solve_cl_model_adaptive``'s MIP start, it
+    must match the target model's own setting, or the seed's symmetry
+    constraints (if broken only on one side) won't line up with the model
+    being seeded; ``solve_cl_model_adaptive`` handles this automatically.
+
+    Every vehicle must still finish within the horizon (the model is a
+    closed system), and ``N - C + 1`` modules charge more slowly than
+    ``N``, so on a tight horizon this model can be infeasible even when
+    the exact one is not -- ``solve_cl_model`` then raises.
     ``presolve``/``pre_passes`` are passed straight through to
     ``solve_cl_model`` -- see its own docstring.
 
@@ -219,7 +222,6 @@ def conservative_feasible_solution(
         relax_modules=True,
         module_pool_cap=cap,
         break_symmetry=break_symmetry,
-        bound_departures=bound_departures,
         model_name="connector_lane_conservative",
     )
     solve_cl_model(
@@ -298,8 +300,8 @@ def _relabel_lanes_for_symmetry(
     Piles are relabelled in the order their first (smallest-id) occupant is
     encountered while scanning vehicles by ascending id; connectors are
     relabelled the same way, independently within each (already-relabelled)
-    pile. Vehicles absent from ``raw_lane_by_vehicle`` (unserved) are
-    simply absent from the result too.
+    pile. Vehicles absent from ``raw_lane_by_vehicle`` (no recorded lane)
+    are simply absent from the result too.
     """
     pile_canon: dict[int, int] = {}
     connector_canon: dict[int, dict[int, int]] = {}  # canonical pile -> {raw connector: canonical connector}
@@ -328,9 +330,9 @@ def _seed_values_from_evs(cl_model: ConnectorLaneModel, evs: list["EV"], *, brea
     power trace instead.
 
     Only EVs with a real pile/connector assignment and a finite
-    ``departure_time`` contribute a seed; anything else (never served,
-    dropped, still queued when the simulation ended) is simply left unset
-    for Gurobi's own partial-start completion.
+    ``departure_time`` contribute a seed; anything else (dropped, or still
+    in the station when the simulation ended) is simply left unset for
+    Gurobi's own partial-start completion.
 
     If ``break_symmetry``, the raw (pile, connector) assignment read off
     the EVs is relabelled into canonical (25)-(26) order first (see
@@ -476,7 +478,6 @@ def solve_cl_model_adaptive(
     horizon_minutes: float,
     *,
     break_symmetry: bool = False,
-    bound_departures: bool = True,
     warm_start_from_conservative: bool = True,
     warm_start_evs: list["EV"] | None = None,
     mip_gap: float | None = 1e-4,
@@ -507,7 +508,7 @@ def solve_cl_model_adaptive(
 
     Parameters
     ----------
-    break_symmetry, bound_departures :
+    break_symmetry :
         See ``build_cl_model``. Applied identically to the main model and
         (when ``warm_start_from_conservative=True``) to the conservative
         seed model, so their symmetry constraints always match -- required
@@ -515,7 +516,9 @@ def solve_cl_model_adaptive(
     warm_start_from_conservative :
         See this module's docstring, "MIP start". On by default; costs one
         extra (cheap-ish) solve up front. Ignored when ``warm_start_evs``
-        is given (see below).
+        is given (see below). If the conservative model is infeasible on
+        this horizon (fewer modules charge more slowly, and every vehicle
+        must still finish), the loop simply starts without a MIP start.
     warm_start_evs :
         Optional list of simulator ``EV`` objects (e.g.
         ``env.engine.metrics.finished_evs`` from a real, causal simulation
@@ -569,7 +572,6 @@ def solve_cl_model_adaptive(
         horizon_minutes,
         relax_modules=True,
         break_symmetry=break_symmetry,
-        bound_departures=bound_departures,
     )
 
     if warm_start_evs is not None:
@@ -580,29 +582,36 @@ def solve_cl_model_adaptive(
     elif warm_start_from_conservative:
         _log(progress, "[adaptive] building MIP start from the conservative shortcut (8.4)...")
         t0 = time.time()
-        # Built with the *same* break_symmetry/bound_departures as the
-        # target above, so its variables line up index-for-index with
-        # cl_model's -- see _apply_mip_start.
-        seed = conservative_feasible_solution(
-            vehicles,
-            station,
-            delta,
-            horizon_minutes,
-            break_symmetry=break_symmetry,
-            bound_departures=bound_departures,
-            mip_gap=mip_gap,
-            time_limit=time_limit,
-            threads=threads,
-            presolve=presolve,
-            pre_passes=pre_passes,
-            verbose=False,
-        )
-        _apply_mip_start(cl_model, seed)
-        _log(
-            progress,
-            f"[adaptive] MIP start ready: conservative objective={seed.model.ObjVal:.3f} "
-            f"({time.time() - t0:.2f}s)",
-        )
+        # Built with the *same* break_symmetry as the target above, so its
+        # variables line up index-for-index with cl_model's -- see
+        # _apply_mip_start.
+        try:
+            seed = conservative_feasible_solution(
+                vehicles,
+                station,
+                delta,
+                horizon_minutes,
+                break_symmetry=break_symmetry,
+                mip_gap=mip_gap,
+                time_limit=time_limit,
+                threads=threads,
+                presolve=presolve,
+                pre_passes=pre_passes,
+                verbose=False,
+            )
+        except RuntimeError as exc:
+            # Fewer modules charge more slowly; on a tight horizon the
+            # conservative model can be infeasible although the exact one
+            # is not. Then there is no seed, not an error.
+            seed = None
+            _log(progress, f"[adaptive] no conservative MIP start on this horizon ({exc})")
+        if seed is not None:
+            _apply_mip_start(cl_model, seed)
+            _log(
+                progress,
+                f"[adaptive] MIP start ready: conservative objective={seed.model.ObjVal:.3f} "
+                f"({time.time() - t0:.2f}s)",
+            )
 
     integer_pile_slots: set[tuple[int, int]] = set()
     promotions_by_iteration: list[list[tuple[int, int]]] = []

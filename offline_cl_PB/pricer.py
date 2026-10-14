@@ -7,25 +7,18 @@ restriction bounds (new node) change, never the constraint matrix.
 
 What the pricer's feasible set is -- exactly
 --------------------------------------------
-The *served* plans of this vehicle on this pile that satisfy the node's
+The plans of this vehicle on this pile that satisfy the node's
 restrictions. The vehicle's own constraints mirror
 ``offline_cl_opt.model.build_cl_model`` row for row -- occupancy block
-(3)-(9), power cap (13), recursion (17), taper (18), departure rule (19)
-with no row at ``k = K`` (censoring), ``x <= W`` as a bound -- plus the
-whole-module link ``p <= Delta*q``, ``q <= N*u``, ``q`` integer, which is
-what the compact model's (14)-(15) say for one connector's occupant.
+(3)-(9) with exactly one start, power cap (13), recursion (17), taper (18),
+departure rule (19), completion ``x_K >= W``, ``x <= W`` as a bound -- plus
+the whole-module link ``p <= Delta*q``, ``q <= N*u``, ``q`` integer, which
+is what the compact model's (14)-(15) say for one connector's occupant.
 
-Two deliberate differences from ``offline_cl_dw.pricer``:
-
-* ``sum_k eta_k == 1`` (served only). The null plan is priced by the caller
-  in closed form, and only when the node allows it. Letting the MILP return
-  "u = 0" would be unsound under branching: at a node that forbids the null
-  plan its convexity dual can exceed ``K``, the MILP would return the
-  (inactive) null plan as its optimum, and a genuinely improving served
-  plan would never be seen.
-* Every result carries Gurobi's ``ObjBound``. The caller's Lagrangian bound
-  is built from bounds, never from incumbents, so it stays a valid lower
-  bound even when a solve stops early on ``BestBdStop``.
+One deliberate difference from ``offline_cl_dw.pricer``: every result
+carries Gurobi's ``ObjBound``. The caller's Lagrangian bound is built from
+bounds, never from incumbents, so it stays a valid lower bound even when a
+solve stops early on ``BestBdStop``.
 """
 
 from __future__ import annotations
@@ -38,7 +31,7 @@ import gurobipy as gp
 from gurobipy import GRB
 
 from offline_cl_opt.instance import StationSpec, VehicleData
-from offline_cl_opt.model import _release_slot, sojourn_minutes
+from offline_cl_opt.model import _release_slot, release_time, sojourn_minutes
 
 from .columns import PBPlan, column_key, modules_needed
 from .restrictions import EMPTY_RESTRICTION, VehicleRestriction
@@ -55,7 +48,7 @@ class PricingNumericalError(RuntimeError):
 
 
 # Status labels on PricingResult.
-INFEASIBLE = "infeasible"  # no served plan on this pile satisfies the node
+INFEASIBLE = "infeasible"  # no plan on this pile satisfies the node (or finishes in time)
 SOLVED = "solved"  # optimum or bound available (see certified / plan)
 TIME_LIMIT = "time_limit"  # stopped by the caller's time limit, not certified
 
@@ -84,10 +77,8 @@ def reduced_cost(
 ) -> float:
     """``cost - sum pi*alpha - sum mu*q - sigma`` straight off the plan's coefficients."""
     rc = cost - sigma
-    if plan.is_null:
-        return rc
     for k in plan.occupied_slots():
-        rc -= pi.get((plan.pile, k), 0.0) + mu.get((plan.pile, k), 0.0) * plan.q(k)  # type: ignore[arg-type]
+        rc -= pi.get((plan.pile, k), 0.0) + mu.get((plan.pile, k), 0.0) * plan.q(k)
     return rc
 
 
@@ -101,7 +92,6 @@ class PBPricer:
         station: StationSpec,
         delta: float,
         K: int,
-        earliest_departure: int,
         *,
         initial_energy: float = 0.0,
         forced_start: bool = False,
@@ -119,7 +109,6 @@ class PBPricer:
         self.k0 = _release_slot(v.a, delta)
         if self.k0 > K - 1:
             raise ValueError(f"Vehicle {v.id}: release slot {self.k0} is outside the horizon K={K}.")
-        self.earliest_departure = int(earliest_departure)
         self.x0 = float(initial_energy)
         self.forced_start = forced_start
         self.weight = float(weight)
@@ -155,14 +144,14 @@ class PBPricer:
         if forced_start:
             self.u[self.k0].lb = self.u[self.k0].ub = 1.0
 
-        # (3)-(6) with "served" in place of "at most one start".
+        # (3)-(6): exactly one start (every vehicle is served).
         for k in ks:
             u_prev = self.u[k - 1] if k > self.k0 else 0.0
             m.addConstr(self.eta[k] >= self.u[k] - u_prev, name=f"eta_lb[{k}]")
             m.addConstr(self.eta[k] <= self.u[k], name=f"eta_le_u[{k}]")
             m.addConstr(self.eta[k] <= 1 - u_prev, name=f"eta_le_1mprev[{k}]")
         m.addConstr(gp.quicksum(self.eta[k] for k in ks) == 1, name="served")
-        # (8)-(9) with v_j = 1.
+        # (8)-(9).
         self.S = gp.quicksum(k * self.eta[k] for k in ks)
         self.D = self.S + gp.quicksum(self.u[k] for k in ks)
 
@@ -178,22 +167,13 @@ class PBPricer:
             if k > self.k0:
                 m.addConstr(
                     self.x[k] >= v.W * (self.u[k - 1] - self.u[k]), name=f"departure_rule[{k}]"
-                )  # (19); no row at k = K (censoring)
+                )  # (19)
+        # Completion: the full request is delivered by the end of the horizon.
+        m.addConstr(self.x[K] >= v.W, name="completion")
 
-        # Departure window. The lower row also carries D >= E_j, valid for
-        # every served plan (E_j is the fastest possible solo departure, or K).
-        self.d_lb = m.addConstr(self.D >= self.earliest_departure, name="d_lb")
+        # Departure window (the node's branching bounds on D).
+        self.d_lb = m.addConstr(self.D >= 0, name="d_lb")
         self.d_ub = m.addConstr(self.D <= K, name="d_ub")
-        # The compact model's (24) with v_j = 1: a plan that departs inside
-        # the horizon occupies at least n_min = E_j - k_j slots (the taper
-        # depends on delivered energy, not on when charging starts). Only
-        # for vehicles that start from s_i, exactly as build_cl_model does.
-        if not forced_start and self.earliest_departure > self.k0:
-            n_min = self.earliest_departure - self.k0
-            m.addConstr(
-                gp.quicksum(self.u[k] for k in ks) >= n_min * (1 - self.u[K - 1]),
-                name="min_occupancy_if_departed",
-            )
         m.update()
 
     def dispose(self) -> None:
@@ -207,7 +187,7 @@ class PBPricer:
         return int(min(self.N, self.restriction.q_max.get(k, self.N)))
 
     def plan_cost(self, departure: int, weight: float) -> float:
-        """A plan's objective cost: ``weight * (delta*D - a)``, its sojourn in minutes (0 for weight 0)."""
+        """A plan's objective cost: ``weight * delta*(D - k_j)``, its sojourn in minutes (0 for weight 0)."""
         return weight * sojourn_minutes(departure, self.vehicle.a, self.delta) if weight else 0.0
 
     def apply(self, restriction: VehicleRestriction) -> None:
@@ -219,7 +199,7 @@ class PBPricer:
         for k, lo in restriction.q_min.items():
             if lo > 0 and not (self.k0 <= k < self.K):
                 self.active = False
-        d_lo = max(self.earliest_departure, restriction.d_min if restriction.d_min is not None else 0)
+        d_lo = restriction.d_min if restriction.d_min is not None else 0
         d_hi = restriction.d_max if restriction.d_max is not None else self.K
         self.d_lb.RHS = d_lo
         self.d_ub.RHS = d_hi
@@ -249,7 +229,7 @@ class PBPricer:
         max_columns: int = 1,
     ) -> PricingResult:
         """
-        Minimise ``w*(delta*D - a) - sum pi*u - sum mu*q`` -- the vehicle's
+        Minimise ``w*delta*(D - k_j) - sum pi*u - sum mu*q`` -- the vehicle's
         sojourn in minutes minus rent (``include_departure=False`` drops the
         sojourn term, for Phase I) -- over this pricer's feasible set.
         ``sigma`` is the vehicle's convexity dual; it only sets the
@@ -269,7 +249,7 @@ class PBPricer:
         cost_weight = self.weight if include_departure else 0.0
         obj = gp.LinExpr()
         if cost_weight != 0.0:
-            obj += cost_weight * (self.delta * self.D - self.vehicle.a)
+            obj += cost_weight * (self.delta * self.D - release_time(self.vehicle.a, self.delta))
         for k in self.ks:
             pk = pi.get((pile, k), 0.0)
             mk = mu.get((pile, k), 0.0)
@@ -363,7 +343,7 @@ class PBPricer:
             val = lambda var: var.Xn  # noqa: E731
         occupied = [k for k in self.ks if val(self.u[k]) > 0.5]
         if not occupied:
-            raise PricingNumericalError(f"Pricer v{self.vehicle_id}: 'served' solution has no occupied slot.")
+            raise PricingNumericalError(f"Pricer v{self.vehicle_id}: solution has no occupied slot.")
         S, D = occupied[0], occupied[-1] + 1
         if occupied != list(range(S, D)):
             raise PricingNumericalError(f"Pricer v{self.vehicle_id}: occupancy {occupied} is not contiguous.")
@@ -393,7 +373,7 @@ class PBPricer:
                 power[k] = p_k
             modules[k] = q_k
             x += h * p_k
-        if D < self.K and x < v.W - VALIDATION_TOL:
+        if x < v.W - VALIDATION_TOL:
             raise PricingNumericalError(
                 f"Pricer v{self.vehicle_id}: plan departs at {D} with {x:.9g} kWh < W={v.W:.9g} after clean-up."
             )

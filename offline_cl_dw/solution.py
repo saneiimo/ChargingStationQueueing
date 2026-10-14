@@ -37,7 +37,7 @@ class DWSolution:
     integer master's objective (Section 9.1) -- a genuine feasible
     schedule's cost, valid regardless of convergence. ``gap`` is
     ``UB - LB``, the certified bracket width. All three are in the
-    objective's own units: total sojourn ``sum_j (delta*D_j - a_j)`` in
+    objective's own units: total sojourn ``sum_j delta*(D_j - k_j)`` in
     minutes over ``objective_cohorts`` -- the same objective as
     ``offline_cl_opt``'s compact model, so directly comparable to it and to
     a simulation's total sojourn over the same vehicles.
@@ -175,13 +175,13 @@ def extract_solution(
         # LB-only mode (chosen is None): the identity / cohort / arrival
         # fields are still meaningful, every schedule-derived one is nan.
         plan = chosen[v.id] if chosen is not None else None
-        served = (not plan.is_null) if plan is not None else None
+        # Closed system: every scheduled vehicle is served (column kept so
+        # the table matches the other packages'); None in LB-only mode.
+        served = True if plan is not None else None
         energy_kwh = h * sum(plan.power.values()) if plan is not None else nan
         start_slot = departure_slot = sojourn_min = nan
         if plan is not None:
-            start_slot = (
-                float(plan.start) if served and plan.start is not None else float(K)
-            )
+            start_slot = float(plan.start)
             departure_slot = float(plan.departure)
             sojourn_min = sojourn_minutes(plan.departure, v.a, delta)
         # A boundary vehicle's plan only covers the modeled window, so its
@@ -247,6 +247,7 @@ def solve_by_decomposition(
     delta: float,
     horizon_minutes: float,
     *,
+    initial_schedule: dict[int, Plan] | None = None,
     extra_seed_columns: dict[int, list[Plan]] | None = None,
     boundary_vehicles: dict[int, BoundaryVehicle] | None = None,
     cohorts: dict[int, Cohort] | None = None,
@@ -282,6 +283,12 @@ def solve_by_decomposition(
     ``boundary_vehicles``: forwarded as-is to ``run_column_generation`` and
     ``postprocess.validate_schedule`` -- see ``colgen.run_column_generation``'s
     own docstring, "Boundary conditions", for what it does.
+
+    ``initial_schedule``: the complete starting schedule the restricted
+    master is built around (closed system: every vehicle served and
+    complete) -- see ``colgen.run_column_generation``. ``None`` builds one
+    by list scheduling and raises ``ValueError`` if that cannot finish
+    every vehicle within the horizon.
 
     See ``colgen.run_column_generation`` for the meaning of ``gamma``,
     ``eps_rc``, ``gap_tolerance``, ``max_iterations``,
@@ -337,6 +344,7 @@ def solve_by_decomposition(
         station,
         delta,
         horizon_minutes,
+        initial_schedule=initial_schedule,
         extra_seed_columns=extra_seed_columns,
         boundary_vehicles=boundary_vehicles,
         cohorts=cohorts,

@@ -12,7 +12,7 @@ sol = solve_branch_and_price(
     time_limit=3600, max_workers=4, progress=True,
 )
 sol.status            # "OPTIMAL" | "TIME_LIMIT" | "NODE_LIMIT"
-sol.objective         # total sojourn of the best schedule, minutes: sum_j (delta*D_j - a_j)
+sol.objective         # total sojourn of the best schedule, minutes: sum_j delta*(D_j - k_j), k_j = ceil(a_j/delta)
 sol.lower_bound       # proven lower bound, same units (== objective when OPTIMAL)
 sol.mean_sojourn      # minutes, over objective_cohorts
 sol.per_vehicle       # same columns as offline_cl_opt / offline_cl_dw
@@ -26,12 +26,12 @@ In the objective sweep it is its own stage: `run_sweep(..., run_bp_model=True)`,
 
 ## Formulation
 
-**Columns.** A column (`columns.PBPlan`, an `offline_cl_dw.columns.Plan` plus `modules`) is one vehicle's whole stay: pile, start `S`, departure `D`, power `p_k`, and the **whole modules `q_k`** its connector holds in each occupied slot. It satisfies the vehicle's own rows of the compact model: (3)–(9), (13), (17)–(19) (no departure row at `K`, i.e. censoring) and `x ≤ W`. It also satisfies `p_k ≤ Δ q_k`, `q_k ≤ N u_k`, `q_k ∈ ℤ`. The null plan (`S = D = K`) is the never-served column.
+**Columns.** A column (`columns.PBPlan`, an `offline_cl_dw.columns.Plan` plus `modules`) is one vehicle's whole stay: pile, start `S`, departure `D`, power `p_k`, and the **whole modules `q_k`** its connector holds in each occupied slot. It satisfies the vehicle's own rows of the compact (closed-system) model: (3)–(9) with exactly one start, (13), (17)–(19), completion `x_K ≥ W` and `x ≤ W`. It also satisfies `p_k ≤ Δ q_k`, `q_k ≤ N u_k`, `q_k ∈ ℤ`. Every vehicle is served and fully charged by its departure `D ≤ K`: there is no never-served column.
 
 **Master.**
 
 ```
-min  Σ_j w_j D_ω λ_ω
+min  Σ_j w_j δ (D_ω − k_j) λ_ω
      Σ α_ωmk λ_ω ≤ C        (pile m, slot k)   connectors
      Σ q_ωk λ_ω  ≤ N        (pile m, slot k)   whole modules
      Σ_{ω∈Ω_j} λ_ω = 1      (vehicle j)
@@ -43,29 +43,30 @@ The DW package (`offline_cl_dw`) differs: its module row sums kW, a relaxation, 
 
 **Boundary vehicles.**
 - FIXED: one mandatory column, the pinned trajectory with `ceil(p/Δ)` modules.
-- OPTIMIZE: priced on its own pile only, occupying slot 0, with energy starting from `initial_energy_kwh`. It has no null plan. Its simulated trajectory is added as a seed column only if it is whole-module valid on its own.
+- OPTIMIZE: priced on its own pile only, occupying slot 0, with energy starting from `initial_energy_kwh`. Its simulated trajectory is added as a seed column only if it departs within the horizon and is whole-module valid on its own.
 
 ## Algorithm (`bp.py`)
 
-- **Pricing**: one pricer per (vehicle, pile). It prices **served plans only**. The null plan is priced in closed form, and only when the node allows it: at a node that forbids the null plan, a pricer allowed to return `u = 0` could hide an improving served plan.
+- **Pricing**: one pricer per (vehicle, pile), over the complete plans the node allows (infeasible when the vehicle cannot finish on that pile in time).
   - `labeling.py` (default): exact forward labelling over (slot, delivered energy, cost). For a fixed module profile, charging as fast as the modules allow is optimal, because the one-slot energy update is non-decreasing in energy. So a label with more energy and no more cost dominates. On a label explosion it falls back to the MILP for that call.
   - `pricer.py` (`pricer="milp"`): the pricing MILP, mirroring the compact model's single-vehicle rows plus `p ≤ Δq`, `q ≤ N u`. It reports Gurobi's `ObjBound`, and `BestBdStop` ends a solve once the bound proves "no improving column here".
 
   The tests check that the two agree on random duals and restrictions.
 - **Node column generation**:
-  - Phase II. If the filtered restricted master is infeasible (branching removed every column of some vehicle), run Phase I with artificials rather than prune the node.
-  - Phase I proves infeasibility only through a Phase-I Lagrangian bound.
+  - Phase II. If the filtered restricted master is infeasible (at the root before any complete schedule is known, or when branching removed every column of some vehicle), run Phase I with artificials rather than prune the node.
+  - Phase I proves infeasibility only through a Phase-I Lagrangian bound. If the whole tree is proved infeasible, no schedule serves and completes every vehicle within the horizon, and `solve()` raises (as `offline_cl_opt.solve_cl_model` does).
 - **Bounds**: each round computes the node's Lagrangian bound, `C Σπ + N Σμ + Σ_j min(allowed plans' pricing objective)`, from the pricers' `ObjBound` and duals clamped to `≤ 0`. The objective is an integer, so a node closes when `ceil(bound − slack) ≥ UB`. The restricted master's LP value is never used as a bound.
 - **Incumbents**:
-  - Greedy list schedule (always feasible, needs no simulation).
+  - Greedy list schedule (needs no simulation; it may fail to finish every vehicle on a tight horizon, and is then skipped).
   - Integer-recoverable node LPs.
-  - Column-fixing dives: from the best open node, fix one fractional vehicle to a heavy served column's timetable and re-price, backtracking on failure. Runs before the root and every `dive_every` nodes.
+  - Column-fixing dives: from the best open node, fix one fractional vehicle to a heavy column's timetable and re-price, backtracking on failure. Runs before the root and every `dive_every` nodes.
   - The restricted integer master over generated columns: once after the root, then every `rim_every_nodes`.
-  - An optional `initial_schedule`, for example `heuristics.schedule_from_compact` on a time-limited compact solve.
+  - An optional `initial_schedule`, for example `heuristics.schedule_from_simulation` on a drained simulation or `heuristics.schedule_from_compact` on a time-limited compact solve.
 
   Every incumbent passes `validation.validate_schedule` before it can lower `UB`.
 - **Branching** (`branching.py`): on the first attribute the positive-weight columns disagree on, in order departure, start, pile, module count. It never branches on `λ`. Columns that share `(pile, S, D)` but differ in `q` have their power averaged and get `ceil(p̄/Δ)` modules. If that fits every pile, the node is integral without branching.
 - **Search**: best bound first, deeper first on ties.
+- **Optimality tolerance** (`gap_abs`, minutes of total sojourn; `x * n` for `x` minutes of mean sojourn): a node is also pruned when its rounded bound is within `gap_abs` of `UB`, and its bound stays in the reported lower bound. The solve then ends with `objective − lower_bound ≤ gap_abs` and status `WITHIN_TOLERANCE` (or `OPTIMAL` if it closed anyway). Only whole steps of `delta` count, since every objective value is a multiple of `delta`; every reported lower bound is rounded up to one.
 - **Speed knobs that never change the answer** (`BranchAndPrice` arguments):
   - `pricing_gap_abs`: a pricing MILP may stop within this absolute gap (minutes; default half a slot, `0.5*delta`). It is re-solved exactly whenever that leaves "improving column or certificate?" open.
   - `columns_per_pricer`: extra improving columns taken from Gurobi's solution pool.
@@ -109,7 +110,8 @@ python -m pytest offline_cl_PB/tests -v
 - Root column generation vs the LP of the **full** master built by brute-force enumeration of every whole-module column (`tests/enumeration.py`, independent of the pricer).
 - Node bounds under random restrictions vs the filtered full master.
 - Phase I revival and Phase I infeasibility.
-- The null-plan trap.
+- Pile-pinned nodes priced exactly.
+- Closed system: every vehicle served and complete; a too-short horizon proved infeasible exactly as the compact model reports it.
 - Branch partitions.
 - Support disagreement.
 - Power averaging.

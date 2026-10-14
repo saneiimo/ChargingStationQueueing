@@ -18,8 +18,7 @@ Validates the model against:
      cuts branch-and-bound nodes on a symmetric instance.
   8. Section 9's E_j/UB: E_j (9.1) is a reachable lower bound on any
      vehicle's own true departure boundary; UB (9.2), from either source,
-     is a valid upper bound on the true optimal objective; constraint (24)
-     (9.3, bound_departures) never changes the optimum; and cutoff (9.2/11,
+     is a valid upper bound on the true optimal objective; and cutoff (9.2/11,
      Gurobi's own Cutoff parameter) never changes the optimum when valid,
      and raises a clear error instead of silently returning nothing when
      built from an incumbent that wasn't actually achievable.
@@ -27,6 +26,9 @@ Validates the model against:
      simulation's own output instead of the conservative shortcut, and the
      raw pile/connector assignment gets relabelled into canonical
      (25)-(26) order first whenever break_symmetry=True.
+ 10. The closed system: every vehicle is served and fully charged; a
+     horizon too short for that is infeasible; and the optimal value never
+     increases as the horizon grows.
 
 Run: python -m pytest tests/test_connector_lane_optimization.py -s -v
 """
@@ -36,6 +38,7 @@ from __future__ import annotations
 import time
 from math import log
 
+import numpy as np
 import pytest
 
 gp = pytest.importorskip("gurobipy")
@@ -236,7 +239,7 @@ def test_offline_bound_never_exceeds_fifo_simulation():
 @pytest.mark.parametrize("tie_break", [False, True])
 def test_objective_is_total_sojourn_over_objective_cohorts(tie_break):
     """ObjVal (or the primary ObjNVal under tie_break) is
-    sum_j (delta*D_j - a_j) over objective_cohorts, arrival constant included."""
+    sum_j delta*(D_j - k_j) over objective_cohorts, arrival constant included."""
     vehicles, station, delta, horizon = _multi_pile_test_instance()
     cohorts = {vehicles[0].id: Cohort.QUEUED}
     for objective_cohorts in (COHORTS_ALL, COHORTS_MEASUREMENT):
@@ -247,7 +250,9 @@ def test_objective_is_total_sojourn_over_objective_cohorts(tie_break):
         solve_cl_model(m, mip_gap=0.0)
         sol = extract_solution(m)
         pv = sol.per_vehicle[sol.per_vehicle["in_objective"]]
-        expected = float((delta * pv["departure_slot"] - pv["arrival"]).sum())
+        # Sojourn from the release slot k_j = ceil(a_j / delta).
+        k = np.ceil(np.round(pv["arrival"] / delta, 9))
+        expected = float((delta * (pv["departure_slot"] - k)).sum())
         assert sol.objective == pytest.approx(expected, abs=1e-6)
         assert sol.mean_sojourn == pytest.approx(expected / len(pv), abs=1e-6)
         assert len(pv) == (len(vehicles) if objective_cohorts is COHORTS_ALL else len(vehicles) - 1)
@@ -548,19 +553,47 @@ def test_inconsistent_cutoff_raises():
         solve_cl_model(m_bad, mip_gap=1e-6, cutoff=bad_UB)
 
 
-def test_bound_departures_preserves_optimal_objective():
-    """(24), Section 9.3: a valid lower bound on D_j derived from E_j and
-    the occupancy count -- turning it on/off must never change the optimal
-    objective, only (potentially) the effort needed to find it."""
+# ---------------------------------------------------------------------------
+# 10. The closed system: completion, feasibility, and the horizon
+# ---------------------------------------------------------------------------
+
+
+def test_every_vehicle_is_served_and_fully_charged():
     vehicles, station, delta, horizon = _multi_pile_test_instance()
+    m = build_cl_model(vehicles, station, delta, horizon)
+    solve_cl_model(m, mip_gap=1e-6)
+    pv = extract_solution(m).per_vehicle
+    assert pv["served"].all()
+    assert (pv["departure_slot"] <= m.K + 1e-9).all()
+    for _, row in pv.iterrows():
+        assert row["energy_kwh"] == pytest.approx(row["energy_required_kwh"], abs=1e-6)
 
-    m_on = build_cl_model(vehicles, station, delta, horizon, bound_departures=True)
-    solve_cl_model(m_on, mip_gap=1e-6)
-    m_off = build_cl_model(vehicles, station, delta, horizon, bound_departures=False)
-    solve_cl_model(m_off, mip_gap=1e-6)
 
-    print(f"\nbound_departures=True: obj={m_on.model.ObjVal:.3f}; False: obj={m_off.model.ObjVal:.3f}")
-    assert m_on.model.ObjVal == pytest.approx(m_off.model.ObjVal, abs=1e-4)
+def test_horizon_too_short_for_completion_is_infeasible():
+    """No vehicle may be left unfinished, so a horizon shorter than the
+    fastest possible charge has no feasible schedule at all."""
+    station = StationSpec(n_piles=1, n_connectors=1, n_modules=8, p_module=25.0)
+    v = VehicleData.from_ev(_make_ev(0, 0.0, 50.0, 0.2, 0.8))
+    E = earliest_departures([v], station, 1.0, 500.0)[v.id]
+    m = build_cl_model([v], station, 1.0, float(E - 1))
+    with pytest.raises(RuntimeError, match="infeasible"):
+        solve_cl_model(m, mip_gap=1e-6)
+    m_ok = build_cl_model([v], station, 1.0, float(E))
+    solve_cl_model(m_ok, mip_gap=1e-6)
+    assert extract_solution(m_ok).per_vehicle.iloc[0]["departure_slot"] == E
+
+
+def test_optimal_value_never_increases_with_the_horizon():
+    """Extending the horizon only adds slots: every schedule stays feasible
+    with the same value, so the optimum can only improve."""
+    vehicles, station, delta, horizon = _multi_pile_test_instance()
+    values = []
+    for extra in (0.0, 10.0, 40.0):
+        m = build_cl_model(vehicles, station, delta, horizon + extra)
+        solve_cl_model(m, mip_gap=0.0)
+        values.append(float(m.model.ObjVal))
+    print(f"\noptimal total sojourn on growing horizons: {values}")
+    assert values[1] <= values[0] + 1e-6 and values[2] <= values[1] + 1e-6
 
 
 # ---------------------------------------------------------------------------
@@ -671,7 +704,9 @@ if __name__ == "__main__":
     test_cutoff_from_real_simulation_preserves_optimum()
     test_cutoff_conservative_fallback_preserves_optimum()
     test_inconsistent_cutoff_raises()
-    test_bound_departures_preserves_optimal_objective()
+    test_every_vehicle_is_served_and_fully_charged()
+    test_horizon_too_short_for_completion_is_infeasible()
+    test_optimal_value_never_increases_with_the_horizon()
     test_relabel_lanes_for_symmetry_produces_canonical_order()
     test_warm_start_from_evs_matches_exact_solve()
     print("\nAll tests in test_connector_lane_optimization.py finished.")

@@ -5,7 +5,8 @@ full (not restricted) master built from them.
 A column's master coefficients and cost depend only on its discrete
 signature ``(pile, S, D, q_S..q_{D-1})``; its power profile only has to
 exist. So the full column set is finite: enumerate every signature and keep
-those for which a small LP finds a feasible power profile. This is written
+those for which a small LP finds a feasible power profile that delivers the
+full request by ``D`` (closed system: every column completes). This is written
 independently of ``offline_cl_PB.pricer`` (no shared code) so the two can
 check each other.
 """
@@ -13,6 +14,7 @@ check each other.
 from __future__ import annotations
 
 import itertools
+import math
 
 import gurobipy as gp
 from gurobipy import GRB
@@ -21,7 +23,7 @@ from offline_cl_opt.boundary import BoundaryMode, BoundaryVehicle
 from offline_cl_opt.instance import StationSpec, VehicleData
 from offline_cl_opt.model import _release_slot
 
-from offline_cl_PB.columns import PBPlan, fixed_boundary_plan, null_pb_plan
+from offline_cl_PB.columns import PBPlan, fixed_boundary_plan
 
 
 def _power_profile(v, x0, S, D, q, station, delta, K):
@@ -40,8 +42,7 @@ def _power_profile(v, x0, S, D, q, station, delta, K):
         m.addConstr(tau_d * p[k] + x <= v.R)
         x = x + h * p[k]
         m.addConstr(x <= v.W)
-    if D < K:
-        m.addConstr(x >= v.W)
+    m.addConstr(x >= v.W)  # completion
     # Prefer front-loaded power; any feasible profile would do.
     m.setObjective(gp.quicksum(-(K - k) * p[k] for k in slots), GRB.MINIMIZE)
     m.optimize()
@@ -69,8 +70,6 @@ def enumerate_columns(
             out[v.id] = [fixed_boundary_plan(bv, station)]
             continue
         plans: list[PBPlan] = []
-        if bv is None:
-            plans.append(null_pb_plan(v.id, K))
         k0 = _release_slot(v.a, delta)
         piles = [bv.pile] if bv is not None else range(station.n_piles)
         starts = [k0] if bv is not None else range(k0, K)
@@ -105,7 +104,8 @@ def solve_full_master(
 ) -> float | None:
     """Optimum of the full master (LP or binary) over the given columns; None if infeasible.
     ``allowed(plan) -> bool`` filters columns (a node's restrictions). A column
-    costs its vehicle's sojourn ``w_j * (delta*D - a_j)`` (minutes)."""
+    costs its vehicle's sojourn ``w_j * delta*(D - k_j)``, ``k_j = ceil(a_j/delta)``
+    (minutes)."""
     m = gp.Model()
     m.Params.OutputFlag = 0
     m.Params.OptimalityTol = 1e-9
@@ -120,13 +120,12 @@ def solve_full_master(
             if allowed is not None and not allowed(plan):
                 continue
             lam = m.addVar(lb=0.0, ub=1.0, vtype=GRB.BINARY if integer else GRB.CONTINUOUS,
-                           obj=weights[j] * (delta * plan.departure - arrivals[j]))
+                           obj=weights[j] * delta * (plan.departure - math.ceil(round(arrivals[j] / delta, 9))))
             lams.append(lam)
-            if not plan.is_null:
-                for k in plan.occupied_slots():
-                    conn.setdefault((plan.pile, k), gp.LinExpr()).add(lam, 1.0)
-                    if plan.q(k):
-                        mod.setdefault((plan.pile, k), gp.LinExpr()).add(lam, float(plan.q(k)))
+            for k in plan.occupied_slots():
+                conn.setdefault((plan.pile, k), gp.LinExpr()).add(lam, 1.0)
+                if plan.q(k):
+                    mod.setdefault((plan.pile, k), gp.LinExpr()).add(lam, float(plan.q(k)))
         m.addConstr(gp.quicksum(lams) == 1)
     for expr in conn.values():
         m.addConstr(expr <= station.n_connectors)

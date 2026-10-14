@@ -2,10 +2,12 @@
 Tests for the Dantzig-Wolfe decomposition (``offline_cl_dw`` package).
 
 Validates:
-  1. Column mechanics (alpha/beta, the null plan) match their definitions
-     (22)-(23) directly.
+  1. Column mechanics (alpha/beta) match their definitions (22)-(23)
+     directly.
   2. The pricer alone reproduces ``earliest_departures`` (E_j) when duals
-     are zero -- both are the same "charge alone at the limit" recursion.
+     are zero -- both are the same "charge alone at the limit" recursion --
+     and is infeasible (zeta = inf, no plan) when the vehicle cannot finish
+     within the horizon (closed system).
   3. The master's dual-sign convention holds (the source document's own
      "Sign convention" warning box).
   4. Column generation converges (``z_RMP - best_LB -> 0``) on a trivial
@@ -22,6 +24,9 @@ Validates:
      from being added twice.
   7. ``solve_integer_ub=False`` (LB-only mode) returns the same certified
      lower bound as a full run, with every schedule-derived figure nan.
+  8. The starting schedule: the master is built around a complete,
+     jointly feasible schedule, rejects one that is not, and never purges
+     its columns; a horizon list scheduling cannot fill raises.
 
 Run: python -m pytest tests/test_offline_cl_dw.py -s -v
 """
@@ -34,11 +39,11 @@ import pytest
 
 gp = pytest.importorskip("gurobipy")
 
-from offline_cl_dw.columns import Plan, null_plan
-from offline_cl_dw.master import add_column, build_master, solve_lp
+from offline_cl_dw.columns import Plan
+from offline_cl_dw.master import add_column, build_master, purge_columns, solve_lp
 from offline_cl_dw.postprocess import validate_schedule, whole_module_failures
 from offline_cl_dw.pricer import build_pricer, price
-from offline_cl_dw.preprocess import earliest_departures, seed_columns
+from offline_cl_dw.preprocess import earliest_departures, initial_schedule, seed_columns
 from offline_cl_dw.solution import solve_by_decomposition
 from offline_cl_opt.instance import StationSpec, VehicleData
 from offline_cl_opt.model import build_cl_model, solve_cl_model
@@ -68,12 +73,6 @@ def test_plan_alpha_beta_match_definitions():
     assert plan.beta(0, 6) == 0.0
     assert plan.beta(1, 8) == 0.0
 
-    null = null_plan(vehicle_id=0, K=100)
-    assert null.is_null
-    assert null.alpha(0, 0) == 0
-    assert null.beta(0, 0) == 0.0
-    assert null.departure == 100
-
 
 # ---------------------------------------------------------------------------
 # 2. Pricer alone reproduces E_j at zero duals
@@ -87,12 +86,23 @@ def test_pricer_at_zero_duals_matches_earliest_departure():
     K = 90
 
     E = earliest_departures([v], station, delta, horizon)
-    pricer = build_pricer(v, 0, station, delta, K, E[v.id])
+    pricer = build_pricer(v, 0, station, delta, K)
     zeta, plan = price(pricer, {}, {})  # no duals -> pure sojourn minimisation
 
-    assert not plan.is_null
+    assert plan is not None
     assert plan.departure == E[v.id]
-    assert zeta == pytest.approx(delta * E[v.id] - v.a)  # sojourn in minutes
+    assert zeta == pytest.approx(delta * (E[v.id] - math.ceil(v.a / delta)))  # sojourn in minutes
+    assert plan.energy_kwh(delta / 60.0) == pytest.approx(v.W, abs=1e-6)
+
+
+def test_pricer_is_infeasible_when_the_vehicle_cannot_finish():
+    """Closed system: a horizon one slot short of E_j leaves no plan at all."""
+    station = StationSpec(n_piles=1, n_connectors=1, n_modules=8, p_module=25.0)
+    v = _toy_vehicle(0, 0.0, 50.0, 0.2, 0.8)
+    E = earliest_departures([v], station, 1.0, 500.0)[v.id]
+    pricer = build_pricer(v, 0, station, 1.0, E - 1)
+    zeta, plan = price(pricer, {}, {})
+    assert zeta == math.inf and plan is None
 
 
 # ---------------------------------------------------------------------------
@@ -107,7 +117,11 @@ def test_master_dual_signs_are_non_positive():
     delta, horizon, K = 1.0, 90.0, 90
 
     seeds = seed_columns([v0, v1], station, delta, K)
-    rm = build_master([v0.id, v1.id], station, delta, K, 0, seeds, arrivals={v0.id: v0.a, v1.id: v1.a})
+    start = initial_schedule([v0, v1], station, delta, K)
+    rm = build_master(
+        [v0.id, v1.id], station, delta, K, 0, seeds,
+        initial_schedule=start, arrivals={v0.id: v0.a, v1.id: v1.a},
+    )
     lp = solve_lp(rm)  # raises AssertionError internally if signs are wrong
     assert all(val <= 1e-9 for val in lp.pi.values())
     assert all(val <= 1e-9 for val in lp.mu.values())
@@ -249,23 +263,74 @@ def test_add_column_deduplicates_identical_plans():
     v = _toy_vehicle(0, 0.0, 50.0, 0.2, 0.8)
     K = 90
     seeds = seed_columns([v], station, 1.0, K)
-    rm = build_master([v.id], station, 1.0, K, 0, seeds, arrivals={v.id: v.a})
+    start = initial_schedule([v], station, 1.0, K)
+    rm = build_master([v.id], station, 1.0, K, 0, seeds, initial_schedule=start, arrivals={v.id: v.a})
 
     n_before = len(rm.columns[v.id])
-    solo_plan = next(p for p in seeds[v.id] if not p.is_null)
+    solo_plan = seeds[v.id][0]
     result = add_column(rm, Plan(vehicle_id=v.id, pile=solo_plan.pile, start=solo_plan.start,
                                   departure=solo_plan.departure, power=dict(solo_plan.power)))
     assert result is None  # identical to an already-seeded column
     assert len(rm.columns[v.id]) == n_before  # nothing was actually added
 
 
+# ---------------------------------------------------------------------------
+# 8. The starting schedule
+# ---------------------------------------------------------------------------
+
+
+def test_master_rejects_a_starting_schedule_that_overfills_a_pile():
+    """Two solo plans on a one-connector pile at the same time do not fit together."""
+    station = StationSpec(n_piles=1, n_connectors=1, n_modules=8, p_module=25.0)
+    v0 = _toy_vehicle(0, 0.0, 50.0, 0.2, 0.8)
+    v1 = _toy_vehicle(1, 0.0, 50.0, 0.2, 0.8)
+    K = 90
+    seeds = seed_columns([v0, v1], station, 1.0, K)
+    clash = {0: seeds[0][0], 1: seeds[1][0]}
+    with pytest.raises(ValueError, match="not jointly feasible"):
+        build_master([0, 1], station, 1.0, K, 0, {}, initial_schedule=clash, arrivals={0: 0.0, 1: 0.0})
+
+
+def test_starting_schedule_columns_are_never_purged():
+    station = StationSpec(n_piles=1, n_connectors=1, n_modules=8, p_module=25.0)
+    v0 = _toy_vehicle(0, 0.0, 50.0, 0.2, 0.8)
+    v1 = _toy_vehicle(1, 0.0, 50.0, 0.2, 0.8)
+    K = 90
+    start = initial_schedule([v0, v1], station, 1.0, K)
+    rm = build_master(
+        [0, 1], station, 1.0, K, 0, seed_columns([v0, v1], station, 1.0, K),
+        initial_schedule=start, arrivals={0: 0.0, 1: 0.0},
+    )
+    solve_lp(rm)
+    purge_columns(rm, threshold=-1e9)  # purge every non-basic column that is allowed to go
+    for j, plan in start.items():
+        assert any(p == plan for p, _ in rm.columns[j])
+    solve_lp(rm)  # still feasible
+
+
+def test_horizon_too_short_for_list_scheduling_raises():
+    """Two vehicles that each need the single connector for E slots cannot
+    both finish within E + 1 slots; with no schedule to start from, column
+    generation refuses to start rather than run an infeasible master."""
+    station = StationSpec(n_piles=1, n_connectors=1, n_modules=8, p_module=25.0)
+    v0 = _toy_vehicle(0, 0.0, 50.0, 0.2, 0.8)
+    v1 = _toy_vehicle(1, 0.0, 50.0, 0.2, 0.8)
+    E = earliest_departures([v0], station, 1.0, 500.0)[0]
+    with pytest.raises(ValueError, match="List scheduling cannot serve and complete"):
+        solve_by_decomposition([v0, v1], station, 1.0, float(E + 1))
+
+
 if __name__ == "__main__":
     print("Running test_offline_cl_dw.py (direct mode)")
     test_plan_alpha_beta_match_definitions()
     test_pricer_at_zero_duals_matches_earliest_departure()
+    test_pricer_is_infeasible_when_the_vehicle_cannot_finish()
     test_master_dual_signs_are_non_positive()
     test_single_vehicle_converges_and_delivers_exact_energy()
     test_bracket_contains_known_compact_model_optimum()
     test_validate_schedule_passes_on_price_and_branch_result()
     test_add_column_deduplicates_identical_plans()
+    test_master_rejects_a_starting_schedule_that_overfills_a_pile()
+    test_starting_schedule_columns_are_never_purged()
+    test_horizon_too_short_for_list_scheduling_raises()
     print("\nAll tests in test_offline_cl_dw.py finished.")

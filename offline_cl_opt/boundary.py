@@ -238,18 +238,20 @@ def realized_slot_power(
     is what an OPTIMIZE-mode *seed column* needs, since the departure rule
     (19) requires the vehicle to have received its full ``W_j`` by the
     slot it unplugs in -- flooring would truncate energy and make the seed
-    infeasible. Both are capped at ``K``; a vehicle that never departed
-    within the run (``actual_departure_time`` is ``inf``) is censored at
-    ``K``, matching the model's own horizon convention.
+    infeasible. Both are capped at ``K``. A vehicle that never departed
+    within the run (``actual_departure_time`` is ``inf`` -- only possible
+    when the simulation was cut off rather than drained) is truncated at
+    ``K``; the closed model needs a drained run, where every vehicle
+    departs.
     """
     h = delta / 60.0
     t0 = snap.boundary_time
     p_req_max = snap.c_b * snap.c_rate
     tan_B = p_req_max / (1.0 - snap.s_th)
 
-    # Departure relative to the boundary, censored at the horizon -- also
-    # what keeps a still-charging vehicle (departure_time == inf) from
-    # reaching math.floor() as an infinity.
+    # Departure relative to the boundary, capped at the horizon -- also
+    # what keeps a still-charging vehicle (departure_time == inf, a run cut
+    # off rather than drained) from reaching math.floor() as an infinity.
     rel_departure = snap.actual_departure_time - t0
     if not math.isfinite(rel_departure):
         rel_departure = float(K) * delta
@@ -339,11 +341,8 @@ def boundary_vehicles_from_in_service(
     A FIXED-mode vehicle whose floor-discretized departure lands at slot 0
     is **discarded**: it left within the first ``delta`` of the window, so
     under the floor convention it occupies no whole slot, and keeping it
-    would force the two solvers to disagree (the compact model reads an
-    all-zero occupancy as "never served", contributing ``D_j = K``, while
-    a Dantzig-Wolfe column with ``start == departure == 0`` contributes
-    ``0`` and trips ``postprocess.validate_schedule``'s degenerate-interval
-    check). It is removed from *both* returned structures together --
+    would leave it with an empty pinned trajectory, which no model can
+    represent (every vehicle occupies at least one slot). It is removed from *both* returned structures together --
     dropping it from only ``boundary`` would silently turn it into an
     ordinary vehicle with ``a=0`` demanding its full ``W_j``, which is far
     worse than the problem being avoided.
