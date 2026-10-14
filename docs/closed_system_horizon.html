@@ -1,0 +1,327 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Closed-System Horizon</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/katex.min.css">
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/katex.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/contrib/auto-render.min.js"
+  onload="renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'$',right:'$',display:false}],throwOnError:false});"></script>
+<style>
+  :root {
+    --bg: #fbfaf7; --fg: #1d1f23; --muted: #5d6470; --rule: #dedbd2;
+    --accent: #2f5d8a; --box: #f1efe8; --def: #eaf1f8; --thm: #f6efe3; --warn: #fbeceb;
+    --code: #efece4;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #17191d; --fg: #e6e4df; --muted: #a2a7b0; --rule: #33363c;
+      --accent: #8db4dc; --box: #202328; --def: #1c2733; --thm: #2a2419; --warn: #33201f;
+      --code: #24272c;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #17191d; --fg: #e6e4df; --muted: #a2a7b0; --rule: #33363c;
+    --accent: #8db4dc; --box: #202328; --def: #1c2733; --thm: #2a2419; --warn: #33201f;
+    --code: #24272c;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 17px/1.62 "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif;
+  }
+  main { max-width: 860px; margin: 0 auto; padding: 40px 16px 80px; }
+  h1 { font-size: 1.9rem; line-height: 1.25; margin: 0 0 6px; }
+  .sub { color: var(--muted); margin: 0 0 32px; }
+  h2 { font-size: 1.35rem; margin: 44px 0 10px; padding-top: 14px; border-top: 1px solid var(--rule); }
+  h3 { font-size: 1.08rem; margin: 26px 0 6px; }
+  p, li { margin: 8px 0; }
+  .box { border-radius: 8px; padding: 12px 16px; margin: 16px 0; background: var(--box); }
+  .def { background: var(--def); }
+  .thm { background: var(--thm); }
+  .warn { background: var(--warn); }
+  .box > :first-child { margin-top: 0; }
+  .box > :last-child { margin-bottom: 0; }
+  .label { font-weight: 700; color: var(--accent); }
+  .proof { border-left: 3px solid var(--rule); padding: 2px 0 2px 14px; margin: 10px 0 18px; }
+  .proof::before { content: "Proof. "; font-style: italic; font-weight: 600; }
+  .qed { float: right; }
+  code { font: 0.86em ui-monospace, "Cascadia Code", Consolas, monospace; background: var(--code); padding: 1px 4px; border-radius: 4px; }
+  table { border-collapse: collapse; width: 100%; margin: 14px 0; font-size: 0.95rem; }
+  th, td { border-bottom: 1px solid var(--rule); padding: 7px 8px; text-align: left; vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; }
+  .table-wrap { overflow-x: auto; }
+  .katex-display { overflow-x: auto; overflow-y: hidden; padding: 4px 0; }
+  ol.algo { counter-reset: none; }
+  ol.algo li { margin: 6px 0; }
+  .toc a { color: var(--accent); text-decoration: none; }
+  .toc a:hover { text-decoration: underline; }
+  .toc ol { padding-left: 22px; }
+</style>
+</head>
+<body>
+<main>
+
+<h1>Closed-system horizon: why the completion constraint fixes the model, and how to pick the horizon</h1>
+<p class="sub">Notes for Chapter 2 — connector-lane model, closed-system trials (every vehicle in a fixed set must be served).</p>
+
+<nav class="toc">
+<ol>
+  <li><a href="#notation">Setting and notation</a></li>
+  <li><a href="#why">Why the current model can "cheat"</a></li>
+  <li><a href="#constraint">The completion constraint</a></li>
+  <li><a href="#lemmas">Three lemmas</a></li>
+  <li><a href="#theorem">Main theorem: how the optimum depends on the horizon</a></li>
+  <li><a href="#sandwich">The relaxation sandwich</a></li>
+  <li><a href="#tightest">Finding the tightest horizon</a></li>
+  <li><a href="#summary">Summary</a></li>
+</ol>
+</nav>
+
+<!-- ===================================================================== -->
+<h2 id="notation">1. Setting and notation</h2>
+
+<p>The modelled window starts at $t_0$ (time $0$ in the model) and is split into $K$ slots of length $\delta$ minutes, so the horizon is $T = \delta K$ minutes. The vehicle set $\mathcal J$ is closed: the queue and the plugged-in vehicles at $t_0$ plus every arrival in $[t_0, t_0 + \text{arrival window}]$. All vehicles are in the objective (weight $1$).</p>
+
+<div class="box def">
+<p><span class="label">Notation.</span></p>
+<ul>
+  <li>$a_j$ — arrival time (minutes after $t_0$; $0$ for vehicles present at $t_0$); $W_j$ — energy the vehicle needs.</li>
+  <li>$u_{jk}\in\{0,1\}$ — vehicle $j$ occupies a connector in slot $k$; $\eta_{jk}$ — plug-in indicator; $p_{jk}$ — power; $x_{jk}$ — energy delivered before slot $k$ (the recursion (17) runs up to $x_{j,K}$).</li>
+  <li>$S_j$, $D_j$ — start and departure slot boundaries, $D_j = S_j + \sum_k u_{jk}$.</li>
+  <li>$\mathcal J^*{\mathrm{FIX}}$ — vehicles plugged in at $t_0$ whose trajectory is pinned (<code>boundary_mode=FIXED</code>); they are excluded from the completion constraint below.</li>
+  <li>A <b>schedule</b> $\sigma$ is an assignment of all variables. Its <b>value</b> is total sojourn
+  $$f(\sigma) = \sum_{j\in\mathcal J}\bigl(\delta D_j - a_j\bigr),$$
+  and its <b>makespan</b> is $\mu(\sigma)=\max_j D_j$ (the slot by which the station is empty).</li>
+  <li>A schedule is <b>complete</b> if every vehicle receives its full energy $W_j$. Completeness does not refer to any horizon: a complete schedule may need any number of slots.</li>
+  <li>$E_j$ — any valid lower bound on $D_j$ in every schedule: the solo earliest departure slot of eq. (22) for ordinary vehicles, and $1$ for vehicles plugged in at $t_0$ (they occupy slot $0$).</li>
+</ul>
+</div>
+
+<p>Two optimization problems with horizon $K$ appear below.</p>
+
+<div class="box def">
+<p><span class="label">Definition (the two models).</span></p>
+<ul>
+  <li><b>Relaxed model</b> $\mathrm{R}(K)$ — the current connector-lane model (Section 6.3): constraints (2)–(19), (24). A vehicle may end the horizon unfinished or even unserved; it then has $D_j = K$. Its optimal value is $r(K)$.</li>
+  <li><b>Closed model</b> $\mathrm{P}(K)$ — the same model plus the completion constraint (C) of Section 3. Its optimal value is $V(K)$ ($+\infty$ if infeasible).</li>
+</ul>
+<p>The quantity we actually want is the <b>closed-system optimum</b>
+$$z^* = \min\{\, f(\sigma) : \sigma \text{ complete}\,\},$$
+the best total sojourn when every vehicle must finish, with no horizon at all. Section 5 shows the minimum exists. Further:</p>
+<ul>
+  <li>$K_{\min}$ — the smallest makespan of any complete schedule;</li>
+  <li>$M^*$ — the smallest makespan among complete schedules with value $z^*$;</li>
+  <li>$M^*{\max}$ — the largest makespan among complete schedules with value $z^*$.</li>
+</ul>
+</div>
+
+<!-- ===================================================================== -->
+<h2 id="why">2. Why the current model can "cheat"</h2>
+
+<p>In $\mathrm{R}(K)$ a vehicle left unfinished is simply recorded as departing at the horizon and charged $\delta K - a_j$, however much energy it still needs. Not finishing is therefore never penalized beyond that cap, and finishing a vehicle can cost the others more than it saves.</p>
+
+<div class="box warn">
+<p><span class="label">Example.</span> Suppose that in the true optimum vehicle $U$ finishes last at slot $15$, and during its final slots it shares a pile's power with vehicle $V$, slowing $V$ down. Give $\mathrm{R}$ the horizon $K=15$. It can leave $U$ unplugged altogether: $U$ is charged $\delta\cdot 15 - a_U$, exactly its cost in the true optimum, while $V$ now charges at full power and leaves earlier. The model's value is <i>below</i> $z^*$, and its schedule does not serve $U$.</p>
+<p>Raising $K$ makes the trick more expensive (each extra slot adds $\delta$ to $U$'s charge), so it stops paying only beyond $15 + (\text{V's gain})/\delta$ — a threshold that depends on the instance and is not known in advance.</p>
+</div>
+
+<p>So $\mathrm{R}(K)$ is a <b>relaxation</b> of the closed system: its value is a valid lower bound on $z^*$ (Section 6), but its schedules are closed-system schedules only when they happen to finish everyone. That is why the current implementation needed a completion check, a repair step and the <code>closed_*</code> bracket.</p>
+
+<!-- ===================================================================== -->
+<h2 id="constraint">3. The completion constraint</h2>
+
+<div class="box thm">
+<p><span class="label">Constraint (C) — for the manuscript.</span></p>
+$$x_{j,K} = W_j \qquad \forall\, j \in \mathcal J \setminus \mathcal J^*{\mathrm{FIX}}$$
+<p><i>Every vehicle must have received its full energy requirement by the end of the horizon (slot $K-1$), so no vehicle can be left unfinished or unserved.</i></p>
+</div>
+
+<p>Remarks.</p>
+<ul>
+  <li>Departures strictly before $K$ were already forced to be complete by the departure rule (19); (C) closes the two remaining cases, a vehicle charging through slot $K-1$ without finishing, and a vehicle never served.</li>
+  <li>For a vehicle plugged in at $t_0$ the recursion is seeded with the energy it already has, so (C) asks only for the remainder.</li>
+  <li>$\mathcal J^*{\mathrm{FIX}}$ is exempt because its trajectory is pinned to one that did finish in the simulation.</li>
+  <li>With $x_{j,k}\le W_j$ already a variable bound, (C) can equivalently be written $x_{j,K}\ge W_j$.</li>
+</ul>
+
+<!-- ===================================================================== -->
+<h2 id="lemmas">4. Three lemmas</h2>
+
+<p>Throughout, the instance data do not depend on $K$: release slots are fixed, and $K$ is at least the departure slot of every vehicle in $\mathcal J^*{\mathrm{FIX}}$ (true for every horizon used in practice, since $K \ge K_{\text{fifo}}$).</p>
+
+<div class="box thm">
+<p><span class="label">Lemma 0 (the value of a schedule does not depend on $K$).</span> For any feasible solution of $\mathrm{P}(K)$, $f(\sigma)$ is the same whatever horizon the solution is embedded in.</p>
+</div>
+<div class="proof">
+<p>The horizon $K$ appears in three places in the model:</p>
+<ul>
+  <li>the start-slot expression $S_j = K(1-v_j) + \sum_k k\,\eta_{jk}$, where $v_j=\sum_k\eta_{jk}$ says whether $j$ is served;</li>
+  <li>the big-$M$ of the lane-sequencing rows (11)–(12);</li>
+  <li>the departure lower bound (24).</li>
+</ul>
+<p>Only the first can reach $f$, and only for an unserved vehicle ($v_j=0$). Under (C) every vehicle is served: $W_j\gt 0$ forces some charging, and a vehicle plugged in at $t_0$ has $u_{j0}=1$ fixed. Hence $S_j=\sum_k k\,\eta_{jk}$ and $D_j = S_j + \sum_k u_{jk}$ contain no $K$, and neither does $f$. <span class="qed">∎</span></p>
+<p>(In $\mathrm{R}(K)$ this fails: an unfinished vehicle has $D_j = K$, so its contribution $\delta K - a_j$ moves with $K$. That is exactly why the relaxed model's values shift when the horizon changes.)</p>
+</div>
+
+<div class="box thm">
+<p><span class="label">Lemma 1 (extension).</span> If $K \le K'$, every feasible solution of $\mathrm{P}(K)$ extends to a feasible solution of $\mathrm{P}(K')$ with the same value.</p>
+</div>
+<div class="proof">
+<p>Extend by $u,\eta,p,r = 0$ on the new slots $K,\dots,K'-1$ and $x_{j,k}=W_j$ for $k\gt K$; keep $y$ and $b$. Check each constraint family:</p>
+<ul>
+  <li><b>Per-slot rows</b> on the new slots (connector capacity, module capacity, station power, (13)): nobody is plugged in and all power is $0$.</li>
+  <li><b>Energy recursion (17):</b> $x$ is constant on the new slots, so $x_{j,K'} = x_{j,K} = W_j$; (C) holds at $K'$.</li>
+  <li><b>Taper (18):</b> $p=0$ and $x\le W_j\le R_j$.</li>
+  <li><b>Departure rule (19) at $k=K$</b> (now inside the horizon): $x_{j,K} \ge W_j\,(u_{j,K-1}-u_{j,K}) = W_j\,u_{j,K-1}$ holds because $x_{j,K}=W_j$. <i>This is the only step that needs (C)</i>: without it, a vehicle charging through slot $K-1$ unfinished would violate this row. For $k\gt K$ the row reads $W_j \ge 0$.</li>
+  <li><b>Sequencing (11)–(12):</b> active rows are unchanged; inactive rows only loosen (big-$M$ grows from $K$ to $K'$).</li>
+  <li><b>(24):</b> a valid inequality for every complete schedule (no vehicle departs before its solo earliest slot).</li>
+</ul>
+<p>By Lemma 0 the value is unchanged. <span class="qed">∎</span></p>
+</div>
+
+<div class="box thm">
+<p><span class="label">Lemma 2 (restriction).</span> If a feasible solution of $\mathrm{P}(K')$ has makespan $\mu\le K \le K'$, dropping slots $K,\dots,K'-1$ gives a feasible solution of $\mathrm{P}(K)$ with the same value. In particular, every complete schedule with makespan $\le K$ is feasible for $\mathrm{P}(K)$.</p>
+</div>
+<div class="proof">
+<p>For $k\ge K$ every $u_{jk}$ and $\eta_{jk}$ is $0$ (all vehicles have departed), so $p_{jk}=0$ by (13); set the module variables to $0$ there as well. Every remaining row only involves slots $\lt K$ and is unchanged, and $x_{j,K}=x_{j,K'}=W_j$ because no energy is delivered after slot $K-1$. <span class="qed">∎</span></p>
+</div>
+
+<!-- ===================================================================== -->
+<h2 id="theorem">5. Main theorem: how the optimum depends on the horizon</h2>
+
+<p>Let $F = \sum_{i\in\mathcal J}\bigl(\delta E_i - a_i\bigr)$ (the total sojourn if every vehicle left at its earliest possible slot), and for any value $\bar Z$ define</p>
+$$K_{\text{cert}}(\bar Z) \;=\; \max_{j} E_j \;+\; \Bigl\lceil \frac{\bar Z - F}{\delta} \Bigr\rceil .$$
+
+<div class="box thm">
+<p><span class="label">Theorem.</span></p>
+<ol type="a">
+  <li><b>Feasibility.</b> $\mathrm{P}(K)$ is infeasible if and only if $K \lt  K_{\min}$.</li>
+  <li><b>Monotonicity.</b> $V(K)$ is non-increasing in $K$.</li>
+  <li><b>Existence and a bound on the optimal makespan.</b> $z^*$ is attained, and for the value $\bar Z$ of any complete schedule, every complete schedule with value $\le \bar Z$ has makespan $\le K_{\text{cert}}(\bar Z)$. In particular $M^* \le M^*{\max} \le K_{\text{cert}}(\bar Z)$.</li>
+  <li><b>The three regimes.</b>
+  $$V(K) = +\infty \;\;(K \lt  K_{\min}),\qquad V(K) \gt  z^* \;\;(K_{\min}\le K \lt  M^*),\qquad V(K) = z^* \;\;(K \ge M^*).$$</li>
+  <li><b>Same schedule, different horizon.</b> A given schedule has the same reported value at every horizon in which it fits. The reported optimal value changes only when the horizon grows enough for a strictly better schedule to fit, and never once $K \ge M^*$.</li>
+</ol>
+</div>
+
+<div class="proof">
+<p><b>(a)</b> A solution of $\mathrm{P}(K)$ is a complete schedule with makespan $\le K$, so $K\ge K_{\min}$. Conversely a complete schedule with makespan $K_{\min}\le K$ is feasible for $\mathrm{P}(K)$ by Lemma 2.</p>
+<p><b>(b)</b> Lemma 1: every solution of $\mathrm{P}(K)$ is available in $\mathrm{P}(K+1)$ with the same value.</p>
+<p><b>(c)</b> Let $\sigma$ be complete with $f(\sigma)\le\bar Z$. For any vehicle $j$, every other vehicle satisfies $D_i\ge E_i$, so
+$$\delta D_j - a_j \;=\; f(\sigma) - \sum_{i\ne j}(\delta D_i - a_i) \;\le\; \bar Z - \sum_{i\ne j}(\delta E_i - a_i),$$
+which rearranges to $D_j \le E_j + (\bar Z - F)/\delta$. Since $D_j$ is an integer, $D_j \le E_j + \lceil(\bar Z-F)/\delta\rceil \le K_{\text{cert}}(\bar Z)$. So every complete schedule at least as good as $\bar Z$ lives within $K_{\text{cert}}(\bar Z)$ slots. Within a bounded number of slots there are finitely many integer patterns $(u,\eta,y,b,r)$ (occupancy, lanes, order, modules); by Lemma 0 each pattern has a single value, and whether a pattern admits feasible powers and energies is a linear feasibility question. The minimum over the finitely many feasible patterns is $z^*$, so it is attained, and every optimal schedule (in particular those achieving $M^*$ and $M^*{\max}$) has makespan $\le K_{\text{cert}}(\bar Z)$.</p>
+<p><b>(d)</b> Every solution of $\mathrm{P}(K)$ is complete, so $V(K)\ge z^*$. If $K\ge M^*$, an optimal schedule with makespan $M^*$ is feasible for $\mathrm{P}(K)$ (Lemma 2), so $V(K)\le z^*$. If $K_{\min}\le K \lt  M^*$, a solution of $\mathrm{P}(K)$ with value $z^*$ would be an optimal schedule of makespan $\le K \lt  M^*$, contradicting the definition of $M^*$; hence $V(K)\gt z^*$. The case $K\lt K_{\min}$ is (a).</p>
+<p><b>(e)</b> The first sentence is Lemma 0 with Lemma 1. Combined with (b) and (d), $V$ is a non-increasing step function that is constant from $M^*$ on. <span class="qed">∎</span></p>
+</div>
+
+<h3>What happens to the optimal <i>schedule</i> (not just its value)</h3>
+<p>Let $\mathcal O^*$ be the set of optimal complete schedules. For $K \ge M^*$, Lemmas 1 and 2 give that the optimal solutions of $\mathrm{P}(K)$ are exactly the members of $\mathcal O^*$ with makespan $\le K$. Hence:</p>
+<ul>
+  <li>for $M^* \le K \lt  M^*{\max}$ the <b>value</b> is final, but enlarging $K$ can add further optimal schedules (ties, with later finishing times), so a solver may return a different schedule with the same total; individual vehicles' sojourns may differ, the total and mean cannot;</li>
+  <li>for $K \ge M^*{\max}$ the <b>set</b> of optimal schedules no longer changes at all.</li>
+</ul>
+<p>For the experiments only the value matters, so the threshold of interest is $M^*$; $M^*{\max}$ matters only if the specific schedule is reported.</p>
+
+<!-- ===================================================================== -->
+<h2 id="sandwich">6. The relaxation sandwich</h2>
+
+<div class="box thm">
+<p><span class="label">Proposition.</span> For every $K$ with $\mathrm{P}(K)$ feasible,
+$$r(K) \;\le\; z^* \;\le\; V(K),$$
+with $r(K)$ non-decreasing and $V(K)$ non-increasing in $K$. Moreover $r(K) = z^*$ whenever $K \ge K_{\text{cert}}(z^*)$.</p>
+</div>
+<div class="proof">
+<p><b>$r(K)\le z^*$.</b> Take an optimal complete schedule and cut it at $K$: a vehicle still charging at $K$ keeps its occupancy up to slot $K-1$ and is recorded with $D_j=K$; a vehicle not yet started is left unserved ($D_j=K$). This is feasible for $\mathrm{R}(K)$ (the departure rule has no row at $K$), and every vehicle's recorded departure is no later than its true one, so the value is $\le z^*$.</p>
+<p><b>$r$ non-decreasing.</b> Cutting a solution of $\mathrm{R}(K+1)$ at $K$ in the same way gives a solution of $\mathrm{R}(K)$ whose value is lower by $\delta$ for each vehicle with $D_j=K+1$ and unchanged otherwise, so $r(K)\le r(K+1)$.</p>
+<p><b>$z^*\le V(K)$</b> is part (d) of the theorem.</p>
+<p><b>$r(K)=z^*$ for large $K$.</b> Let $K \ge K_{\text{cert}}(z^*)$ and let $\sigma$ be any solution of $\mathrm{R}(K)$ with some vehicle $j$ unfinished (so $D_j=K$). Since $D_i\ge E_i$ for all $i$,
+$$f(\sigma) \;\ge\; (\delta K - a_j) + \sum_{i\ne j}(\delta E_i - a_i) \;\ge\; \delta E_j + (z^*-F) - a_j + F - (\delta E_j - a_j) \;=\; z^*.$$
+Solutions with no unfinished vehicle are complete and so cost $\ge z^*$ as well. Hence $r(K)\ge z^*$. <span class="qed">∎</span></p>
+</div>
+
+<p>Consequences:</p>
+<ul>
+  <li>Any lower bound for $\mathrm{R}(K)$ (from the compact MILP, B&amp;P or DW run <i>without</i> (C)) is a certified lower bound on $z^*$ at every horizon, however small.</li>
+  <li>Any feasible solution of $\mathrm{P}(K)$ (run <i>with</i> (C)) is a certified upper bound on $z^*$.</li>
+  <li>If the two meet at some $K$, then $z^*$ is proven there, and $M^* \le K$ (an optimal schedule fits in $K$).</li>
+</ul>
+
+<!-- ===================================================================== -->
+<h2 id="tightest">7. Finding the tightest horizon</h2>
+
+<p>The tightest horizon after which a larger $T$ changes nothing is
+$$T^* = \delta M^* \quad\text{(for the optimal value)},\qquad T^*{\max} = \delta M^*{\max} \quad\text{(for the set of optimal schedules)}.$$
+Below $M^*$ the optimum is too pessimistic, above it extra slots only enlarge the model. $M^*$ is not known in advance, so the procedure has two parts: first find <i>some</i> horizon that is certified to be $\ge M^*$, then, if desired, shrink it to exactly $M^*$.</p>
+
+<h3>7.1 A certificate from any complete schedule</h3>
+<p>By part (c) of the theorem, $M^* \le K_{\text{cert}}(\bar Z)$ for the value $\bar Z$ of <i>any</i> complete schedule. Using a better schedule gives a smaller bound, so the bound tightens as solvers improve the incumbent.</p>
+
+<p>Values on the three small test trials ($\delta=5$; $E_j=1$ for vehicles plugged in at $t_0$):</p>
+<div class="table-wrap">
+<table>
+  <tr><th>trial</th><th>vehicles</th><th>$K_{\text{fifo}}$</th><th>$\max_j E_j$</th><th>$F$</th><th>$\bar Z$ used</th><th>$K_{\text{cert}}(\bar Z)$</th></tr>
+  <tr><td>interarrival 30</td><td>3</td><td>19</td><td>16</td><td>85</td><td>100 (optimum)</td><td><b>19</b> — certified at $K_{\text{fifo}}$</td></tr>
+  <tr><td>interarrival 20</td><td>6</td><td>21</td><td>19</td><td>140</td><td>225 (optimum)</td><td>36</td></tr>
+  <tr><td>interarrival 12</td><td>10</td><td>37</td><td>20</td><td>240</td><td>690 (FIFO)</td><td>110</td></tr>
+</table>
+</div>
+<p>The bound is <b>sound but loose</b>: it charges all the excess delay $\bar Z - F$ to a single vehicle, so in congested instances it can be several times $K_{\text{fifo}}$.</p>
+
+<h3>7.2 A much tighter certificate</h3>
+<p>The loose step is replacing the other vehicles' total by $\sum_{i\ne j}(\delta E_i - a_i)$, which ignores the fact that they congest each other. A better bound uses the instance without $j$.</p>
+
+<div class="box thm">
+<p><span class="label">Lemma 3.</span> Let $L_{-j}$ be any lower bound on the closed-system optimum of the instance $\mathcal J\setminus\{j\}$ (for example $r_{-j}(K)$, a relaxed-model bound for that instance at any horizon). Then every optimal schedule satisfies
+$$D_j \;\le\; \Bigl\lfloor \frac{z^* - L_{-j} + a_j}{\delta} \Bigr\rfloor,
+\qquad\text{so}\qquad
+M^*{\max} \;\le\; K^*{+}_{\text{cert}}(\bar Z) = \max_j \Bigl\lfloor \frac{\bar Z - L_{-j} + a_j}{\delta} \Bigr\rfloor$$
+for the value $\bar Z \ge z^*$ of any complete schedule.</p>
+</div>
+<div class="proof">
+<p>Take an optimal schedule and delete vehicle $j$. The remaining vehicles keep their occupancy, lanes and power; deleting $j$ only frees connectors and modules, so this is a complete schedule for $\mathcal J\setminus\{j\}$ and its value is at least $L_{-j}$. Hence $z^* = (\delta D_j - a_j) + (\text{others}) \ge \delta D_j - a_j + L_{-j}$. Rearrange and use $z^*\le\bar Z$. <span class="qed">∎</span></p>
+</div>
+<p>Because $L_{-j}$ accounts for the congestion among the other vehicles, $\bar Z - L_{-j}$ is close to the cost of vehicle $j$ itself, and $K^*{+}_{\text{cert}}$ is typically close to the true last departure. It costs one lower-bound computation per vehicle; a DW bound (or the root bound of B&amp;P) without (C) is enough, and only the vehicles that could plausibly finish last need it.</p>
+
+<h3>7.3 Certifying a given horizon with the sandwich</h3>
+<p>At a candidate horizon $K$, solve $\mathrm{P}(K)$ (with (C)) for an upper bound $U$ and $\mathrm{R}(K)$ (without (C)) for a lower bound $L$. If $L \ge U - \varepsilon$, then $z^* = U$ and $M^* \le K$, with no need to know $M^*$. This is the cheapest certificate when it succeeds, and it succeeded at $K=K_{\text{fifo}}$ on the interarrival 15, 20 and 30 trials. It can fail even for $K\ge M^*$ when the relaxation still cheats (Section 2), in which case 7.1/7.2 are the fallback.</p>
+
+<h3>7.4 Shrinking to exactly $M^*$ (optional)</h3>
+<p>Once a horizon $K_c \ge M^*$ is certified and $z^* = V(K_c)$ is known, $M^*$ is the optimal value of a second, lexicographic problem in the same model:</p>
+$$M^* \;=\; \min\bigl\{\, \mu \;:\; D_j \le \mu \;\;\forall j,\;\; f \le z^*,\;\; \text{(2)–(19), (24), (C) with horizon } K_c \,\bigr\}.$$
+<p>In Gurobi this is a hierarchical objective (minimize $f$ with priority 1, then $\mu$ with priority 0), the same mechanism the code already uses for <code>tie_break</code>, so it is one solve. Replacing "min $\mu$" by "max $\mu$" gives $M^*{\max}$. Alternatively, because $V$ is non-increasing and equals $z^*$ exactly on $[M^*,\infty)$, a binary search on $K\in[K_{\min}, K_c]$ with the question "is there a solution of $\mathrm{P}(K)$ with value $\le z^*$?" (a feasibility problem — use $z^*$ as a cutoff) also finds $M^*$.</p>
+<p>This step is only worth doing to understand an instance or to shrink later re-solves; correctness needs only <i>some</i> certified $K\ge M^*$.</p>
+
+<h3>7.5 Recommended procedure</h3>
+<div class="box">
+<ol class="algo">
+  <li><b>Start</b> at $K \leftarrow K_{\text{fifo}}$ (the discretized FIFO schedule is complete and fits, so $\mathrm{P}(K)$ is feasible).</li>
+  <li><b>Solve</b> $\mathrm{P}(K)$ with (C): incumbent value $U$ (an upper bound on $z^*$) and its bound $B$ (a lower bound on $V(K)$). Solve or bound $\mathrm{R}(K)$ without (C): lower bound $L$ on $z^*$.</li>
+  <li><b>Sandwich test:</b> if $L \ge U - \varepsilon$, stop — $z^* = U$, certified, and $M^*\le K$.</li>
+  <li><b>Horizon test:</b> compute $K_c = K^*{+}_{\text{cert}}(U)$ (or $K_{\text{cert}}(U)$ if the per-vehicle bounds are not available). If $K \ge K_c$, stop — $V(K)=z^*$, so $[\max(B,L),\,U]$ brackets $z^*$ (and equals it when the solve is optimal).</li>
+  <li><b>Otherwise</b> enlarge the horizon, $K \leftarrow \min\bigl(K_c,\ \lceil (1+s)K \rceil\bigr)$ for a growth factor $s$ (e.g. $0.25$), carry the incumbent over (Lemma 1 keeps it feasible with the same value) and return to step 2.</li>
+  <li><i>(Optional)</i> At the certified horizon, run 7.4 to obtain $M^*$ and the tightest $T^* = \delta M^*$.</li>
+</ol>
+</div>
+<p><b>Termination.</b> $K$ grows every round until it reaches $K_c$, and $K_c$ never grows because $U$ never increases (Lemma 1 carries incumbents forward). So the loop ends after at most $\lceil \log_{1+s}(K_c/K_{\text{fifo}}) \rceil + 1$ rounds, with $K_c$ at most $K_{\text{cert}}$ of the FIFO value.</p>
+
+<!-- ===================================================================== -->
+<h2 id="summary">8. Summary</h2>
+
+<div class="table-wrap">
+<table>
+  <tr><th>question</th><th>answer</th></tr>
+  <tr><td>Does (C) remove the cheating, the repair step and the K-dependence of a schedule's value?</td><td>Yes. Every feasible solution is a complete schedule (a valid upper bound on $z^*$), and its value does not depend on $K$ (Lemma 0).</td></tr>
+  <tr><td>Is it "either optimal or infeasible"?</td><td>No — three regimes: infeasible ($K\lt K_{\min}$), feasible but too pessimistic ($K_{\min}\le K\lt M^*$, where $V(K)\gt z^*$), exact ($K\ge M^*$).</td></tr>
+  <tr><td>Does the optimal value change with $K$?</td><td>Only by decreasing, and only until $K=M^*$; afterwards it is exactly $z^*$.</td></tr>
+  <tr><td>Does the optimal schedule change with $K$?</td><td>For $K\ge M^*$ only among ties of equal value; for $K\ge M^*{\max}$ not at all.</td></tr>
+  <tr><td>Same schedule, different $K$ — different reported value?</td><td>Never (Lemma 0). (In the relaxed model it does, through $\delta K - a_j$.)</td></tr>
+  <tr><td>Tightest horizon?</td><td>$T^* = \delta M^*$. Certify some $K\ge M^*$ with the sandwich (7.3) or the makespan bounds (7.1–7.2), then optionally compute $M^*$ exactly (7.4).</td></tr>
+  <tr><td>Role left for <code>closed_*</code></td><td>Only as the certificate in 7.3: best lower bound of the relaxed model against best schedule of the closed model.</td></tr>
+</table>
+</div>
+
+</main>
+</body>
+</html>
