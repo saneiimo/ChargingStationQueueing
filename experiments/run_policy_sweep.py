@@ -67,6 +67,21 @@ BASE = PolicyConfig(
     battery_cap_kwh=(75,),
     queue_capacity=1000,
     # traffic
+    # The arrival rate comes from EITHER of these two fields:
+    #   * mean_interarrival (minutes between arrivals): used as given;
+    #     offered_power_load is then ignored (put None).
+    #   * mean_interarrival = None and offered_power_load = target THEORETICAL
+    #     offered power load rho_P (the theoretical counterpart of overall
+    #     power utilization: the fraction of the station's rated power the
+    #     arriving demand needs, e.g. 0.8). The sweep sets
+    #     mean_interarrival = 60 * E[W] / (rho_P * R), with E[W] the mean
+    #     requested energy (kWh) of the battery/SoC distributions and
+    #     R = n_piles * n_modules * p_module (kW). The value used is recorded
+    #     in the results' mean_interarrival column.
+    # Either one can be the swept axis below; sweeping offered_power_load
+    # needs mean_interarrival=None here (a swept mean_interarrival overrides it).
+    mean_interarrival=None,
+    offered_power_load=None,
     warmup_period=6 * HR2MIN,  # long relative to max_time, to reach steady state
     max_time=24 * HR2MIN,  # measured window (minutes); None -> config.MAX_TIME
     delta_arr=None,  # None keeps continuous exponential arrival times
@@ -93,6 +108,8 @@ BASE = PolicyConfig(
 SWEEP = dict(
     mean_interarrival=[HR2MIN / (n_veh / 2 * BASE.n_piles) for n_veh in range(2, 13)],
 )
+# Or sweep the load directly (needs mean_interarrival=None in BASE, as above):
+# SWEEP = dict(offered_power_load=[0.2, 0.4, 0.6, 0.8, 0.9])
 
 # Other grids worth trying (uncomment one):
 #

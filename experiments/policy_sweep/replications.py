@@ -22,6 +22,7 @@ import numpy as np
 import pandas as pd
 
 from env.charging_env import ChargingStationEnv
+from metrics.load import ArrivalModel, station_load_summary
 from policy.power.base import PowerPolicy
 from policy.power.proportional import ProportionalPower
 from policy.queue.fifo import FIFOQueuePolicy
@@ -43,6 +44,40 @@ def _mean_or_zero(samples: np.ndarray) -> float:
         return 0.0
     usable = samples[~np.isnan(samples)]
     return float(usable.mean()) if usable.size else 0.0
+
+
+def _station_load(e: ChargingStationEnv, since: float) -> dict[str, float]:
+    """
+    ``metrics.load.station_load_summary`` for one finished episode: time
+    averages over ``[since, end of run]``, offered loads from the arrivals
+    in ``[since, engine.max_time]`` (realized) and from the env's arrival
+    generator (theory; NaN-free only when the env samples its own arrivals).
+    See ``metrics/README.md`` for what each one means.
+    """
+    eng = e.engine
+    now = float(eng.current_time)
+    return station_load_summary(
+        eng.metrics, eng.station, now, since=since,
+        arrivals_until=min(float(eng.max_time), now), arrival_model=ArrivalModel.from_env(e),
+    )
+
+
+def _station_load_columns(since_of: Callable[[ChargingStationEnv], float]) -> dict[str, Callable[[ChargingStationEnv], float]]:
+    """The station-load columns (see ``metrics/README.md``), windowed by ``since_of(env)``."""
+    keys = {
+        "connector occupancy": "connector_occupancy",
+        "power utilization": "power_utilization",
+        "offered power load (realized)": "offered_power_load_realized",
+        "offered power load (theory)": "offered_power_load_theory",
+        "offered connector load (realized)": "offered_connector_load_realized",
+        "offered connector load (theory)": "offered_connector_load_theory",
+        "offered occupancy (realized)": "offered_occupancy_realized",
+        "offered occupancy (theory)": "offered_occupancy_theory",
+    }
+    return {
+        name: (lambda e, k=key: _station_load(e, since_of(e)).get(k, float("nan")))
+        for name, key in keys.items()
+    }
 
 
 def _max_or_zero(samples: np.ndarray) -> float:
@@ -85,6 +120,9 @@ DEFAULT_METRICS: dict[str, Callable[[ChargingStationEnv], float]] = {
         e.engine.current_time,
         n_servers=e.engine.station.n_piles * e.engine.station.n_connectors,
     )["rho_theory"],
+    # Station load -- occupancy, power utilization and offered loads; see
+    # metrics/README.md for definitions and how they relate.
+    **_station_load_columns(lambda e: 0.0),
     # The "(all)" family counts vehicles still in the system at the end of
     # the run as well as the finished ones, right-censored at that instant
     # -- see MetricsTracker.in_system_time_arrays. Each is a LOWER BOUND on
@@ -153,6 +191,7 @@ DEFAULT_METRICS_POST_WARMUP: dict[str, Callable[[ChargingStationEnv], float]] = 
         n_servers=e.engine.station.n_piles * e.engine.station.n_connectors,
         since=e.engine.warmup_period,
     )["rho_theory"],
+    **_station_load_columns(lambda e: e.engine.warmup_period),
     # Measured-phase counterpart of the "(all)" family above. Note the
     # censoring bites harder here: the measured window is shorter than the
     # whole run, so a larger share of its arrivals are still in flight when

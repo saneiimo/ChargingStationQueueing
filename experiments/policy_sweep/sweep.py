@@ -283,7 +283,7 @@ def run_policy_sweep(
             tag = f" [{cfg.label}]" if cfg.label else ""
             print(
                 f"\n[config {config_id + 1}/{len(configs)}]{tag} "
-                f"interarrival={cfg.mean_interarrival:g} "
+                f"interarrival={cfg.effective_mean_interarrival:g} "
                 f"piles={cfg.n_piles} conn={cfg.n_connectors} "
                 f"modules={cfg.n_modules} n_reps={cfg.n_reps}"
             )

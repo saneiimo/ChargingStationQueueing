@@ -15,7 +15,8 @@ import dataclasses
 from dataclasses import dataclass
 from typing import Any
 
-from config import HR2MIN
+from config import BATTERY_CAP_OPTIONS, HR2MIN
+from metrics.load import mean_interarrival_for_power_load
 from policy.power.base import PowerPolicy
 from policy.power.constant import ConstantPower
 from policy.power.proportional import ProportionalPower
@@ -59,7 +60,18 @@ class PolicyConfig:
     queue_capacity: int = 100
 
     # --- traffic -----------------------------------------------------------
-    mean_interarrival: float = 15.0
+    # Arrival rate: give EITHER mean_interarrival (minutes between arrivals,
+    # lambda = 1 / mean_interarrival) OR offered_power_load (rho_P, the
+    # theoretical counterpart of overall power utilization: the fraction of
+    # the station's rated power the arriving demand needs; see
+    # metrics/README.md, 6.3). With mean_interarrival=None it is derived from
+    # offered_power_load as 60 * E[W] / (rho_P * R) (E[W]: mean requested
+    # kWh of the battery/SoC distributions; R = n_piles * n_modules *
+    # p_module); with mean_interarrival set, offered_power_load is ignored.
+    # The value actually used is effective_mean_interarrival, and is what
+    # the mean_interarrival column of the results records.
+    mean_interarrival: float | None = 15.0
+    offered_power_load: float | None = None
     # None defers to config.MAX_TIME / config.WARMUP_PERIOD respectively.
     max_time: float | None = None
     warmup_period: float | None = None
@@ -107,6 +119,13 @@ class PolicyConfig:
 
     # ------------------------------------------------------------------ #
     def __post_init__(self) -> None:
+        # Neither rate input set is allowed here: a sweep's BASE leaves the
+        # swept one to config_grid. effective_mean_interarrival raises if a
+        # config is used with neither.
+        if self.mean_interarrival is not None and self.mean_interarrival <= 0:
+            raise ValueError(f"mean_interarrival must be > 0, got {self.mean_interarrival}")
+        if self.offered_power_load is not None and self.offered_power_load <= 0:
+            raise ValueError(f"offered_power_load must be > 0, got {self.offered_power_load}")
         unknown_q = set(self.queue_policies) - set(QUEUE_POLICIES)
         unknown_p = set(self.power_policies) - set(POWER_POLICIES)
         if unknown_q:
@@ -133,6 +152,27 @@ class PolicyConfig:
                 )
 
     @property
+    def effective_mean_interarrival(self) -> float:
+        """
+        The mean inter-arrival time (minutes) the scenario uses:
+        ``mean_interarrival`` when given, else the one that makes the
+        theoretical offered power load equal ``offered_power_load``
+        (``metrics.load.mean_interarrival_for_power_load``; batteries default
+        to ``config.BATTERY_CAP_OPTIONS`` like the arrival generator's).
+        Computed from the inputs every time, so ``dataclasses.replace`` /
+        ``config_grid`` of either field always takes effect.
+        """
+        if self.mean_interarrival is not None:
+            return float(self.mean_interarrival)
+        if self.offered_power_load is None:
+            raise ValueError("set mean_interarrival or offered_power_load (one of them is needed)")
+        return mean_interarrival_for_power_load(
+            self.offered_power_load,  # type: ignore[arg-type]
+            rated_power=self.n_piles * self.n_modules * self.p_module,
+            battery_cap_options=self.battery_cap_options or BATTERY_CAP_OPTIONS,
+        )
+
+    @property
     def battery_cap_options(self) -> list[float] | None:
         """Battery capacities in the engine's native kW*min units."""
         if self.battery_cap_kwh is None:
@@ -148,7 +188,7 @@ class PolicyConfig:
             "n_modules": self.n_modules,
             "p_module": self.p_module,
             "queue_capacity": self.queue_capacity,
-            "mean_interarrival": self.mean_interarrival,
+            "mean_interarrival": self.effective_mean_interarrival,
             "max_time": self.max_time,
             "battery_cap_options": self.battery_cap_options,
             "delta_arr": self.delta_arr,
@@ -159,6 +199,8 @@ class PolicyConfig:
     def to_row(self) -> dict[str, Any]:
         """Flat, CSV-friendly view -- one column per knob, tuples joined."""
         row = dataclasses.asdict(self)
+        # The rate actually used, whichever input set it.
+        row["mean_interarrival"] = self.effective_mean_interarrival
         row["queue_policies"] = "+".join(self.queue_policies)
         row["power_policies"] = "+".join(self.power_policies)
         row["battery_cap_kwh"] = (
