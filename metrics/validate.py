@@ -346,9 +346,12 @@ def report_queueing_laws(
     *,
     verbose: bool = False,
     post_warmup_only: bool = False,
+    mean_interarrival: float | None = None,
 ) -> dict[str, float]:
     """
-    Print / return Little's law (system / queue) and connector utilization.
+    Print / return Little's law (system / queue), connector utilization and
+    the station-load metrics (occupancy, power utilization, offered loads --
+    see ``metrics/README.md``).
 
     Delegates all computation to ``MetricsTracker.queueing_summary`` so
     notebooks, tests, and this helper share one implementation.
@@ -366,6 +369,11 @@ def report_queueing_laws(
         in which case this flag has no effect. If False (default), report
         over the whole run -- identical to this function's behaviour before
         the warm-up feature existed.
+    mean_interarrival :
+        For the theoretical offered loads: the generator's mean gap
+        (minutes). Defaults to the station's own ``mean_interarrival``;
+        when that is ``None`` too (an external arrival list) and nothing is
+        passed here, only the realized offered loads are reported.
 
     Returns
     -------
@@ -388,8 +396,17 @@ def report_queueing_laws(
     c = station.n_piles * station.n_connectors
     since = metrics.warmup_period if post_warmup_only else 0.0
 
+    from metrics.load import ArrivalModel
+
+    mia = mean_interarrival if mean_interarrival is not None else station.mean_interarrival
+    arrival_model = (
+        ArrivalModel.from_env(engine, mean_interarrival=mia) if mia is not None else None
+    )
     try:
-        out = metrics.queueing_summary(T, n_servers=c, since=since)
+        out = metrics.queueing_summary(
+            T, n_servers=c, since=since, station=station,
+            arrivals_until=min(float(engine.max_time), T), arrival_model=arrival_model,
+        )
     except MetricsError as exc:
         raise EpisodeValidationError(str(exc)) from exc
 
@@ -419,5 +436,26 @@ def report_queueing_laws(
             f"  Utilization rho           :  theory={out['rho_theory']:.4f}  "
             f"sim={out['rho_sim']:.4f}  |diff|={abs(out['rho_theory'] - out['rho_sim']):.4f}"
         )
+        print("  --- station load (metrics/README.md) ---")
+        occ = [k for k in out if k.startswith("connector_occupancy_p")]
+        print(
+            f"  connector occupancy       :  overall={out['connector_occupancy']:.4f}  "
+            + "  ".join(f"{k.removeprefix('connector_occupancy_')}={out[k]:.4f}" for k in occ)
+        )
+        util = [k for k in out if k.startswith("power_utilization_p")]
+        print(
+            f"  power utilization         :  overall={out['power_utilization']:.4f}  "
+            + "  ".join(f"{k.removeprefix('power_utilization_')}={out[k]:.4f}" for k in util)
+        )
+        for name, label in (
+            ("offered_power_load", "offered power load"),
+            ("offered_connector_load", "offered connector load (Erl)"),
+            ("offered_occupancy", "offered occupancy"),
+        ):
+            theory = out.get(f"{name}_theory")
+            print(
+                f"  {label:26s}:  realized={out[f'{name}_realized']:.4f}"
+                + (f"  theory={theory:.4f}" if theory is not None else "  theory=n/a (no mean_interarrival)")
+            )
 
     return out

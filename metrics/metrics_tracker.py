@@ -17,6 +17,11 @@ After an episode, ``metrics.validate`` can assert invariants and optionally
 print the queueing-law summary via ``report_queueing_laws`` (which delegates
 here).
 
+``metrics/README.md`` is the reference for every metric recorded or reported
+(notation, formulas, realized vs theory, how they relate, and where each
+appears); station-load metrics (connector occupancy, power utilization,
+offered power and connector loads) are computed in ``metrics/load.py``.
+
 Warm-up period
 --------------
 ``SimulationEngine`` can be given a ``warmup_period > 0`` (minutes), in
@@ -93,7 +98,10 @@ from dataclasses import dataclass
 import numpy as np
 from typing import TYPE_CHECKING
 
+from metrics.load import station_load_summary
+
 if TYPE_CHECKING:
+    from metrics.load import ArrivalModel
     from models.station import ChargingStation
     from models.ev import EV
 
@@ -192,6 +200,12 @@ class InServiceAtBoundary:
         that optimizer's own preprocessing, not done here.
         """
         return [row for row in self.ev.charge_trace if row[0] >= self.boundary_time]
+
+
+def _release_slot(a_rel: float, delta: float) -> int:
+    """``ceil(a_rel / delta)`` for an arrival ``a_rel >= 0`` measured from the
+    window start -- the offline models' release slot."""
+    return math.ceil(round(max(0.0, a_rel) / delta, 9))
 
 
 class MetricsTracker:
@@ -520,6 +534,18 @@ class MetricsTracker:
             else self.connector_active_minutes_since(since)
         )
         return active / window
+
+    def pile_power_utilization(self, sim_time: float, pile_power: float, since: float = 0.0) -> np.ndarray:
+        """
+        Fraction of each pile's rated power that reached vehicles over
+        ``[since, sim_time]``: energy the pile delivered divided by the
+        energy ``pile_power`` kW (``N * Delta``) would deliver running flat
+        out for the whole window. See ``metrics/README.md``.
+        """
+        window = sim_time - since if since > 0 else sim_time
+        if window <= 0 or pile_power <= 0:
+            return np.zeros(self.n_piles)
+        return self.pile_energy(since) / (pile_power * window / 60.0)
 
     def mean_connector_utilization(self, sim_time: float, since: float = 0.0) -> float:
         """Mean connector busy fraction across all connectors, over
@@ -948,7 +974,7 @@ class MetricsTracker:
             for ev in censored:
                 rows.append((K, max(0.0, ev.arrival_time - since)))
 
-            sojourns = [delta * slot - a_rel for slot, a_rel in rows]
+            sojourns = [delta * (slot - _release_slot(a_rel, delta)) for slot, a_rel in rows]
             out[name] = {
                 "n": float(len(rows)),
                 "n_censored": float(len(censored)),
@@ -1019,6 +1045,22 @@ class MetricsTracker:
         """
         return dict(self._grid_departure_slots(delta, since)[0])
 
+    def grid_replay_intervals(self, delta: float, since: float = 0.0) -> dict[int, tuple[int, int]]:
+        """
+        ``{vehicle_id: (start_slot, departure_slot)}`` in this run's grid
+        replay (the same replay as ``grid_departure_slots``): each stay holds
+        ``ceil(service_minutes / delta)`` slots, at least one, ending at its
+        departure slot. Slots are counted from ``since``.
+        """
+        departure_slot, by_id = self._grid_departure_slots(delta, since)
+        out: dict[int, tuple[int, int]] = {}
+        for vid, dep in departure_slot.items():
+            ev = by_id[vid]
+            served_from = max(float(ev.service_start_time), since)  # type: ignore[arg-type]
+            need = max(math.ceil(round((ev.departure_time - served_from) / delta, 9)), 1)
+            out[vid] = (dep - need, dep)
+        return out
+
     def grid_sojourn_by_cohort(
         self, delta: float, since: float = 0.0
     ) -> dict[str, dict[str, float]]:
@@ -1049,8 +1091,8 @@ class MetricsTracker:
         Note this rounds each *stay* up once. Rounding a stay's two
         endpoints up independently instead would compress it (an 18.21
         minute stay squeezed into 18 slots) and produce departure times no
-        policy can actually achieve -- which the offline model rejects via
-        its earliest-departure bound (24).
+        policy can actually achieve -- which the offline model rejects (the
+        vehicle cannot receive its full energy in the compressed stay).
 
         Caveats. Like ``sojourn_by_cohort`` this covers finished vehicles
         only. And it replays *occupancy*, not power: it assumes each
@@ -1063,9 +1105,10 @@ class MetricsTracker:
         "total_departure_slots"}``. ``total_sojourn`` is in the offline
         models' objective units (total sojourn, minutes), directly
         comparable with ``ConnectorLaneSolution.objective`` when the
-        objective covers the matching cohorts; ``total_departure_slots`` is
-        ``sum_j D_j``, the slot-count form (``delta * it - sum_j a_j`` is
-        ``total_sojourn``).
+        objective covers the matching cohorts: like the models, a vehicle's
+        sojourn runs from its release slot ``k_j = ceil(a_j/delta)`` (arrival
+        relative to ``since``) to its departure slot, ``delta * (D_j - k_j)``.
+        ``total_departure_slots`` is ``sum_j D_j``, the slot-count form.
         """
         departure_slot, by_id = self._grid_departure_slots(delta, since)
         levels = (
@@ -1082,7 +1125,7 @@ class MetricsTracker:
                 if by_id[j].arrival_time >= since or j in keep
             ]
             sojourns = [
-                delta * departure_slot[j] - max(0.0, by_id[j].arrival_time - since)
+                delta * (departure_slot[j] - _release_slot(by_id[j].arrival_time - since, delta))
                 for j in ids
             ]
             out[name] = {
@@ -1191,6 +1234,9 @@ class MetricsTracker:
         since: float = 0.0,
         include_ids: set[int] | None = None,
         truncate_included: bool = True,
+        station: ChargingStation | None = None,
+        arrivals_until: float | None = None,
+        arrival_model: "ArrivalModel | None" = None,
     ) -> dict[str, float]:
         """
         Little's law (system and queue) and utilization for the episode.
@@ -1238,6 +1284,14 @@ class MetricsTracker:
 
             Per-pile energy / utilization arrays are available via
             ``pile_energy``, ``average_pile_energy``, and ``pile_utilization``.
+
+            With ``station`` given, also every key of
+            ``metrics.load.station_load_summary`` (connector occupancy per
+            connector and overall, power utilization per pile and overall,
+            realized offered loads, and theoretical ones when
+            ``arrival_model`` is given); ``arrivals_until`` is when arrivals
+            closed (``engine.max_time``; default ``sim_time``). All are
+            explained in ``metrics/README.md``.
         """
         window = float(sim_time) - since
         T = window if window > 0 else 1.0
@@ -1287,4 +1341,12 @@ class MetricsTracker:
             "E_total": self.total_energy(since),
             "E_avg": self.average_energy(since),
             "c_s2": float(c_s2) if np.isfinite(c_s2) else float("nan"),
+            **(
+                station_load_summary(
+                    self, station, float(sim_time), since=since,
+                    arrivals_until=arrivals_until, arrival_model=arrival_model,
+                )
+                if station is not None
+                else {}
+            ),
         }
