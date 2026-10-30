@@ -126,8 +126,9 @@ sojourn measured on the slot grid, `sum_j delta*(D_j - k_j)` with
 `k_j = ceil(a_j/delta)` the release slot, so every objective value is a
 whole multiple of `delta` and any lower bound can be rounded up to the
 next multiple (the free tightening; all reported bounds are). With
-`TrialConfig.exact_tolerance_min` / `bp_tolerance_min = x`, the exact
-model / branch-and-price stop as soon as their schedule is proven within
+`TrialConfig.exact_tolerance_min` / `bp_tolerance_min` / `pds_tolerance_min = x`,
+the exact model / branch-and-price / price-directed search stop as soon as
+their schedule is proven within
 `x` minutes of mean sojourn of the optimum (`x * n` of total); only whole
 steps of `delta / n` count.
 
@@ -135,8 +136,8 @@ steps of `delta / n` count.
 
 ### What a trial produces
 
-One trial = one `TrialConfig` = one simulated episode plus up to three solves.
-Up to five numbers for the same objective come out, each reported per cohort:
+One trial = one `TrialConfig` = one simulated episode plus up to four solves.
+Up to six numbers for the same objective come out, each reported per cohort:
 
 | source  | what it is | comparable? |
 |---------|-----------|-------------|
@@ -144,9 +145,11 @@ Up to five numbers for the same objective come out, each reported per cohort:
 | `grid`  | that *same* FIFO schedule replayed on the `delta` slot grid | **yes** — the like-for-like target |
 | `exact` | the connector-lane MILP's incumbent (an upper bound on the optimum), plus the solver's own `best_bound` | yes |
 | `bp`    | the *same* model solved by branch-and-price (`offline_cl_PB`): best schedule plus a proven `best_bound`, equal when `bp_status == "OPTIMAL"` | yes |
+| `pds`   | the *same* model solved by price-directed state-space search (`offline_cl_PDS`): best schedule plus a proven `best_bound`, equal when `pds_status == "OPTIMAL"` | yes |
 | `dw`    | Dantzig-Wolfe's certified **lower** bound on the optimum (continuous-module relaxation) | yes |
 
-On every row: `grid ≥ exact ≥ z* ≥ bp_best_bound` and `bp_objective ≥ z*`,
+On every row: `grid ≥ exact ≥ z* ≥ bp_best_bound` and `bp_objective ≥ z*`
+(the same for `pds_`),
 where `z*` is the closed-system optimum at the trial's horizon; `dw_LB ≤ z*`
 too.
 
@@ -307,7 +310,8 @@ edge needs nothing: the horizon lies past every vehicle's FIFO departure.)
 ### Which stages run
 
 ```python
-run_sweep(configs, run_sim=True, run_exact_model=False, run_bp_model=True, run_dw_model=True)
+run_sweep(configs, run_sim=True, run_exact_model=False, run_bp_model=True, run_pds_model=True,
+          run_dw_model=True)
 ```
 
 | flag | default | stage | columns |
@@ -315,12 +319,13 @@ run_sweep(configs, run_sim=True, run_exact_model=False, run_bp_model=True, run_d
 | `run_sim` | `True` | sim/grid sojourn tables | `sim_*`, `grid_*` |
 | `run_exact_model` | `True` | exact model as a compact MILP (Gurobi) | `exact_*` |
 | `run_bp_model` | `False` | exact model by branch-and-price | `bp_*` |
+| `run_pds_model` | `False` | exact model by price-directed state-space search (needs `numba`) | `pds_*` |
 | `run_dw_model` | `True` | Dantzig-Wolfe lower bound | `dw_*` |
 
 The DES episode **always** runs, whatever `run_sim` says: every offline model
 is built from its realized arrival stream and its boundary snapshot, so
 there is no instance without it. `run_sim=False` skips only the sim/grid
-sojourn tables. Stages run in the order exact → bp → dw, which is what lets
+sojourn tables. Stages run in the order exact → bp → pds → dw, which is what lets
 branch-and-price start from the MILP's incumbent (see below).
 
 A solve that raises (an infeasibility, a failed assertion) is recorded as
@@ -426,6 +431,42 @@ Cost: on small windows it proves optimality in seconds; on large ones its
 bound is far stronger than the MILP's at the same wall clock but the gap may
 not close — see `offline_cl_PB/README.md`, "Performance".
 
+### Price-directed search: the exact model, a third way
+
+`run_pds_model=True` solves the same whole-module model as `exact` and `bp`
+with `offline_cl_PDS` (see its README: column generation gives slot prices,
+the prices become exact cost-to-go tables that bound every partial schedule,
+and a layered search over the station's slot-by-slot states either finds a
+better schedule or proves none exists). It starts from this trial's FIFO
+episode rebuilt on the slot grid (DW's starting schedule) plus its own
+greedy and beam schedules. Two `TrialConfig` fields control it:
+
+* `pds_time_limit` (seconds, default 1800) — at the limit it stops with
+  `pds_status == "TIME_LIMIT"` and a still-valid bracket
+  `[pds_best_bound, pds_objective]`.
+* `pds_tolerance_min` — as `exact_tolerance_min` / `bp_tolerance_min`.
+
+Columns (`pds_` prefix) — the same as `bp_` where they mean the same thing:
+
+| column | meaning |
+|--------|---------|
+| `pds_status` | `OPTIMAL`, `WITHIN_TOLERANCE`, or why it stopped early: `TIME_LIMIT`, `EXPANSION_LIMIT`, `MEMORY_LIMIT` |
+| `pds_objective` / `pds_best_bound` | best schedule's total sojourn (minutes) and the proven lower bound (equal when OPTIMAL) |
+| `pds_gap` / `pds_rel_gap` | `objective - best_bound`, and that over `objective` |
+| `pds_tolerance_used`, `pds_mean_gap_min`, `pds_within_tolerance` | as for `exact_` / `bp_` |
+| `pds_master`, `pds_master_bound` | which master problem priced the slots (`aggregate` for one pile, `configuration` for two or more) and its Lagrangian bound |
+| `pds_root_lower_bound` | the search's bound before any pass (the master bound, rounded up) |
+| `pds_passes`, `pds_expanded` | search passes run, and partial schedules they expanded |
+| `pds_table_repairs` | cost-to-go table corrections (expected 0) |
+| `pds_seed_objective`, `pds_incumbent_source` | the FIFO starting schedule's value; where the final schedule came from |
+| `pds_compact_check_max_violation` | the final schedule checked against every row of the compact model (~0) |
+| `pds_time_prices_s`, `pds_time_tables_s`, `pds_time_beam_s`, `pds_time_search_s` | seconds per stage of the method |
+| `pds_{completed,arrived}_{cohort}_{stat}` | per-cohort sojourns of its schedule, same semantics as `exact_` |
+
+Its bracket over time is written to `pds_bound_history.csv` (same columns as
+`bound_history.csv`, without `nodes`; `load_bound_history(run_name,
+stage="pds")`).
+
 ### DW: lower bound only, by default
 
 `solve_integer_ub=False` (the default here) stops after column generation and
@@ -499,10 +540,12 @@ trials/trial_000.json  the same trial in full, nested, plus `arrivals`:
                        DES was fed. Enough to rebuild that episode with
                        `replay_episode`; the env object and the Gurobi /
                        B&P / DW models are not saved
-run_meta.json          the sweep definition, stage flags (sim/exact/bp/dw), timing
+run_meta.json          the sweep definition, stage flags (sim/exact/bp/pds/dw), timing
 bound_history.csv      (only with run_bp_model) B&P's bracket on the optimum
                        over time, one row per change per trial -- see
                        "Branch-and-price" above
+pds_bound_history.csv  (only with run_pds_model) the same for the
+                       price-directed search
 ```
 
 `delta`, `mip_gap`, `time_limit`, `gap_tolerance`, `include_queued`,
@@ -517,8 +560,9 @@ Status and tolerance columns for reading a limited run honestly:
 | `exact_status` | `OPTIMAL`, `TIME_LIMIT`, `SUBOPTIMAL`, … |
 | `exact_mip_gap_achieved` | gap actually reached (vs. the requested `mip_gap` column), relative to total sojourn |
 | `exact_objective` / `exact_best_bound` | incumbent and the solver's bound rounded up to a multiple of `delta` (the free tightening: every objective value is one; `exact_best_bound_raw` is Gurobi's own), total sojourn in minutes — a time-limited run still brackets the optimum (`exact_mean_sojourn_LB` is the bound per vehicle) |
-| `exact_` / `bp_` `tolerance_used`, `mean_gap_min`, `within_tolerance` | the optimality tolerance applied (`exact_tolerance_min` / `bp_tolerance_min` × n, total minutes; NaN when proving optimality), the proven distance from the optimum in mean-sojourn minutes, `(objective − best_bound)/n`, and whether it is within the tolerance (or zero, without one) |
+| `exact_` / `bp_` / `pds_` `tolerance_used`, `mean_gap_min`, `within_tolerance` | the optimality tolerance applied (`exact_tolerance_min` / `bp_tolerance_min` / `pds_tolerance_min` × n, total minutes; NaN when proving optimality), the proven distance from the optimum in mean-sojourn minutes, `(objective − best_bound)/n`, and whether it is within the tolerance (or zero, without one) |
 | `bp_status` / `bp_objective` / `bp_best_bound` | the same for branch-and-price (see its section) |
+| `pds_status` / `pds_objective` / `pds_best_bound` | the same for the price-directed search (see its section) |
 | `dw_status` | `CONVERGED`, `TIME_LIMIT`, `ITERATION_LIMIT`, `NOT_CONVERGED` |
 | `dw_LB` / `dw_LB_raw` | DW's lower bound rounded up to a multiple of `delta` (the free tightening) / as column generation produced it |
 | `dw_converged` / `dw_iterations` | column generation's own stopping detail |
@@ -527,5 +571,5 @@ Status and tolerance columns for reading a limited run honestly:
 | `arrivals_close_at`, `sim_clock_end`, `drain_minutes` | when arrivals closed (`T`), when the simulation ended, and the difference |
 | `inst_horizon_minutes`, `inst_K`, `inst_K_grid_fifo`, `inst_K_feasible_fifo`, `inst_K_fifo` | the models' horizon and where it came from |
 
-`results.csv` and `bound_history.csv` are rewritten after every trial, so an
+`results.csv` and the bound histories are rewritten after every trial, so an
 interrupted sweep still leaves usable output.

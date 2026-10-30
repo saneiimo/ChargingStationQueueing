@@ -17,8 +17,11 @@ Layout written under ``out_dir / run_name``::
                            certified bracket on the optimum over time: one
                            row per change per trial -- see
                            ``bound_history_rows`` / ``load_bound_history``
+    pds_bound_history.csv  (only with run_pds_model) the same for the
+                           price-directed search (``load_bound_history(...,
+                           stage="pds")``)
 
-``results.csv`` and ``bound_history.csv`` are rewritten after every trial,
+``results.csv`` and the bound histories are rewritten after every trial,
 so a sweep interrupted halfway still leaves usable output.
 """
 
@@ -60,7 +63,7 @@ def flatten_trial(result: TrialResult, trial_id: int) -> dict[str, Any]:
     """
     One flat CSV row: config knobs, then populations, then per-stage metrics.
 
-    Stage scalars are prefixed by source (``exact_``, ``bp_``, ``dw_``);
+    Stage scalars are prefixed by source (``exact_``, ``bp_``, ``pds_``, ``dw_``);
     per-cohort figures become ``{source}_{group}_{cohort}_{stat}`` columns, where
     ``group`` is ``completed`` (vehicles that got their full energy) or
     ``arrived`` (all of them, an unfinished one censored at the end of the
@@ -68,7 +71,8 @@ def flatten_trial(result: TrialResult, trial_id: int) -> dict[str, Any]:
     so the two groups coincide; both are kept for older results. The
     offline objective is total
     sojourn in minutes, so ``exact_objective``, ``bp_objective`` /
-    ``bp_best_bound`` and ``dw_LB`` line up directly with
+    ``bp_best_bound``, ``pds_objective`` / ``pds_best_bound`` and ``dw_LB``
+    line up directly with
     ``grid_arrived_{cohort}_total_sojourn`` for the cohort level matching
     ``objective_cohorts`` (``grid`` also carries ``total_departure_slots``,
     ``sum_j D_j``).
@@ -91,6 +95,7 @@ def flatten_trial(result: TrialResult, trial_id: int) -> dict[str, Any]:
         ("grid", result.grid),
         ("exact", result.exact),
         ("bp", result.bp),
+        ("pds", result.pds),
         ("dw", result.dw),
     ):
         if stage is None:
@@ -107,16 +112,22 @@ def flatten_trial(result: TrialResult, trial_id: int) -> dict[str, Any]:
     return row
 
 
-def bound_history_rows(result: TrialResult, trial_id: int) -> list[dict[str, Any]]:
+# Solvers whose certified bracket over time is written to "<prefix>bound_history.csv".
+HISTORY_FILES = {"bp": "bound_history", "pds": "pds_bound_history"}
+
+
+def bound_history_rows(result: TrialResult, trial_id: int, stage: str = "bp") -> list[dict[str, Any]]:
     """
-    Long-format rows of one trial's B&P bound history (empty if B&P did not
-    run or failed): ``trial_id``, ``label`` and the knobs that usually tell
-    trials apart, then ``time_s``, ``lower_bound``, ``upper_bound``,
-    ``gap``, ``gap_pct``, ``lower_bound_min``, ``upper_bound_min``,
-    ``nodes``, ``event``. Join on ``trial_id`` with ``results.csv`` for any
-    other knob.
+    Long-format rows of one trial's bound history for ``stage`` (``"bp"``:
+    branch-and-price, ``"pds"``: price-directed search; empty if that stage
+    did not run or failed): ``trial_id``, ``label`` and the knobs that
+    usually tell trials apart, then ``time_s``, ``lower_bound``,
+    ``upper_bound``, ``gap``, ``gap_pct``, ``lower_bound_min``,
+    ``upper_bound_min``, ``nodes`` (B&P only), ``event``. Join on
+    ``trial_id`` with ``results.csv`` for any other knob.
     """
-    if not result.bp or "bound_history" not in result.bp:
+    record = getattr(result, stage)
+    if not record or "bound_history" not in record:
         return []
     cfg = result.config
     ident = {
@@ -126,9 +137,9 @@ def bound_history_rows(result: TrialResult, trial_id: int) -> list[dict[str, Any
         "max_time": cfg.max_time,
         "delta": cfg.delta,
         "n_piles": cfg.n_piles,
-        "bp_status": result.bp.get("status"),
+        f"{stage}_status": record.get("status"),
     }
-    return [{**ident, **point} for point in result.bp["bound_history"]]
+    return [{**ident, **point} for point in record["bound_history"]]
 
 
 def _trial_to_json(result: TrialResult, trial_id: int) -> dict[str, Any]:
@@ -142,6 +153,7 @@ def _trial_to_json(result: TrialResult, trial_id: int) -> dict[str, Any]:
         "grid": result.grid,
         "exact": result.exact,
         "bp": result.bp,
+        "pds": result.pds,
         "dw": result.dw,
         # Arrival specs only. Rebuilt via replay_episode; the env and the
         # solved MILP / B&P / DW objects are not serialized.
@@ -158,6 +170,7 @@ def run_sweep(
     run_exact_model: bool = True,
     run_dw_model: bool = True,
     run_bp_model: bool = False,
+    run_pds_model: bool = False,
     verbose: bool = True,
     solver_progress: bool = False,
     return_history: bool = False,
@@ -171,12 +184,14 @@ def run_sweep(
         From ``config_grid`` or built by hand.
     run_name :
         Sub-directory name under ``out_dir``; defaults to a UTC timestamp.
-    run_sim, run_exact_model, run_bp_model, run_dw_model :
+    run_sim, run_exact_model, run_bp_model, run_pds_model, run_dw_model :
         Which stages to run. ``run_exact_model`` solves the exact model as a
         compact MILP, ``run_bp_model`` solves the same model by
-        branch-and-price (``bp_*`` columns; off by default); either, both or
-        neither. The DES episode runs regardless (every offline model is
-        built from it) -- see ``run_trial``.
+        branch-and-price (``bp_*`` columns; off by default) and
+        ``run_pds_model`` by price-directed state-space search (``pds_*``
+        columns; off by default, needs ``numba``); any of them can run. The
+        DES episode runs regardless (every offline model is built from it) --
+        see ``run_trial``.
     solver_progress :
         Print each solver's own internal log (Gurobi's native solve log;
         B&P's per-node log; column generation's per-iteration
@@ -206,12 +221,13 @@ def run_sweep(
         # the models switched objective have no such key: there those columns
         # are sum_j D_j in slots (mean-sojourn columns were minutes either way).
         objective_units=OBJECTIVE_UNITS,
-        stages={"sim": run_sim, "exact": run_exact_model, "bp": run_bp_model, "dw": run_dw_model},
+        stages={"sim": run_sim, "exact": run_exact_model, "bp": run_bp_model, "pds": run_pds_model,
+                "dw": run_dw_model},
         configs=[c.to_row() for c in configs],
     )
 
     rows: list[dict[str, Any]] = []
-    history: list[dict[str, Any]] = []
+    histories: dict[str, list[dict[str, Any]]] = {stage: [] for stage in HISTORY_FILES}
     for trial_id, cfg in enumerate(configs):
         if verbose:
             tag = f" [{cfg.label}]" if cfg.label else ""
@@ -227,6 +243,7 @@ def run_sweep(
             run_exact_model=run_exact_model,
             run_dw_model=run_dw_model,
             run_bp_model=run_bp_model,
+            run_pds_model=run_pds_model,
             verbose=verbose,
             solver_progress=solver_progress,
         )
@@ -237,10 +254,11 @@ def run_sweep(
         )
         # Rewritten each trial so an interrupted sweep still leaves results.
         store.write_table("results", rows)
-        trial_history = bound_history_rows(result, trial_id)
-        if trial_history:
-            history.extend(trial_history)
-            store.write_table("bound_history", history)
+        for stage, table in HISTORY_FILES.items():
+            trial_history = bound_history_rows(result, trial_id, stage)
+            if trial_history:
+                histories[stage].extend(trial_history)
+                store.write_table(table, histories[stage])
 
     meta = store.finish_meta()
     if verbose:
@@ -250,7 +268,7 @@ def run_sweep(
         )
     results = pd.DataFrame(rows)
     if return_history:
-        return results, pd.DataFrame(history)
+        return results, pd.DataFrame(histories["bp"])
     return results
 
 
@@ -259,20 +277,25 @@ def load_results(run_name: str, out_dir: Path | str = DEFAULT_OUT_DIR) -> pd.Dat
     return load_table(run_name, "results", out_dir)
 
 
-def load_bound_history(run_name: str, out_dir: Path | str = DEFAULT_OUT_DIR) -> pd.DataFrame:
+def load_bound_history(
+    run_name: str, out_dir: Path | str = DEFAULT_OUT_DIR, stage: str = "bp"
+) -> pd.DataFrame:
     """
-    Read back ``bound_history.csv``: branch-and-price's certified bracket on
-    the optimum over time, one row per change per trial (see
-    ``bound_history_rows``). Empty if the run did not use ``run_bp_model``.
+    Read back a certified bracket on the optimum over time, one row per
+    change per trial (see ``bound_history_rows``): ``stage="bp"``
+    (``bound_history.csv``, branch-and-price) or ``"pds"``
+    (``pds_bound_history.csv``, price-directed search). Empty if the run did
+    not use that stage.
 
     Per trial, ``lower_bound`` is non-decreasing and ``upper_bound``
     non-increasing in ``time_s``; between two rows both are constant, so
     plot them as steps (``where="post"``).
     """
-    path = Path(out_dir) / run_name / "bound_history.csv"
+    table = HISTORY_FILES[stage]
+    path = Path(out_dir) / run_name / f"{table}.csv"
     if not path.exists():
         return pd.DataFrame()
-    return load_table(run_name, "bound_history", out_dir)
+    return load_table(run_name, table, out_dir)
 
 
 def comparison_table(
@@ -284,7 +307,8 @@ def comparison_table(
     ``sim`` is continuous-time FIFO, ``grid`` is that same schedule on the
     slot grid (the like-for-like target), ``exact`` is the MILP incumbent,
     ``bp`` / ``bp_LB`` are branch-and-price's best schedule and proven lower
-    bound for the same model (equal when ``bp_status == "OPTIMAL"``), and
+    bound for the same model (equal when ``bp_status == "OPTIMAL"``),
+    ``pds`` / ``pds_LB`` the same from the price-directed search, and
     ``dw_LB`` is DW's certified lower bound. Every model is the
     closed-system model, so every model schedule serves and completes every
     vehicle. Missing columns (a stage that was switched off, or a run
@@ -304,17 +328,22 @@ def comparison_table(
         "exact": f"exact_{group}_{cohort}_mean_sojourn",
         "bp": f"bp_{group}_{cohort}_mean_sojourn",
         "bp_LB": "bp_mean_sojourn_LB",
+        "pds": f"pds_{group}_{cohort}_mean_sojourn",
+        "pds_LB": "pds_mean_sojourn_LB",
         "dw_LB": "dw_mean_sojourn_LB",
         "sim_n": f"sim_{group}_{cohort}_n",
         "grid_n": f"grid_{group}_{cohort}_n",
         "exact_n": f"exact_{group}_{cohort}_n",
         "bp_n": f"bp_{group}_{cohort}_n",
+        "pds_n": f"pds_{group}_{cohort}_n",
         "exact_status": "exact_status",
         "bp_status": "bp_status",
+        "pds_status": "pds_status",
         "dw_status": "dw_status",
         "sim_runtime_s": "sim_runtime_s",
         "exact_runtime_s": "exact_runtime_s",
         "bp_runtime_s": "bp_runtime_s",
+        "pds_runtime_s": "pds_runtime_s",
         "dw_runtime_s": "dw_runtime_s",
     }
     keys = [

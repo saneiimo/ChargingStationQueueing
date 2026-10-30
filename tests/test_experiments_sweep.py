@@ -12,6 +12,9 @@ Validates what a sweep row's meaning rests on:
      power misses their final partial slot.
   3. The branch-and-price stage (``run_bp_model``) writes its ``bp_*``
      columns and agrees with the exact MILP wherever both prove optimality.
+  4. The price-directed search stage (``run_pds_model``) does the same with
+     its ``pds_*`` columns and ``pds_bound_history.csv``, and honours
+     ``pds_tolerance_min``.
 
 Run: python -m pytest tests/test_experiments_sweep.py -s -v
 """
@@ -163,7 +166,7 @@ def test_bp_stage_matches_exact_and_is_recorded(tmp_path):
     table = comparison_table(df)
     assert {"bp", "bp_LB", "bp_status", "bp_runtime_s"} <= set(table.columns)
     meta = json.loads((tmp_path / "bp" / "run_meta.json").read_text())
-    assert meta["stages"] == {"sim": True, "exact": True, "bp": True, "dw": True}
+    assert meta["stages"] == {"sim": True, "exact": True, "bp": True, "pds": False, "dw": True}
     record = json.loads((tmp_path / "bp" / "trials" / "trial_000.json").read_text())
     assert record["bp"]["status"] == "OPTIMAL" and "arrived_by_cohort" in record["bp"]
 
@@ -219,3 +222,60 @@ def test_bp_bound_history_is_returned_saved_and_consistent(tmp_path):
     run_sweep(configs[:1], "nohist", out_dir=tmp_path, run_exact_model=False, run_bp_model=False,
               run_dw_model=False, verbose=False)
     assert load_bound_history("nohist", out_dir=tmp_path).empty
+
+
+def test_pds_stage_matches_exact_and_is_recorded(tmp_path):
+    """Exact MILP and price-directed search on small closed systems: same
+    proven optimum, pds_* columns, comparison table, JSON record, run_meta
+    stage flag and pds_bound_history.csv all written."""
+    import json
+
+    pytest.importorskip("numba")
+    from experiments.objective_sweep import comparison_table, load_bound_history, run_sweep
+
+    configs = [_tiny_bp_config(mean_interarrival=ia, label=f"ia{ia:g}") for ia in (15.0, 25.0)]
+    df = run_sweep(configs, "pds", out_dir=tmp_path, run_exact_model=True, run_pds_model=True,
+                   run_dw_model=False, verbose=False)
+    for _, row in df.iterrows():
+        assert row["exact_status"] == "OPTIMAL" and row["pds_status"] == "OPTIMAL"
+        assert row["pds_objective"] == pytest.approx(row["exact_objective"])
+        assert row["pds_best_bound"] == pytest.approx(row["pds_objective"])
+        assert row["pds_objective"] == pytest.approx(row["pds_arrived_all_total_sojourn"])
+        assert row["pds_mean_sojourn_LB"] == pytest.approx(row["pds_best_bound"] / row["pds_n_optimized"])
+        assert row["pds_master_bound"] <= row["pds_objective"] + 1e-6
+        assert row["pds_root_lower_bound"] <= row["pds_objective"] + 1e-6
+        assert row["pds_seed_objective"] >= row["pds_objective"] - 1e-6
+        assert row["pds_compact_check_max_violation"] <= 1e-5
+        assert row["pds_table_repairs"] == 0
+        assert row["pds_within_tolerance"]
+    table = comparison_table(df)
+    assert {"pds", "pds_LB", "pds_status", "pds_runtime_s"} <= set(table.columns)
+    meta = json.loads((tmp_path / "pds" / "run_meta.json").read_text())
+    assert meta["stages"] == {"sim": True, "exact": True, "bp": False, "pds": True, "dw": False}
+    record = json.loads((tmp_path / "pds" / "trials" / "trial_000.json").read_text())
+    assert record["pds"]["status"] == "OPTIMAL" and "arrived_by_cohort" in record["pds"]
+    history = load_bound_history("pds", out_dir=tmp_path, stage="pds")
+    assert load_bound_history("pds", out_dir=tmp_path).empty  # no B&P in this run
+    for trial_id, h in history.groupby("trial_id"):
+        row = df.loc[df["trial_id"] == trial_id].iloc[0]
+        lb, ub = h["lower_bound"].dropna(), h["upper_bound"].dropna()
+        assert lb.is_monotonic_increasing and ub.is_monotonic_decreasing
+        last = h.iloc[-1]
+        assert last["event"] == "end"
+        assert last["lower_bound"] == pytest.approx(row["pds_best_bound"])
+        assert last["upper_bound"] == pytest.approx(row["pds_objective"])
+
+
+def test_pds_tolerance_is_reported_like_the_other_solvers(tmp_path):
+    """pds_tolerance_min = x stops within x minutes of mean sojourn and is
+    reported as x * n_optimized minutes of total sojourn."""
+    pytest.importorskip("numba")
+    from experiments.objective_sweep import run_sweep
+
+    cfg = _tiny_bp_config(mean_interarrival=12.0, delta=2.0, pds_tolerance_min=2.0)
+    row = run_sweep([cfg], "pds_tol", out_dir=tmp_path, run_exact_model=False, run_pds_model=True,
+                    run_dw_model=False, verbose=False).iloc[0]
+    assert row["pds_status"] in ("OPTIMAL", "WITHIN_TOLERANCE")
+    assert row["pds_tolerance_used"] == pytest.approx(2.0 * row["pds_n_optimized"])
+    assert row["pds_within_tolerance"] and row["pds_mean_gap_min"] <= 2.0 + 1e-9
+    assert row["pds_objective"] - row["pds_best_bound"] <= row["pds_tolerance_used"] + 1e-6

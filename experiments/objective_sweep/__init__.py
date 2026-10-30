@@ -4,9 +4,10 @@ Objective sweep: how far is a realized episode from the true optimum?
 For each configuration, simulate a closed system (warm-up, an arrival window,
 then drain the station) and bound its objective
 -- the connector-lane MILP (an incumbent plus the solver's own bound),
-branch-and-price on the same model (``run_bp_model=True``: a proven optimum,
-or a certified bracket at its time limit), and Dantzig-Wolfe (a certified
-lower bound) -- then store everything.
+branch-and-price and price-directed search on the same model
+(``run_bp_model=True`` / ``run_pds_model=True``: a proven optimum, or a
+certified bracket at the time limit), and Dantzig-Wolfe (a certified lower
+bound) -- then store everything.
 This is ``sim_benchmark.ipynb`` run headless and recorded.
 
 Start at ``run_sweep``; see ``experiments/README.md`` for the column
@@ -34,6 +35,7 @@ from .trial import (
     replay_episode,
     run_bp,
     run_dw,
+    run_pds,
     run_episode,
     run_exact,
     run_trial,
@@ -56,6 +58,7 @@ __all__ = [
     "build_instance",
     "run_exact",
     "run_bp",
+    "run_pds",
     "run_dw",
     "run_sweep",
     "flatten_trial",

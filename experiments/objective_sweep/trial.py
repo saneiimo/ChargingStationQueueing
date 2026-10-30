@@ -12,7 +12,7 @@ off the discretized FIFO run (``closed_system_horizon``). Nothing is
 censored on the simulation side; a model is told nothing about FIFO beyond
 ``K`` (and, for B&P, an optional seed schedule).
 
-Up to five numbers for the same objective come out of a trial, all
+Up to six numbers for the same objective come out of a trial, all
 reported per cohort so they are comparable (see ``metrics.MetricsTracker``
 and ``offline_cl_opt.boundary`` for the cohort definitions):
 
@@ -28,10 +28,13 @@ and ``offline_cl_opt.boundary`` for the cohort definitions):
 * ``bp``    -- the SAME whole-module model solved by branch-and-price
                (``offline_cl_PB``): its best schedule plus a proven lower
                bound; the two coincide when ``bp_status == "OPTIMAL"``.
+* ``pds``   -- the SAME model again, solved by price-directed state-space
+               search (``offline_cl_PDS``): its best schedule plus a proven
+               lower bound; the two coincide when ``pds_status == "OPTIMAL"``.
 * ``dw``    -- Dantzig-Wolfe's certified lower bound on the optimum
                (continuous-module relaxation).
 
-All three offline models minimize the same objective, total sojourn
+All the offline models minimize the same objective, total sojourn
 ``sum_j delta*(D_j - k_j)`` in minutes (``k_j = ceil(a_j/delta)``, the
 release slot) over ``objective_cohorts``, so every
 ``objective`` / ``best_bound`` / ``LB`` / ``UB`` field is total sojourn in
@@ -118,7 +121,7 @@ class TrialResult:
     """
     Everything one trial produced, in nested dicts ready for JSON.
 
-    ``sim``/``grid``/``exact``/``bp``/``dw`` are ``None`` for a stage that
+    ``sim``/``grid``/``exact``/``bp``/``pds``/``dw`` are ``None`` for a stage that
     was switched off, and carry an ``"error"`` key for one that was
     attempted and failed (a solve can hit an infeasibility or an assertion;
     a failed stage must not take the whole sweep down with it).
@@ -135,6 +138,7 @@ class TrialResult:
     grid: dict[str, Any] | None = None
     exact: dict[str, Any] | None = None
     bp: dict[str, Any] | None = None
+    pds: dict[str, Any] | None = None
     dw: dict[str, Any] | None = None
 
 
@@ -833,20 +837,20 @@ def _bp_seed(
     return best
 
 
-def _bp_bound_history(sol, offset_s: float) -> list[dict[str, Any]]:
+def _bound_history(sol, offset_s: float) -> list[dict[str, Any]]:
     """
-    ``PBSolution.bound_history`` in sweep units: the certified bracket on the
-    optimum over time, one row per change.
+    A solver's ``bound_history`` (``PBSolution`` or ``PDSSolution``) in sweep
+    units: the certified bracket on the optimum over time, one row per change.
 
-    ``time_s`` is measured from the start of the B&P stage (``offset_s`` adds
-    the seed construction that precedes the solver), so the last row's time
-    is ~``bp_runtime_s``. Bounds are given in objective units (total sojourn,
-    minutes) and per vehicle as mean sojourn over ``objective_cohorts`` --
-    the same figures as ``bp_objective`` / ``bp_best_bound`` and
-    ``bp_mean_sojourn`` / ``bp_mean_sojourn_LB``. ``gap_pct`` is
-    ``100 * (upper - lower) / upper``, the gap relative to total sojourn. A
-    lower bound of ``-inf`` (before the root is first priced) is stored as
-    NaN.
+    ``time_s`` is measured from the start of the stage (``offset_s`` adds the
+    seed construction that precedes the solver), so the last row's time is
+    ~``{bp,pds}_runtime_s``. Bounds are given in objective units (total
+    sojourn, minutes) and per vehicle as mean sojourn over
+    ``objective_cohorts`` -- the same figures as ``*_objective`` /
+    ``*_best_bound`` and ``*_mean_sojourn`` / ``*_mean_sojourn_LB``.
+    ``gap_pct`` is ``100 * (upper - lower) / upper``, the gap relative to
+    total sojourn. A bound not known yet (``-inf`` / ``inf``) is stored as
+    NaN. ``nodes`` (tree nodes solved so far) exists for B&P only.
 
     These bracket the optimum of the horizon-``K`` closed-system model.
     """
@@ -865,7 +869,7 @@ def _bp_bound_history(sol, offset_s: float) -> list[dict[str, Any]]:
                 "gap_pct": 100.0 * gap / ub if ub else NAN,
                 "lower_bound_min": lb / n if n else NAN,
                 "upper_bound_min": ub / n if n else NAN,
-                "nodes": h["nodes"],
+                **({"nodes": h["nodes"]} if "nodes" in h else {}),
                 "event": h["event"],
             }
         )
@@ -905,7 +909,7 @@ def run_bp(
     trial, needed only for the ``"exact"``/``"both"`` seeds.
 
     ``bound_history`` is the certified bracket over time (see
-    ``_bp_bound_history``); the sweep writes it to ``bound_history.csv``,
+    ``_bound_history``); the sweep writes it to ``bound_history.csv``,
     not to ``results.csv``.
 
     ``solver_progress=True`` prints B&P's own per-node log.
@@ -932,7 +936,7 @@ def run_bp(
     completed, arrived, diag = _model_groups(sol.per_vehicle, sol.K)
     return {
         "status": sol.status,
-        "bound_history": _bp_bound_history(sol, seed_s),
+        "bound_history": _bound_history(sol, seed_s),
         "objective": sol.objective,  # best schedule's total sojourn, minutes
         "best_bound": sol.lower_bound,  # proven lower bound, minutes
         "gap": sol.gap,  # objective - best_bound (0 when OPTIMAL)
@@ -962,7 +966,106 @@ def run_bp(
 
 
 # --------------------------------------------------------------------------- #
-# Stage 5 -- Dantzig-Wolfe
+# Stage 5 -- price-directed search (the exact model, solved by offline_cl_PDS)
+# --------------------------------------------------------------------------- #
+
+
+def run_pds(
+    cfg: TrialConfig,
+    inst,
+    station: StationSpec,
+    env: ChargingStationEnv,
+    *,
+    horizon_minutes: float,
+    solver_progress: bool = False,
+) -> dict[str, Any]:
+    """
+    Solve the exact whole-module model by price-directed state-space search
+    (``offline_cl_PDS``).
+
+    ``horizon_minutes``: as in ``run_exact``.
+
+    Reports the same fields as ``run_bp`` for the same model: ``objective``
+    (best schedule, total sojourn in minutes), ``best_bound`` (proven lower
+    bound), ``status`` (``OPTIMAL``; ``WITHIN_TOLERANCE`` when
+    ``cfg.pds_tolerance_min`` stopped it with the bracket inside it; or why it
+    stopped early: ``TIME_LIMIT``, ``EXPANSION_LIMIT``, ``MEMORY_LIMIT``), the
+    tolerance report (``tolerance_used``, ``mean_gap_min``,
+    ``within_tolerance``), per-cohort sojourns and ``bound_history``. Its own
+    diagnostics: ``master`` (which master problem priced the slots),
+    ``master_bound`` (that master's Lagrangian bound, not rounded),
+    ``root_lower_bound`` (the search's bound before any pass), ``passes`` /
+    ``expanded`` (search passes, and partial schedules they expanded),
+    ``table_repairs`` (cost-to-go corrections; expected 0) and seconds per
+    stage (``time_prices_s``, ``time_tables_s``, ``time_beam_s``,
+    ``time_search_s``).
+
+    It starts from the FIFO episode rebuilt on the slot grid
+    (``fifo_schedule``, DW's starting schedule); ``seed_objective`` is that
+    schedule's value. ``solver_progress=True`` prints the search's own log.
+    """
+    # Imported here so that sweeps which never run this stage do not need numba.
+    from offline_cl_PDS import solve_price_directed_search
+
+    t0 = time.perf_counter()
+    seed = fifo_schedule(cfg, inst, station, env, horizon_minutes)
+    K = math.ceil(round(horizon_minutes / cfg.delta, 9))
+    seed_objective = validate_schedule(
+        seed, inst.vehicles, station, cfg.delta, K, inst.boundary_vehicles, _objective_weights(cfg, inst)
+    ).objective
+    seed_s = time.perf_counter() - t0
+    n_opt = _n_optimized(cfg, inst)
+    sol = solve_price_directed_search(
+        inst.vehicles,
+        station,
+        cfg.delta,
+        horizon_minutes,
+        boundary_vehicles=inst.boundary_vehicles,
+        cohorts=inst.cohorts,
+        objective_cohorts=cfg.objective_cohorts,
+        initial_schedule=seed,
+        time_limit=cfg.pds_time_limit,
+        gap_abs=cfg.pds_tolerance_min * n_opt if cfg.pds_tolerance_min is not None else 0.0,
+        progress=solver_progress,
+    )
+    elapsed = time.perf_counter() - t0
+    completed, arrived, diag = _model_groups(sol.per_vehicle, sol.K)
+    return {
+        "status": sol.status,
+        "bound_history": _bound_history(sol, seed_s),
+        "objective": sol.objective,  # best schedule's total sojourn, minutes
+        "best_bound": sol.lower_bound,  # proven lower bound, minutes
+        "gap": sol.gap,  # objective - best_bound (0 when OPTIMAL)
+        "rel_gap": sol.gap / sol.objective if sol.objective else NAN,  # relative to total sojourn
+        **_tolerance_report(sol.objective, sol.lower_bound, n_opt, cfg.pds_tolerance_min),
+        "master": sol.prices.kind,
+        "master_bound": sol.master_bound,
+        "root_lower_bound": sol.root_lower_bound,
+        "total_sojourn": sol.total_sojourn,
+        "mean_sojourn": sol.mean_sojourn,
+        "total_sojourn_LB": sol.total_sojourn_LB,
+        "mean_sojourn_LB": sol.mean_sojourn_LB,
+        "n_vehicles": sol.n_vehicles,
+        "n_optimized": sol.n_optimized,
+        "K": sol.K,
+        "passes": len(sol.passes),
+        "expanded": sum(p["expanded"] for p in sol.passes),
+        "table_repairs": sol.table_repairs,
+        "seed_objective": seed_objective,
+        "incumbent_source": sol.incumbent_source,
+        "compact_check_max_violation": (
+            sol.compact_check.max_violation if sol.compact_check is not None else NAN
+        ),
+        **{f"time_{stage}_s": secs for stage, secs in sol.timings.items()},
+        "runtime_s": elapsed,
+        **diag,
+        "completed_by_cohort": completed,
+        "arrived_by_cohort": arrived,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Stage 6 -- Dantzig-Wolfe
 # --------------------------------------------------------------------------- #
 
 
@@ -1102,6 +1205,7 @@ def run_trial(
     run_exact_model: bool = True,
     run_dw_model: bool = True,
     run_bp_model: bool = False,
+    run_pds_model: bool = False,
     verbose: bool = True,
     solver_progress: bool = False,
 ) -> TrialResult:
@@ -1113,11 +1217,12 @@ def run_trial(
     its realized arrivals and boundary snapshot -- so ``run_sim=False``
     skips only the sim/grid sojourn tables, not the episode.
 
-    ``run_exact_model`` and ``run_bp_model`` solve the same exact
-    whole-module model two ways (compact MILP / branch-and-price); either,
-    both or neither can run. When both run, exact goes first so B&P can be
-    seeded from its incumbent (``bp_initial_schedule="exact"``/``"both"``).
-    Stages run in the order exact, bp, dw.
+    ``run_exact_model``, ``run_bp_model`` and ``run_pds_model`` solve the
+    same exact whole-module model three ways (compact MILP /
+    branch-and-price / price-directed search); any of them can run. When
+    exact and B&P both run, exact goes first so B&P can be seeded from its
+    incumbent (``bp_initial_schedule="exact"``/``"both"``). Stages run in the
+    order exact, bp, pds, dw.
 
     ``verbose`` prints one line per trial/stage (this module's own summary --
     "instance: J=...", "exact: OPTIMAL obj=..."). ``solver_progress`` is a
@@ -1155,7 +1260,7 @@ def run_trial(
         result.sim = {"runtime_s": sim_runtime, **load, **sim}
         result.grid = dict(grid)
 
-    if not (run_exact_model or run_bp_model or run_dw_model):
+    if not (run_exact_model or run_bp_model or run_pds_model or run_dw_model):
         return result
 
     if verbose:
@@ -1192,6 +1297,9 @@ def run_trial(
             horizon_minutes=horizon_minutes, solver_progress=solver_progress,
         )
 
+    def solve_pds(cfg, inst, station, *, horizon_minutes, solver_progress):
+        return run_pds(cfg, inst, station, env, horizon_minutes=horizon_minutes, solver_progress=solver_progress)
+
     def solve_dw(cfg, inst, station, *, horizon_minutes, solver_progress):
         return run_dw(
             cfg, inst, station, horizon_minutes=horizon_minutes,
@@ -1203,6 +1311,7 @@ def run_trial(
         for enabled, name, fn in (
             (run_exact_model, "exact", solve_exact),
             (run_bp_model, "bp", solve_bp),
+            (run_pds_model, "pds", solve_pds),
             (run_dw_model, "dw", solve_dw),
         ):
             if not enabled:
@@ -1240,6 +1349,13 @@ def _stage_summary(stage: dict[str, Any]) -> str:
             f"{stage['status']} LB={stage['LB']:.2f} "
             f"mean_sojourn_LB={stage['mean_sojourn_LB']:.2f} min "
             f"({stage['runtime_s']:.1f}s, {stage['iterations']} iters)"
+        )
+    if "passes" in stage:  # price-directed search
+        return (
+            f"{stage['status']} obj={stage['objective']:.2f} "
+            f"bound={stage['best_bound']:.2f} gap={stage['rel_gap']:.2%} "
+            f"mean_sojourn={stage['mean_sojourn']:.2f} min "
+            f"({stage['runtime_s']:.1f}s, {stage['passes']} passes, {stage['master']} master)"
         )
     if "nodes" in stage:  # branch-and-price
         return (

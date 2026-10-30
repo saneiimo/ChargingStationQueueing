@@ -199,6 +199,19 @@ class TrialConfig:
     # optimum (status "WITHIN_TOLERANCE"). None: prove optimality.
     bp_tolerance_min: float | None = None
 
+    # --- price-directed state-space search (offline_cl_PDS) ----------------
+    # The SAME whole-module model once more, solved by price-directed search:
+    # a proven optimum, or at the time limit a certified bracket
+    # [pds_best_bound, pds_objective]. It starts from this trial's FIFO
+    # episode rebuilt on the slot grid (offline_cl_PB.schedule_from_simulation,
+    # DW's starting schedule) plus its own greedy and beam schedules. Only used
+    # when the sweep runs with run_pds_model=True.
+    pds_time_limit: float | None = 1800.0  # seconds; None for no limit
+    # Same as exact_tolerance_min / bp_tolerance_min, for the search: stop as
+    # soon as its schedule is proven within this many minutes of mean sojourn
+    # of the optimum (status "WITHIN_TOLERANCE"). None: prove optimality.
+    pds_tolerance_min: float | None = None
+
     # --- bookkeeping -------------------------------------------------------
     label: str = ""  # optional human-readable tag carried into the results
     notes: str = ""
@@ -214,7 +227,7 @@ class TrialConfig:
             raise ValueError(f"offered_power_load must be > 0, got {self.offered_power_load}")
         if self.horizon_slack < 0:
             raise ValueError(f"horizon_slack must be >= 0, got {self.horizon_slack}")
-        for name in ("exact_tolerance_min", "bp_tolerance_min"):
+        for name in ("exact_tolerance_min", "bp_tolerance_min", "pds_tolerance_min"):
             value = getattr(self, name)
             if value is not None and value < 0:
                 raise ValueError(f"{name} must be >= 0 or None, got {value}")

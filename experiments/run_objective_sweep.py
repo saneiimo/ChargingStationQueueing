@@ -47,6 +47,13 @@ on large instances; set
 ``bp_time_limit`` accordingly. ``bp_initial_schedule`` picks its starting
 incumbent ("simulation", "exact", "both", "none" -- see ``TrialConfig``).
 
+Price-directed state-space search (``RUN_PDS_MODEL``, ``offline_cl_PDS``)
+solves the same exact model a third way and fills ``pds_*`` columns with the
+same meaning: ``pds_objective`` / ``pds_best_bound``, equal when
+``pds_status`` is OPTIMAL. Its bracket over time goes to
+``pds_bound_history.csv`` (``load_bound_history(run, stage="pds")``).
+``pds_time_limit`` and ``pds_tolerance_min`` control it.
+
 ``main()`` returns ``(results, history)``. ``history`` is B&P's certified
 bracket on each trial's optimum over time (also saved as
 ``bound_history.csv``; empty unless ``RUN_BP_MODEL``): one row per change,
@@ -128,7 +135,7 @@ BASE = TrialConfig(
     # characteristics from separate streams, so vehicle k's battery/SoC
     # depend only on k. A mean_interarrival sweep therefore varies the
     # arrival process alone, instead of also resampling the fleet under it.
-    seed=40,
+    seed=37,
     # Cap both solvers so one hard trial cannot run away with the sweep. A
     # limit that bites is recorded, not hidden: see exact_status/dw_status.
     time_limit=1800.0,
@@ -166,13 +173,22 @@ BASE = TrialConfig(
     # arrivals), so check exact_/bp_n_optimized in the results.
     exact_tolerance_min=None,
     bp_tolerance_min=1,
+    # Price-directed state-space search (used only when RUN_PDS_MODEL is
+    # True): wall-clock cap, and its optimality tolerance in minutes of MEAN
+    # sojourn -- same meaning and same delta / n step rule as the two above
+    # (pds_tolerance_used, pds_mean_gap_min, pds_within_tolerance). It starts
+    # from the FIFO episode rebuilt on the slot grid.
+    pds_time_limit=1800.0,
+    pds_tolerance_min=None,
 )
 
 # Which stages run. The exact model can be solved as a compact MILP
 # (RUN_EXACT_MODEL -> exact_* columns), by branch-and-price (RUN_BP_MODEL ->
-# bp_* columns), or both; DW adds its continuous-module lower bound (dw_*).
+# bp_* columns), by price-directed search (RUN_PDS_MODEL -> pds_* columns),
+# or any combination; DW adds its continuous-module lower bound (dw_*).
 RUN_EXACT_MODEL = False
-RUN_BP_MODEL = True
+RUN_BP_MODEL = False
+RUN_PDS_MODEL = True
 RUN_DW_MODEL = False
 
 # The swept axes. First keyword varies slowest, so the cheap knobs cycle
@@ -216,57 +232,23 @@ def main() -> tuple[pd.DataFrame, pd.DataFrame]:
     #   time_limit, dw_time_limit, max_time, label, bp_initial_schedule)
 
     combos = [
-        # (None, 0.1, 1.0, 1e-4, None, 1800.0, 1200.0, 8 * HR2MIN, "rho0.1"),
-        # (None, 0.2, 1.0, 1e-4, None, 1800.0, 1200.0, 8 * HR2MIN, "rho0.2"),
-        # (None, 0.3, 1.0, 1e-4, None, 1800.0, 1200.0, 8 * HR2MIN, "rho0.3"),
-        # (None, 0.4, 1.0, 1e-4, None, 2 * 1800.0, 1200.0, 4 * HR2MIN, "rho0.4"),
-        # (None, 0.5, 2.0, 1e-4, None, 2 * 1800.0, 1200.0, 4 * HR2MIN, "rho0.5"),
-        # (None, 0.6, 2.0, 1e-4, 1, 2 * 1800.0, 1200.0, 4 * HR2MIN, "rho0.6"),
-        # (None, 0.7, 2.0, 1e-4, 1, 2 * 1800.0, 1200.0, 4 * HR2MIN, "rho0.7"),
-        # (None, 0.8, 2.0, 1e-4, 1, 3 * 1800.0, 1200.0, 4 * HR2MIN, "rho0.8"),
-        # (None, 0.9, 2.0, 1e-4, 1, 3 * 1800.0, 1200.0, 4 * HR2MIN, "rho0.9"),
-        (
-            None,
-            0.9,
-            2.0,
-            1e-4,
-            1,
-            3 * 1800.0,
-            1200.0,
-            1 * HR2MIN,
-            "rho0.9, 2, 120n",
-            "simulation",
-        ),
-        (
-            None,
-            0.9,
-            2.0,
-            1e-4,
-            1,
-            3 * 1800.0,
-            1200.0,
-            1 * HR2MIN,
-            "rho0.9, 2, 120",
-            "none",
-        ),
-        (
-            None,
-            0.9,
-            2.0,
-            1e-4,
-            1,
-            3 * 1800.0,
-            1200.0,
-            1 * HR2MIN,
-            "rho0.9, 2, 240",
-            "none",
-        ),
+        (None, 0.1, 1.0, 1e-4, None, 1800.0, 1200.0, 8 * HR2MIN, "rho0.1"),
+        (None, 0.2, 1.0, 1e-4, None, 1800.0, 1200.0, 8 * HR2MIN, "rho0.2"),
+        (None, 0.3, 1.0, 1e-4, None, 1800.0, 1200.0, 8 * HR2MIN, "rho0.3"),
+        (None, 0.4, 1.0, 1e-4, None, 2 * 1800.0, 1200.0, 8 * HR2MIN, "rho0.4"),
+        (None, 0.5, 1.0, 1e-4, None, 2 * 1800.0, 1200.0, 8 * HR2MIN, "rho0.5"),
+        (None, 0.6, 1.0, 1e-4, 1, 2 * 1800.0, 1200.0, 8 * HR2MIN, "rho0.6"),
+        (None, 0.7, 1.0, 1e-4, 1, 2 * 1800.0, 1200.0, 8 * HR2MIN, "rho0.7"),
+        (None, 0.8, 1.0, 1e-4, 1, 3 * 1800.0, 1200.0, 8 * HR2MIN, "rho0.8"),
+        (None, 0.9, 1.0, 1e-4, 1, 3 * 1800.0, 1200.0, 8 * HR2MIN, "rho0.9"),
+        # (None, 0.93, 2.0, 1e-4, 1, 3 * 1800.0, 1200.0, 4 * HR2MIN, "rho0.93"),
+        # (None, 0.96, 2.0, 1e-4, 1, 3 * 1800.0, 1200.0, 4 * HR2MIN, "rho0.96"),
     ]
     # To do: try with gap_tolerance_target_min = .1 (or remove it)
     # Set the time_limit for the first two to 2 hr.
     # Add more trials (in .5 veh intervals)
     # Try the case with 2piles
-    RUN_NAME = "1pile_75kwh_bp_test"
+    RUN_NAME = "1pile_75kwh_pds"
     configs = [
         dataclasses.replace(
             BASE,
@@ -279,9 +261,8 @@ def main() -> tuple[pd.DataFrame, pd.DataFrame]:
             dw_time_limit=dw_t_lim,
             max_time=mx_time,
             label=lab,
-            bp_initial_schedule=bp_sch,
         )
-        for ia, rho_p, d, mip_gap, bp_tol, t_lim, dw_t_lim, mx_time, lab, bp_sch in combos
+        for ia, rho_p, d, mip_gap, bp_tol, t_lim, dw_t_lim, mx_time, lab in combos
     ]
     print(f"{len(configs)} trial(s) queued\n")
     # for cfg in configs:
@@ -293,6 +274,7 @@ def main() -> tuple[pd.DataFrame, pd.DataFrame]:
         run_sim=True,
         run_exact_model=RUN_EXACT_MODEL,
         run_bp_model=RUN_BP_MODEL,
+        run_pds_model=RUN_PDS_MODEL,
         run_dw_model=RUN_DW_MODEL,
         run_name=RUN_NAME,
         verbose=True,
