@@ -55,16 +55,16 @@ from experiments.policy_sweep import (
     HR2MIN,
 )
 
-RUN_NAME = "queue_sweep_LSoCD_3pile"
+RUN_NAME = "queue_sweep_LSoCD_2pile"
 
 # Everything held constant across the sweep.
 BASE = PolicyConfig(
     # station layout
-    n_piles=3,
+    n_piles=2,
     n_connectors=2,
     n_modules=6,
     p_module=25.0,
-    battery_cap_kwh=(75,),
+    battery_cap_kwh=(50, 100),
     queue_capacity=1000,
     # traffic
     # The arrival rate comes from EITHER of these two fields:
@@ -105,11 +105,11 @@ BASE = PolicyConfig(
 #     .venv/Scripts/python.exe -m experiments.run_policy_sweep
 
 # The swept axes. The FIRST keyword varies slowest.
-SWEEP = dict(
-    mean_interarrival=[HR2MIN / (n_veh / 2 * BASE.n_piles) for n_veh in range(2, 13)],
-)
+# SWEEP = dict(
+#     mean_interarrival=[HR2MIN / (n_veh / 2 * BASE.n_piles) for n_veh in range(2, 13)],
+# )
 # Or sweep the load directly (needs mean_interarrival=None in BASE, as above):
-# SWEEP = dict(offered_power_load=[0.2, 0.4, 0.6, 0.8, 0.9])
+SWEEP = dict(offered_power_load=[0.1 * cnst for cnst in range(1, 10)])
 
 # Other grids worth trying (uncomment one):
 #
