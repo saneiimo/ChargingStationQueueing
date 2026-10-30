@@ -25,6 +25,9 @@ Read the code in this order the first time through:
     - `compare_policies.ipynb` — Monte Carlo replications across queue/power policies
     - `cl_model.ipynb` — the offline connector-lane model (compact MILP,
       branch-and-price, Dantzig-Wolfe) on one simulated window
+    - `cl_model_PDS.ipynb` — the same window solved by price-directed
+      state-space search, checked against the compact MILP and
+      branch-and-price, plus a larger instance
 12. Offline (clairvoyant) optimum for total sojourn time, solved with
     gurobipy. Given full knowledge of arrivals up front, its optimum
     lower-bounds every causal queue/power policy's cost on the same
@@ -32,6 +35,8 @@ Read the code in this order the first time through:
     - `offline_cl_opt/` — the connector-lane compact MILP. See
       `offline_cl_opt/README.md`.
     - `offline_cl_PB/` — the same model solved exactly by branch-and-price.
+    - `offline_cl_PDS/` — the same model solved exactly by price-directed
+      state-space search (needs `numba`). See `offline_cl_PDS/README.md`.
     - `offline_cl_dw/` — its Dantzig-Wolfe lower bound (continuous modules).
 
 ```text
